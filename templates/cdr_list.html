@@ -3,7 +3,7 @@
 {% block content %}
 
 <section class="page-header">
-  <h1>Call Detail Records</h1>
+  <h1>Call Detail Records <span class="muted day-label">— {{ day_label }}</span></h1>
   <div class="actions">
     <a class="button" href="{{ export_url }}">Export CSV</a>
   </div>
@@ -23,11 +23,16 @@
   </div>
   <div class="filter-actions">
     <button type="submit">Apply</button>
-    <a class="link" href="/">Clear</a>
+    <a class="link" href="/">Today</a>
+    <a class="link" href="/?from={{ filters.yesterday_from }}&to={{ filters.yesterday_to }}">Yesterday</a>
   </div>
 </form>
 
-<p class="muted">{{ total }} record{% if total != 1 %}s{% endif %} · page {{ page }} of {{ pages }}</p>
+<p class="muted">
+  Page {{ page }} ·
+  {{ cdrs.len() }} row{% if cdrs.len() != 1 %}s{% endif %} shown
+  {% if has_more %}· more available{% endif %}
+</p>
 
 <table class="cdrs">
   <thead>
@@ -61,5 +66,15 @@
     {% endfor %}
   </tbody>
 </table>
+
+<div class="pagination">
+  {% if has_prev %}
+    <a class="button" href="{{ prev_url }}">&larr; Previous</a>
+  {% endif %}
+  <span class="muted">Page {{ page }}</span>
+  {% if has_more %}
+    <a class="button" href="{{ next_url }}">Next &rarr;</a>
+  {% endif %}
+</div>
 
 {% endblock %}

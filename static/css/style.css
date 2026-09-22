@@ -181,3 +181,17 @@ table.cdrs tr:hover { background: var(--bg-elev-2); }
   margin-top: 8px;
 }
 .login-card button[type=submit]:hover { background: var(--accent-hover); }
+
+.day-label {
+  font-weight: normal;
+  font-size: 14px;
+}
+
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 16px;
+  justify-content: flex-end;
+}
+.pagination a.button { padding: 6px 14px; }

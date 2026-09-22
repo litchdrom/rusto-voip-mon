@@ -19,12 +19,15 @@ use crate::{
 pub struct CdrListTemplate {
     pub user: Option<SessionUser>,
     pub cdrs: Vec<CdrSummary>,
-    pub total: u64,
     pub page: u32,
     pub page_size: u32,
+    pub has_more: bool,
+    pub has_prev: bool,
     pub filters: FiltersView,
     pub export_url: String,
-    pub pages: u64,
+    pub next_url: String,
+    pub prev_url: String,
+    pub day_label: String,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -38,10 +41,15 @@ pub struct FiltersView {
     pub mos_min_str: String,
     pub mos_max_str: String,
     pub id_sensor_str: String,
+    pub yesterday_from: String,
+    pub yesterday_to: String,
 }
 
 impl FiltersView {
     fn from(f: &CdrFilters) -> Self {
+        use chrono::Utc;
+        let now = Utc::now().naive_utc();
+        let yesterday = now.date().pred_opt().unwrap();
         Self {
             from_str: f.from.map(dt_input).unwrap_or_default(),
             to_str: f.to.map(dt_input).unwrap_or_default(),
@@ -58,6 +66,8 @@ impl FiltersView {
                 .map(|m| format!("{:.1}", m as f32 / 10.0))
                 .unwrap_or_default(),
             id_sensor_str: f.id_sensor.map(|v| v.to_string()).unwrap_or_default(),
+            yesterday_from: format!("{}T00:00", yesterday),
+            yesterday_to: format!("{}T23:59", yesterday),
         }
     }
 
@@ -130,26 +140,43 @@ pub async fn cdr_list(
     let filters = build_filters(&q);
     let normalized = filters.normalized();
 
-    let total = cdr::count(&state.pool, &normalized).await?;
-    let cdrs = cdr::list(&state.pool, &normalized).await?;
+    let page = cdr::list(&state.pool, &normalized).await?;
 
     let view = FiltersView::from(&filters);
     let export_url = format!("/cdr/export.csv{}", view.export_query());
-    let pages = if normalized.page_size == 0 {
-        1
+
+    let has_prev = normalized.page > 1;
+    let has_more = page.has_more;
+    let day_label = label_for_window(normalized.from, normalized.to);
+
+    let mut page_q = view.export_query();
+    if !page_q.is_empty() {
+        page_q.push('&');
+    }
+
+    let next_url = if has_more {
+        format!("/?{page_q}page={}", normalized.page + 1)
     } else {
-        total.div_ceil(normalized.page_size as u64).max(1)
+        String::new()
+    };
+    let prev_url = if has_prev {
+        format!("/?{page_q}page={}", normalized.page - 1)
+    } else {
+        String::new()
     };
 
     let tmpl = CdrListTemplate {
         user: Some(user),
-        cdrs,
-        total,
+        cdrs: page.rows,
         page: normalized.page,
         page_size: normalized.page_size,
+        has_more,
+        has_prev,
         filters: view,
         export_url,
-        pages,
+        next_url,
+        prev_url,
+        day_label,
     };
     let body = tmpl
         .render()
@@ -243,14 +270,14 @@ pub async fn cdr_export_csv(
         max_duration: None,
         id_sensor: q.id_sensor,
         page: None,
-        page_size: Some(1000),
+        page_size: Some(10_000),
     };
     let normalized = filters.normalized();
-    let rows = cdr::list(&state.pool, &normalized).await?;
+    let page = cdr::list(&state.pool, &normalized).await?;
 
-    let mut out = String::with_capacity(rows.len() * 200);
+    let mut out = String::with_capacity(page.rows.len() * 200);
     out.push_str("id,calldate,callend,duration,caller,called,last_sip,mos,id_sensor\n");
-    for r in rows {
+    for r in &page.rows {
         let mos = if r.mos_str.is_empty() { String::new() } else { r.mos_str.clone() };
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{},{}\n",
@@ -319,4 +346,32 @@ fn parse_dt(s: &Option<String>) -> Option<NaiveDateTime> {
 
 fn dt_input(d: NaiveDateTime) -> String {
     d.format("%Y-%m-%dT%H:%M").to_string()
+}
+
+/// Build a human-readable label for the active time window, shown above
+/// the CDR list. Examples: "Today", "Yesterday", "2026-09-21", "Last 7 days".
+fn label_for_window(from: Option<NaiveDateTime>, to: Option<NaiveDateTime>) -> String {
+    use chrono::Utc;
+    let now = Utc::now().naive_utc();
+    let today = now.date();
+    match (from, to) {
+        (Some(f), Some(t)) if f.date() == t.date() => {
+            let d = f.date();
+            if d == today {
+                "Today".to_string()
+            } else if d == today.pred_opt().unwrap() {
+                "Yesterday".to_string()
+            } else {
+                d.format("%Y-%m-%d").to_string()
+            }
+        }
+        (Some(_), Some(_)) => format!(
+            "{} \u{2192} {}",
+            from.unwrap().format("%Y-%m-%d %H:%M"),
+            to.unwrap().format("%Y-%m-%d %H:%M")
+        ),
+        (Some(f), None) => format!("from {}", f.format("%Y-%m-%d %H:%M")),
+        (None, Some(t)) => format!("until {}", t.format("%Y-%m-%d %H:%M")),
+        (None, None) => "All time".to_string(),
+    }
 }

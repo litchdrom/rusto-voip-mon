@@ -10,7 +10,7 @@
 //!                     (`mos_str`, `src_ip_str`, `dst_ip_str`). Templates
 //!                     consume this one.
 
-use chrono::{Duration, NaiveDateTime, Utc};
+use chrono::{NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, MySqlPool};
 
@@ -104,13 +104,19 @@ impl CdrFilters {
         let page = self.page.unwrap_or(1).max(1);
         let page_size = self.page_size.unwrap_or(50).clamp(1, 500);
 
-        // Default the time window to "last 24h" when the caller didn't
-        // specify one — keeps COUNT(*) cheap on the partitioned table.
+        // Default the time window to **today** (00:00:00 .. 23:59:59 UTC)
+        // when the caller didn't specify one. This:
+        //   - keeps the query inside a single partition,
+        //   - gives the user "today's calls" as the natural starting point,
+        //   - leaves only one partition to scan instead of many.
         let (from, to) = match (self.from, self.to) {
             (None, None) => {
                 let now = Utc::now().naive_utc();
-                let from = now - Duration::hours(24);
-                (Some(from), Some(now))
+                let day: NaiveDate = now.date();
+                (
+                    Some(day.and_hms_opt(0, 0, 0).unwrap()),
+                    Some(day.and_hms_opt(23, 59, 59).unwrap()),
+                )
             }
             (Some(f), None) => (Some(f), None),
             (None, Some(t)) => (None, Some(t)),
@@ -224,13 +230,19 @@ pub enum FilterBind {
     U16(u16),
 }
 
-pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrSummary>, sqlx::Error> {
-    let rows = list_raw(pool, f).await?;
-    Ok(rows.into_iter().map(CdrSummary::from).collect())
+/// Page of CDRs plus a flag indicating whether at least one more page
+/// likely exists (used by the prev/next pagination links).
+#[derive(Debug, Clone)]
+pub struct CdrPage {
+    pub rows: Vec<CdrSummary>,
+    pub has_more: bool,
 }
 
-async fn list_raw(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrRow>, sqlx::Error> {
+/// Fetch a single page of CDRs. We over-fetch by one row beyond the page
+/// size to cheaply detect "there's a next page" without a separate COUNT.
+pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<CdrPage, sqlx::Error> {
     let (where_sql, binds) = f.to_where();
+    let limit = f.page_size + 1;
     let sql = format!(
         "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
                 caller, callername, called, sipcallerip, sipcalledip, \
@@ -238,7 +250,7 @@ async fn list_raw(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrRow>
                 mos_min_mult10, a_lost, b_lost, id_sensor \
            FROM cdr \
            {where_sql} \
-          ORDER BY calldate DESC \
+          ORDER BY calldate DESC, ID DESC \
           LIMIT ? OFFSET ?",
     );
     let mut q = sqlx::query_as::<_, CdrRow>(&sql);
@@ -250,24 +262,14 @@ async fn list_raw(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrRow>
             FilterBind::U16(v) => q.bind(*v),
         };
     }
-    q = q.bind(f.page_size).bind(f.offset());
-    q.fetch_all(pool).await
-}
-
-pub async fn count(pool: &MySqlPool, f: &NormalizedFilters) -> Result<u64, sqlx::Error> {
-    let (where_sql, binds) = f.to_where();
-    let sql = format!("SELECT COUNT(*) AS c FROM cdr {where_sql}");
-    let mut q = sqlx::query_scalar::<_, i64>(&sql);
-    for b in &binds {
-        q = match b {
-            FilterBind::DateTime(d) => q.bind(d),
-            FilterBind::Str(s) => q.bind(s),
-            FilterBind::U32(v) => q.bind(*v),
-            FilterBind::U16(v) => q.bind(*v),
-        };
+    q = q.bind(limit).bind(f.offset());
+    let mut rows = q.fetch_all(pool).await?;
+    let has_more = rows.len() as u32 > f.page_size;
+    if has_more {
+        rows.truncate(f.page_size as usize);
     }
-    let c = q.fetch_one(pool).await?;
-    Ok(c.max(0) as u64)
+    let summaries = rows.into_iter().map(CdrSummary::from).collect();
+    Ok(CdrPage { rows: summaries, has_more })
 }
 
 /// Parse an IPv4 string ("1.2.3.4") into VoIPmonitor's int representation
