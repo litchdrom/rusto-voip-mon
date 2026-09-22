@@ -1,0 +1,13 @@
+{% macro qs(f) %}
+{%- set parts = [] -%}
+{%- if let Some(v) = f.from %}{%- set _ = parts.push(format!("from={}", v.format("%Y-%m-%dT%H:%M"))) -%}{%- endif -%}
+{%- if let Some(v) = f.to %}{%- set _ = parts.push(format!("to={}", v.format("%Y-%m-%dT%H:%M"))) -%}{%- endif -%}
+{%- if let Some(v) = f.caller %}{%- set _ = parts.push(format!("caller={}", v)) -%}{%- endif -%}
+{%- if let Some(v) = f.called %}{%- set _ = parts.push(format!("called={}", v)) -%}{%- endif -%}
+{%- if let Some(v) = f.src_ip %}{%- set _ = parts.push(format!("src_ip={}", v)) -%}{%- endif -%}
+{%- if let Some(v) = f.sip_code %}{%- set _ = parts.push(format!("sip_code={}", v)) -%}{%- endif -%}
+{%- if let Some(v) = f.mos_min %}{%- set _ = parts.push(format!("mos_min={}", v)) -%}{%- endif -%}
+{%- if let Some(v) = f.mos_max %}{%- set _ = parts.push(format!("mos_max={}", v)) -%}{%- endif -%}
+{%- if let Some(v) = f.id_sensor %}{%- set _ = parts.push(format!("id_sensor={}", v)) -%}{%- endif -%}
+{{ parts.join("&") }}
+{%- endmacro qs %}

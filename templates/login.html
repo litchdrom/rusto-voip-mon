@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Login · rusto-voip-mon{% endblock %}
+{% block content %}
+<section class="login-card">
+  <h1>rusto-voip-mon</h1>
+  <p class="muted">Sign in with your VoIPmonitor credentials</p>
+  {% if let Some(e) = error %}
+    <div class="error">{{ e }}</div>
+  {% endif %}
+  <form method="post" action="/login">
+    {% if let Some(n) = next %}
+      <input type="hidden" name="next" value="{{ n }}">
+    {% endif %}
+    <label>
+      <span>Username</span>
+      <input type="text" name="username" required autofocus>
+    </label>
+    <label>
+      <span>Password</span>
+      <input type="password" name="password" required>
+    </label>
+    <button type="submit">Sign in</button>
+  </form>
+</section>
+{% endblock %}

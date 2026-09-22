@@ -1,0 +1,183 @@
+:root {
+  --bg: #0f1419;
+  --bg-elev: #1a1f2a;
+  --bg-elev-2: #232938;
+  --border: #2a3142;
+  --fg: #e6e9ef;
+  --fg-muted: #8a93a6;
+  --accent: #4a9eff;
+  --accent-hover: #6cb1ff;
+  --danger: #ff5470;
+  --success: #4ade80;
+  --warn: #fbbf24;
+  --radius: 6px;
+  --mono: ui-monospace, "Cascadia Mono", "Consolas", monospace;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+h1 { font-size: 22px; margin: 0 0 16px; }
+h2 { font-size: 18px; margin: 16px 0 12px; }
+
+.muted { color: var(--fg-muted); }
+.center { text-align: center; }
+.num { font-variant-numeric: tabular-nums; text-align: right; }
+
+.topbar {
+  background: var(--bg-elev);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 24px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.topbar .brand a { color: var(--fg); font-weight: 600; }
+.topbar .user { color: var(--fg-muted); font-size: 13px; }
+.topbar .user form { display: inline; }
+
+.link-button {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+.link-button:hover { color: var(--accent-hover); text-decoration: underline; }
+
+.content { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+}
+
+.button {
+  background: var(--accent);
+  color: #fff;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  border: none;
+  cursor: pointer;
+  font: inherit;
+}
+.button:hover { background: var(--accent-hover); }
+
+.filters {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.filters .grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+.filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.filters input, .filters select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font: inherit;
+}
+.filter-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 12px;
+  align-items: center;
+}
+
+table.cdrs {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+table.cdrs th, table.cdrs td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+table.cdrs th {
+  background: var(--bg-elev-2);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+}
+table.cdrs tr:last-child td { border-bottom: none; }
+table.cdrs tr:hover { background: var(--bg-elev-2); }
+
+.error {
+  background: rgba(255, 84, 112, 0.1);
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  padding: 8px 12px;
+  border-radius: var(--radius);
+  margin-bottom: 12px;
+}
+
+.login-card {
+  max-width: 360px;
+  margin: 80px auto;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 32px;
+}
+.login-card h1 { margin-bottom: 4px; }
+.login-card form { display: flex; flex-direction: column; gap: 12px; }
+.login-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+.login-card input {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font: inherit;
+}
+.login-card button[type=submit] {
+  background: var(--accent);
+  color: #fff;
+  padding: 10px;
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 500;
+  margin-top: 8px;
+}
+.login-card button[type=submit]:hover { background: var(--accent-hover); }

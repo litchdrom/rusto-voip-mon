@@ -1,0 +1,37 @@
+version: "3.8"
+
+# Example: run rusto-voip-mon against an EXISTING VoIPmonitor MySQL/MariaDB
+# and the existing /var/spool/voipmonitor pcap directory. Adjust the bind
+# paths and DATABASE_URL for your environment.
+#
+# This compose does NOT run VoIPmonitor — it only reads from its database
+# and serves pcaps from its spool.
+
+services:
+  rusto-voip-mon:
+    image: ghcr.io/litchdrom/rusto-voip-mon:latest
+    container_name: rusto-voip-mon
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      LISTEN: "0.0.0.0:8080"
+      # Read-only MySQL user recommended.
+      DATABASE_URL: "mysql://voipmonitor:CHANGE_ME@host.docker.internal:3306/voipmonitor"
+      PCAP_DIR: "/var/spool/voipmonitor"
+      # Generate with: openssl rand -hex 32
+      APP_COOKIE_SECRET: "CHANGE_ME_TO_RANDOM_64_HEX_CHARS"
+      RUST_LOG: "info,rusto_voip_mon=debug"
+    volumes:
+      # Mount the VoIPmonitor pcap spool as read-only.
+      - /var/spool/voipmonitor:/var/spool/voipmonitor:ro
+    # extra_hosts helps the container reach the MySQL host if it's the
+    # Docker host. Remove if your DB is on a separate host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rusto-voip-mon", "--healthcheck-only"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

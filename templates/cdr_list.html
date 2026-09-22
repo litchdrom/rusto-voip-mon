@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}CDR list · rusto-voip-mon{% endblock %}
+{% block content %}
+
+<section class="page-header">
+  <h1>Call Detail Records</h1>
+  <div class="actions">
+    <a class="button" href="{{ export_url }}">Export CSV</a>
+  </div>
+</section>
+
+<form method="get" action="/" class="filters">
+  <div class="grid">
+    <label><span>From</span><input type="datetime-local" name="from" value="{{ filters.from_str }}"></label>
+    <label><span>To</span><input type="datetime-local" name="to" value="{{ filters.to_str }}"></label>
+    <label><span>Caller</span><input type="text" name="caller" value="{{ filters.caller }}"></label>
+    <label><span>Called</span><input type="text" name="called" value="{{ filters.called }}"></label>
+    <label><span>Source IP</span><input type="text" name="src_ip" value="{{ filters.src_ip }}" placeholder="1.2.3.4"></label>
+    <label><span>SIP code</span><input type="number" name="sip_code" value="{{ filters.sip_code_str }}"></label>
+    <label><span>MOS min</span><input type="number" step="0.1" min="0" max="5" name="mos_min" value="{{ filters.mos_min_str }}"></label>
+    <label><span>MOS max</span><input type="number" step="0.1" min="0" max="5" name="mos_max" value="{{ filters.mos_max_str }}"></label>
+    <label><span>Sensor ID</span><input type="number" name="id_sensor" value="{{ filters.id_sensor_str }}"></label>
+  </div>
+  <div class="filter-actions">
+    <button type="submit">Apply</button>
+    <a class="link" href="/">Clear</a>
+  </div>
+</form>
+
+<p class="muted">{{ total }} record{% if total != 1 %}s{% endif %} · page {{ page }} of {{ pages }}</p>
+
+<table class="cdrs">
+  <thead>
+    <tr>
+      <th>calldate</th>
+      <th>caller</th>
+      <th>called</th>
+      <th class="num">dur</th>
+      <th class="num">SIP</th>
+      <th class="num">MOS</th>
+      <th class="num">lost (a/b)</th>
+      <th>sensor</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for c in cdrs %}
+    <tr>
+      <td>{{ c.calldate.format("%Y-%m-%d %H:%M:%S") }}</td>
+      <td>{{ c.caller.as_deref().unwrap_or("") }}</td>
+      <td>{{ c.called.as_deref().unwrap_or("") }}</td>
+      <td class="num">{% if let Some(v) = c.duration %}{{ v }}s{% endif %}</td>
+      <td class="num">{% if let Some(v) = c.last_sip_response_num %}{{ v }}{% endif %}</td>
+      <td class="num">{{ c.mos_str }}</td>
+      <td class="num">{{ c.a_lost.unwrap_or(0) }} / {{ c.b_lost.unwrap_or(0) }}</td>
+      <td>{{ c.id_sensor.unwrap_or(0) }}</td>
+      <td><a href="/cdr/{{ c.id }}">view</a></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="9" class="muted center">No CDRs match the current filter.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+{% endblock %}
