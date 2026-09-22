@@ -10,17 +10,32 @@
 </section>
 
 <form method="get" action="/" class="filters">
+  <datalist id="sip-codes">
+    {% for v in distinct.sip_codes %}<option value="{{ v }}"></option>{% endfor %}
+  </datalist>
+  <datalist id="sensor-ids">
+    {% for v in distinct.sensor_ids %}<option value="{{ v }}"></option>{% endfor %}
+  </datalist>
+  <datalist id="src-ips">
+    {% for v in distinct.src_ips %}<option value="{{ v }}"></option>{% endfor %}
+  </datalist>
+  <datalist id="dst-ips">
+    {% for v in distinct.dst_ips %}<option value="{{ v }}"></option>{% endfor %}
+  </datalist>
+
   <div class="grid">
     <label><span>From</span><input type="datetime-local" name="from" value="{{ filters.from_str }}"></label>
     <label><span>To</span><input type="datetime-local" name="to" value="{{ filters.to_str }}"></label>
     <label><span>Caller</span><input type="text" name="caller" value="{{ filters.caller }}"></label>
     <label><span>Called</span><input type="text" name="called" value="{{ filters.called }}"></label>
-    <label><span>Source IP</span><input type="text" name="src_ip" value="{{ filters.src_ip }}" placeholder="1.2.3.4"></label>
-    <label><span>SIP code</span><input type="number" name="sip_code" value="{{ filters.sip_code_str }}"></label>
+    <label><span>Source IP(s)</span><input type="text" name="src_ip" list="src-ips" value="{{ filters.src_ip }}" placeholder="1.2.3.4, 5.6.7.8"></label>
+    <label><span>Dest IP(s)</span><input type="text" name="dst_ip" list="dst-ips" value="{{ filters.dst_ip }}" placeholder="1.2.3.4, 5.6.7.8"></label>
+    <label><span>SIP code(s)</span><input type="text" name="sip_code" list="sip-codes" value="{{ filters.sip_code_str }}" placeholder="200, 486, 503"></label>
+    <label><span>Sensor ID(s)</span><input type="text" name="id_sensor" list="sensor-ids" value="{{ filters.id_sensor_str }}" placeholder="1, 2"></label>
     <label><span>MOS min</span><input type="number" step="0.1" min="0" max="5" name="mos_min" value="{{ filters.mos_min_str }}"></label>
     <label><span>MOS max</span><input type="number" step="0.1" min="0" max="5" name="mos_max" value="{{ filters.mos_max_str }}"></label>
-    <label><span>Sensor ID</span><input type="number" name="id_sensor" value="{{ filters.id_sensor_str }}"></label>
   </div>
+  <p class="muted hint">Multiple values: separate with commas. Empty fields are ignored. Pick from suggestions or type custom.</p>
   <div class="filter-actions">
     <button type="submit">Apply</button>
     <a class="link" href="/">Today</a>
@@ -40,6 +55,8 @@
       <th>calldate</th>
       <th>caller</th>
       <th>called</th>
+      <th>src IP</th>
+      <th>dst IP</th>
       <th class="num">dur</th>
       <th class="num">SIP</th>
       <th class="num">MOS</th>
@@ -54,6 +71,8 @@
       <td>{{ c.calldate.format("%Y-%m-%d %H:%M:%S") }}</td>
       <td>{{ c.caller.as_deref().unwrap_or("") }}</td>
       <td>{{ c.called.as_deref().unwrap_or("") }}</td>
+      <td>{{ c.src_ip_str }}</td>
+      <td>{{ c.dst_ip_str }}</td>
       <td class="num">{% if let Some(v) = c.duration %}{{ v }}s{% endif %}</td>
       <td class="num">{% if let Some(v) = c.last_sip_response_num %}{{ v }}{% endif %}</td>
       <td class="num">{{ c.mos_str }}</td>
@@ -62,7 +81,7 @@
       <td><a href="/cdr/{{ c.id }}">view</a></td>
     </tr>
     {% else %}
-    <tr><td colspan="9" class="muted center">No CDRs match the current filter.</td></tr>
+    <tr><td colspan="11" class="muted center">No CDRs match the current filter.</td></tr>
     {% endfor %}
   </tbody>
 </table>

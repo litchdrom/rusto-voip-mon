@@ -24,10 +24,31 @@ pub struct CdrListTemplate {
     pub has_more: bool,
     pub has_prev: bool,
     pub filters: FiltersView,
+    pub distinct: DistinctView,
     pub export_url: String,
     pub next_url: String,
     pub prev_url: String,
     pub day_label: String,
+}
+
+/// Stringified versions of the distinct values, ready for the template.
+#[derive(Debug, Default, Clone)]
+pub struct DistinctView {
+    pub sip_codes: Vec<String>,
+    pub sensor_ids: Vec<String>,
+    pub src_ips: Vec<String>,
+    pub dst_ips: Vec<String>,
+}
+
+impl DistinctView {
+    fn from(d: cdr::DistinctValues) -> Self {
+        Self {
+            sip_codes: d.sip_codes.iter().map(|v| v.to_string()).collect(),
+            sensor_ids: d.sensor_ids.iter().map(|v| v.to_string()).collect(),
+            src_ips: d.src_ips.iter().map(|&v| cdr::int_to_ipv4(v)).collect(),
+            dst_ips: d.dst_ips.iter().map(|&v| cdr::int_to_ipv4(v)).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -36,10 +57,15 @@ pub struct FiltersView {
     pub to_str: String,
     pub caller: String,
     pub called: String,
+    /// Comma-separated input shown in the form.
     pub src_ip: String,
+    /// Comma-separated input shown in the form.
+    pub dst_ip: String,
+    /// Comma-separated input shown in the form.
     pub sip_code_str: String,
     pub mos_min_str: String,
     pub mos_max_str: String,
+    /// Comma-separated input shown in the form.
     pub id_sensor_str: String,
     pub yesterday_from: String,
     pub yesterday_to: String,
@@ -56,7 +82,8 @@ impl FiltersView {
             caller: f.caller.clone().unwrap_or_default(),
             called: f.called.clone().unwrap_or_default(),
             src_ip: f.src_ip.clone().unwrap_or_default(),
-            sip_code_str: f.sip_code.map(|v| v.to_string()).unwrap_or_default(),
+            dst_ip: f.dst_ip.clone().unwrap_or_default(),
+            sip_code_str: f.sip_code.clone().unwrap_or_default(),
             mos_min_str: f
                 .mos_min
                 .map(|m| format!("{:.1}", m as f32 / 10.0))
@@ -65,7 +92,7 @@ impl FiltersView {
                 .mos_max
                 .map(|m| format!("{:.1}", m as f32 / 10.0))
                 .unwrap_or_default(),
-            id_sensor_str: f.id_sensor.map(|v| v.to_string()).unwrap_or_default(),
+            id_sensor_str: f.id_sensor.clone().unwrap_or_default(),
             yesterday_from: format!("{}T00:00", yesterday),
             yesterday_to: format!("{}T23:59", yesterday),
         }
@@ -87,6 +114,9 @@ impl FiltersView {
         }
         if !self.src_ip.is_empty() {
             parts.push(("src_ip".into(), self.src_ip.clone()));
+        }
+        if !self.dst_ip.is_empty() {
+            parts.push(("dst_ip".into(), self.dst_ip.clone()));
         }
         if !self.sip_code_str.is_empty() {
             parts.push(("sip_code".into(), self.sip_code_str.clone()));
@@ -124,6 +154,7 @@ pub struct ListQuery {
     pub caller: Option<String>,
     pub called: Option<String>,
     pub src_ip: Option<String>,
+    pub dst_ip: Option<String>,
     // Numeric fields are taken as raw strings so an empty form value
     // (e.g. `mos_min=`) doesn't fail deserialization. We parse them
     // manually in `build_filters`.
@@ -143,7 +174,13 @@ pub async fn cdr_list(
     let filters = build_filters(&q);
     let normalized = filters.normalized();
 
-    let page = cdr::list(&state.pool, &normalized).await?;
+    // Fetch the rows + distinct values for the dropdowns in parallel.
+    let (page_result, distinct_result) = tokio::join!(
+        cdr::list(&state.pool, &normalized),
+        cdr::distinct_values(&state.pool, 7, 100),
+    );
+    let page = page_result?;
+    let distinct = DistinctView::from(distinct_result?);
 
     let view = FiltersView::from(&filters);
     let export_url = format!("/cdr/export.csv{}", view.export_query());
@@ -176,6 +213,7 @@ pub async fn cdr_list(
         has_more,
         has_prev,
         filters: view,
+        distinct,
         export_url,
         next_url,
         prev_url,
@@ -266,12 +304,13 @@ pub async fn cdr_export_csv(
         caller: q.caller.filter(|s| !s.is_empty()),
         called: q.called.filter(|s| !s.is_empty()),
         src_ip: q.src_ip.filter(|s| !s.is_empty()),
-        sip_code: parse_opt(q.sip_code.as_deref()),
+        dst_ip: q.dst_ip.filter(|s| !s.is_empty()),
+        sip_code: q.sip_code.filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: parse_opt(q.id_sensor.as_deref()),
+        id_sensor: q.id_sensor.filter(|s| !s.is_empty()),
         page: None,
         page_size: Some(10_000),
     };
@@ -315,12 +354,13 @@ fn build_filters(q: &ListQuery) -> CdrFilters {
         caller: q.caller.clone().filter(|s| !s.is_empty()),
         called: q.called.clone().filter(|s| !s.is_empty()),
         src_ip: q.src_ip.clone().filter(|s| !s.is_empty()),
-        sip_code: parse_opt(q.sip_code.as_deref()),
+        dst_ip: q.dst_ip.clone().filter(|s| !s.is_empty()),
+        sip_code: q.sip_code.clone().filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: parse_opt(q.id_sensor.as_deref()),
+        id_sensor: q.id_sensor.clone().filter(|s| !s.is_empty()),
         page: parse_opt(q.page.as_deref()),
         page_size: parse_opt(q.page_size.as_deref()),
     }

@@ -195,3 +195,8 @@ table.cdrs tr:hover { background: var(--bg-elev-2); }
   justify-content: flex-end;
 }
 .pagination a.button { padding: 6px 14px; }
+
+.hint {
+  font-size: 12px;
+  margin: 8px 0 0;
+}

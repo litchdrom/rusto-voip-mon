@@ -10,7 +10,7 @@
 //!                     (`mos_str`, `src_ip_str`, `dst_ip_str`). Templates
 //!                     consume this one.
 
-use chrono::{NaiveDate, NaiveDateTime, Utc};
+use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, MySqlPool};
 
@@ -88,13 +88,18 @@ pub struct CdrFilters {
     pub to: Option<NaiveDateTime>,
     pub caller: Option<String>,
     pub called: Option<String>,
+    /// Caller-side IPs (matches `sipcallerip`). Comma-separated in the form.
     pub src_ip: Option<String>,
-    pub sip_code: Option<u16>,
+    /// Callee-side IPs (matches `sipcalledip`). Comma-separated in the form.
+    pub dst_ip: Option<String>,
+    /// SIP response codes. Comma-separated in the form.
+    pub sip_code: Option<String>,
+    /// Sensor IDs. Comma-separated in the form.
+    pub id_sensor: Option<String>,
     pub mos_min: Option<u8>,
     pub mos_max: Option<u8>,
     pub min_duration: Option<u32>,
     pub max_duration: Option<u32>,
-    pub id_sensor: Option<u16>,
     pub page: Option<u32>,
     pub page_size: Option<u32>,
 }
@@ -105,10 +110,7 @@ impl CdrFilters {
         let page_size = self.page_size.unwrap_or(50).clamp(1, 500);
 
         // Default the time window to **today** (00:00:00 .. 23:59:59 UTC)
-        // when the caller didn't specify one. This:
-        //   - keeps the query inside a single partition,
-        //   - gives the user "today's calls" as the natural starting point,
-        //   - leaves only one partition to scan instead of many.
+        // when the caller didn't specify one.
         let (from, to) = match (self.from, self.to) {
             (None, None) => {
                 let now = Utc::now().naive_utc();
@@ -128,13 +130,14 @@ impl CdrFilters {
             to,
             caller: self.caller.clone(),
             called: self.called.clone(),
-            src_ip: self.src_ip.clone(),
-            sip_code: self.sip_code,
+            src_ips: parse_ip_list(self.src_ip.as_deref()),
+            dst_ips: parse_ip_list(self.dst_ip.as_deref()),
+            sip_codes: parse_u16_list(self.sip_code.as_deref()),
+            sensor_ids: parse_u16_list(self.id_sensor.as_deref()),
             mos_min_mult10: self.mos_min.map(|m| (m as u16) * 10),
             mos_max_mult10: self.mos_max.map(|m| (m as u16) * 10),
             min_duration: self.min_duration,
             max_duration: self.max_duration,
-            id_sensor: self.id_sensor,
             page,
             page_size,
         }
@@ -147,13 +150,14 @@ pub struct NormalizedFilters {
     pub to: Option<NaiveDateTime>,
     pub caller: Option<String>,
     pub called: Option<String>,
-    pub src_ip: Option<String>,
-    pub sip_code: Option<u16>,
+    pub src_ips: Vec<u32>,
+    pub dst_ips: Vec<u32>,
+    pub sip_codes: Vec<u16>,
+    pub sensor_ids: Vec<u16>,
     pub mos_min_mult10: Option<u16>,
     pub mos_max_mult10: Option<u16>,
     pub min_duration: Option<u32>,
     pub max_duration: Option<u32>,
-    pub id_sensor: Option<u16>,
     pub page: u32,
     pub page_size: u32,
 }
@@ -167,6 +171,7 @@ impl NormalizedFilters {
     pub fn to_where(&self) -> (String, Vec<FilterBind>) {
         let mut parts: Vec<String> = Vec::new();
         let mut binds: Vec<FilterBind> = Vec::new();
+
         if let Some(from) = self.from {
             parts.push("calldate >= ?".into());
             binds.push(FilterBind::DateTime(from));
@@ -183,16 +188,41 @@ impl NormalizedFilters {
             parts.push("called LIKE ?".into());
             binds.push(FilterBind::Str(format!("%{c}%")));
         }
-        if let Some(ip) = &self.src_ip {
-            if let Some(int_ip) = ipv4_to_int(ip) {
-                parts.push("(sipcallerip = ? OR sipcalledip = ?)".into());
-                binds.push(FilterBind::U32(int_ip));
-                binds.push(FilterBind::U32(int_ip));
+        if !self.src_ips.is_empty() {
+            parts.push(format!(
+                "sipcallerip IN ({})",
+                placeholders(self.src_ips.len())
+            ));
+            for v in &self.src_ips {
+                binds.push(FilterBind::U32(*v));
             }
         }
-        if let Some(code) = self.sip_code {
-            parts.push("lastSIPresponseNum = ?".into());
-            binds.push(FilterBind::U16(code));
+        if !self.dst_ips.is_empty() {
+            parts.push(format!(
+                "sipcalledip IN ({})",
+                placeholders(self.dst_ips.len())
+            ));
+            for v in &self.dst_ips {
+                binds.push(FilterBind::U32(*v));
+            }
+        }
+        if !self.sip_codes.is_empty() {
+            parts.push(format!(
+                "lastSIPresponseNum IN ({})",
+                placeholders(self.sip_codes.len())
+            ));
+            for v in &self.sip_codes {
+                binds.push(FilterBind::U16(*v));
+            }
+        }
+        if !self.sensor_ids.is_empty() {
+            parts.push(format!(
+                "id_sensor IN ({})",
+                placeholders(self.sensor_ids.len())
+            ));
+            for v in &self.sensor_ids {
+                binds.push(FilterBind::U16(*v));
+            }
         }
         if let Some(m) = self.mos_min_mult10 {
             parts.push("mos_min_mult10 >= ?".into());
@@ -210,10 +240,7 @@ impl NormalizedFilters {
             parts.push("duration <= ?".into());
             binds.push(FilterBind::U32(d));
         }
-        if let Some(s) = self.id_sensor {
-            parts.push("id_sensor = ?".into());
-            binds.push(FilterBind::U16(s));
-        }
+
         let where_sql = if parts.is_empty() {
             String::new()
         } else {
@@ -228,6 +255,34 @@ pub enum FilterBind {
     Str(String),
     U32(u32),
     U16(u16),
+}
+
+fn placeholders(n: usize) -> String {
+    std::iter::repeat("?")
+        .take(n)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Parse a comma-separated list of IPv4 strings, dropping invalid/empty
+/// entries. Returns an empty Vec when no valid IPs are present.
+fn parse_ip_list(s: Option<&str>) -> Vec<u32> {
+    let Some(s) = s else { return Vec::new() };
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(ipv4_to_int)
+        .collect()
+}
+
+/// Parse a comma-separated list of u16s, dropping invalid/empty entries.
+fn parse_u16_list(s: Option<&str>) -> Vec<u16> {
+    let Some(s) = s else { return Vec::new() };
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse::<u16>().ok())
+        .collect()
 }
 
 /// Page of CDRs plus a flag indicating whether at least one more page
@@ -270,6 +325,74 @@ pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<CdrPage, sq
     }
     let summaries = rows.into_iter().map(CdrSummary::from).collect();
     Ok(CdrPage { rows: summaries, has_more })
+}
+
+/// Distinct values from the last N days, used to populate the filter
+/// `<datalist>` pickers so users can choose from observed values OR type
+/// custom ones (the text input + datalist combo).
+#[derive(Debug, Clone)]
+pub struct DistinctValues {
+    pub sip_codes: Vec<u16>,
+    pub sensor_ids: Vec<u16>,
+    pub src_ips: Vec<u32>,
+    pub dst_ips: Vec<u32>,
+}
+
+/// Returns up to `limit` distinct values per field, scoped to the last
+/// `lookback_days` days so the dropdown stays relevant.
+pub async fn distinct_values(
+    pool: &MySqlPool,
+    lookback_days: i64,
+    limit: u32,
+) -> Result<DistinctValues, sqlx::Error> {
+    let since = Utc::now().naive_utc() - Duration::days(lookback_days);
+
+    let sip_codes: Vec<u16> = sqlx::query_scalar(
+        "SELECT DISTINCT lastSIPresponseNum FROM cdr \
+          WHERE calldate >= ? AND lastSIPresponseNum IS NOT NULL \
+          ORDER BY lastSIPresponseNum ASC LIMIT ?",
+    )
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let sensor_ids: Vec<u16> = sqlx::query_scalar(
+        "SELECT DISTINCT id_sensor FROM cdr \
+          WHERE calldate >= ? AND id_sensor IS NOT NULL \
+          ORDER BY id_sensor ASC LIMIT ?",
+    )
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let src_ips: Vec<u32> = sqlx::query_scalar(
+        "SELECT DISTINCT sipcallerip FROM cdr \
+          WHERE calldate >= ? AND sipcallerip IS NOT NULL \
+          ORDER BY sipcallerip DESC LIMIT ?",
+    )
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let dst_ips: Vec<u32> = sqlx::query_scalar(
+        "SELECT DISTINCT sipcalledip FROM cdr \
+          WHERE calldate >= ? AND sipcalledip IS NOT NULL \
+          ORDER BY sipcalledip DESC LIMIT ?",
+    )
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(DistinctValues {
+        sip_codes,
+        sensor_ids,
+        src_ips,
+        dst_ips,
+    })
 }
 
 /// Parse an IPv4 string ("1.2.3.4") into VoIPmonitor's int representation
