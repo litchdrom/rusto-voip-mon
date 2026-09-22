@@ -124,12 +124,15 @@ pub struct ListQuery {
     pub caller: Option<String>,
     pub called: Option<String>,
     pub src_ip: Option<String>,
-    pub sip_code: Option<u16>,
-    pub mos_min: Option<u8>,
-    pub mos_max: Option<u8>,
-    pub id_sensor: Option<u16>,
-    pub page: Option<u32>,
-    pub page_size: Option<u32>,
+    // Numeric fields are taken as raw strings so an empty form value
+    // (e.g. `mos_min=`) doesn't fail deserialization. We parse them
+    // manually in `build_filters`.
+    pub sip_code: Option<String>,
+    pub mos_min: Option<String>,
+    pub mos_max: Option<String>,
+    pub id_sensor: Option<String>,
+    pub page: Option<String>,
+    pub page_size: Option<String>,
 }
 
 pub async fn cdr_list(
@@ -263,12 +266,12 @@ pub async fn cdr_export_csv(
         caller: q.caller.filter(|s| !s.is_empty()),
         called: q.called.filter(|s| !s.is_empty()),
         src_ip: q.src_ip.filter(|s| !s.is_empty()),
-        sip_code: q.sip_code,
-        mos_min: q.mos_min,
-        mos_max: q.mos_max,
+        sip_code: parse_opt(q.sip_code.as_deref()),
+        mos_min: parse_opt(q.mos_min.as_deref()),
+        mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: q.id_sensor,
+        id_sensor: parse_opt(q.id_sensor.as_deref()),
         page: None,
         page_size: Some(10_000),
     };
@@ -312,14 +315,30 @@ fn build_filters(q: &ListQuery) -> CdrFilters {
         caller: q.caller.clone().filter(|s| !s.is_empty()),
         called: q.called.clone().filter(|s| !s.is_empty()),
         src_ip: q.src_ip.clone().filter(|s| !s.is_empty()),
-        sip_code: q.sip_code,
-        mos_min: q.mos_min,
-        mos_max: q.mos_max,
+        sip_code: parse_opt(q.sip_code.as_deref()),
+        mos_min: parse_opt(q.mos_min.as_deref()),
+        mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: q.id_sensor,
-        page: q.page,
-        page_size: q.page_size,
+        id_sensor: parse_opt(q.id_sensor.as_deref()),
+        page: parse_opt(q.page.as_deref()),
+        page_size: parse_opt(q.page_size.as_deref()),
+    }
+}
+
+/// Parse an optional form field. Empty / whitespace → None.
+/// Non-empty but unparseable → also None (we log it as a warning).
+fn parse_opt<T: std::str::FromStr>(s: Option<&str>) -> Option<T> {
+    let s = s?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match s.parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            tracing::warn!(value = s, "ignored unparseable query field");
+            None
+        }
     }
 }
 
