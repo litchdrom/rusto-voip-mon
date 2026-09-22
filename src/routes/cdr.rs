@@ -34,19 +34,72 @@ pub struct CdrListTemplate {
 /// Stringified versions of the distinct values, ready for the template.
 #[derive(Debug, Default, Clone)]
 pub struct DistinctView {
-    pub sip_codes: Vec<String>,
-    pub sensor_ids: Vec<String>,
-    pub src_ips: Vec<String>,
-    pub dst_ips: Vec<String>,
+    pub sip_codes: Vec<DistinctItem>,
+    pub sensor_ids: Vec<DistinctItem>,
+    pub src_ips: Vec<DistinctItem>,
+    pub dst_ips: Vec<DistinctItem>,
+    /// Total selected across all fields, for the header badge.
+    pub total_selected: usize,
+}
+
+/// One distinct value with an `is_checked` flag for the checkbox widget.
+/// Concrete (non-generic) so Askama's derive can compile the template.
+#[derive(Debug, Clone)]
+pub struct DistinctItem {
+    pub value: String,
+    pub is_checked: bool,
 }
 
 impl DistinctView {
-    fn from(d: cdr::DistinctValues) -> Self {
+    fn from(
+        d: cdr::DistinctValues,
+        selected_src_ips: &[u32],
+        selected_dst_ips: &[u32],
+        selected_sip_codes: &[u16],
+        selected_sensor_ids: &[u16],
+    ) -> Self {
+        let src_ips: Vec<DistinctItem> = d
+            .src_ips
+            .iter()
+            .map(|&v| DistinctItem {
+                value: cdr::int_to_ipv4(v),
+                is_checked: selected_src_ips.contains(&v),
+            })
+            .collect();
+        let dst_ips: Vec<DistinctItem> = d
+            .dst_ips
+            .iter()
+            .map(|&v| DistinctItem {
+                value: cdr::int_to_ipv4(v),
+                is_checked: selected_dst_ips.contains(&v),
+            })
+            .collect();
+        let sip_codes: Vec<DistinctItem> = d
+            .sip_codes
+            .iter()
+            .map(|v| DistinctItem {
+                value: v.to_string(),
+                is_checked: selected_sip_codes.contains(v),
+            })
+            .collect();
+        let sensor_ids: Vec<DistinctItem> = d
+            .sensor_ids
+            .iter()
+            .map(|v| DistinctItem {
+                value: v.to_string(),
+                is_checked: selected_sensor_ids.contains(v),
+            })
+            .collect();
+        let total_selected = src_ips.iter().filter(|i| i.is_checked).count()
+            + dst_ips.iter().filter(|i| i.is_checked).count()
+            + sip_codes.iter().filter(|i| i.is_checked).count()
+            + sensor_ids.iter().filter(|i| i.is_checked).count();
         Self {
-            sip_codes: d.sip_codes.iter().map(|v| v.to_string()).collect(),
-            sensor_ids: d.sensor_ids.iter().map(|v| v.to_string()).collect(),
-            src_ips: d.src_ips.iter().map(|&v| cdr::int_to_ipv4(v)).collect(),
-            dst_ips: d.dst_ips.iter().map(|&v| cdr::int_to_ipv4(v)).collect(),
+            sip_codes,
+            sensor_ids,
+            src_ips,
+            dst_ips,
+            total_selected,
         }
     }
 }
@@ -67,6 +120,11 @@ pub struct FiltersView {
     pub mos_max_str: String,
     /// Comma-separated input shown in the form.
     pub id_sensor_str: String,
+    /// Resolved display strings for the multi-select summary headers.
+    pub src_ip_display: String,
+    pub dst_ip_display: String,
+    pub sip_code_display: String,
+    pub id_sensor_display: String,
     pub yesterday_from: String,
     pub yesterday_to: String,
 }
@@ -76,14 +134,22 @@ impl FiltersView {
         use chrono::Utc;
         let now = Utc::now().naive_utc();
         let yesterday = now.date().pred_opt().unwrap();
+        let src_ip = f.src_ip.clone().unwrap_or_default();
+        let dst_ip = f.dst_ip.clone().unwrap_or_default();
+        let sip_code = f.sip_code.clone().unwrap_or_default();
+        let id_sensor = f.id_sensor.clone().unwrap_or_default();
         Self {
             from_str: f.from.map(dt_input).unwrap_or_default(),
             to_str: f.to.map(dt_input).unwrap_or_default(),
             caller: f.caller.clone().unwrap_or_default(),
             called: f.called.clone().unwrap_or_default(),
-            src_ip: f.src_ip.clone().unwrap_or_default(),
-            dst_ip: f.dst_ip.clone().unwrap_or_default(),
-            sip_code_str: f.sip_code.clone().unwrap_or_default(),
+            src_ip_display: if src_ip.is_empty() { "any".into() } else { src_ip.clone() },
+            dst_ip_display: if dst_ip.is_empty() { "any".into() } else { dst_ip.clone() },
+            sip_code_display: if sip_code.is_empty() { "any".into() } else { sip_code.clone() },
+            id_sensor_display: if id_sensor.is_empty() { "any".into() } else { id_sensor.clone() },
+            src_ip,
+            dst_ip,
+            sip_code_str: sip_code,
             mos_min_str: f
                 .mos_min
                 .map(|m| format!("{:.1}", m as f32 / 10.0))
@@ -92,7 +158,7 @@ impl FiltersView {
                 .mos_max
                 .map(|m| format!("{:.1}", m as f32 / 10.0))
                 .unwrap_or_default(),
-            id_sensor_str: f.id_sensor.clone().unwrap_or_default(),
+            id_sensor_str: id_sensor,
             yesterday_from: format!("{}T00:00", yesterday),
             yesterday_to: format!("{}T23:59", yesterday),
         }
@@ -153,15 +219,17 @@ pub struct ListQuery {
     pub to: Option<String>,
     pub caller: Option<String>,
     pub called: Option<String>,
-    pub src_ip: Option<String>,
-    pub dst_ip: Option<String>,
+    // Multi-value fields arrive as repeated query params or comma-separated
+    // text input — we accept Vec<String> and merge both in build_filters.
+    pub src_ip: Option<Vec<String>>,
+    pub dst_ip: Option<Vec<String>>,
+    pub sip_code: Option<Vec<String>>,
+    pub id_sensor: Option<Vec<String>>,
     // Numeric fields are taken as raw strings so an empty form value
     // (e.g. `mos_min=`) doesn't fail deserialization. We parse them
     // manually in `build_filters`.
-    pub sip_code: Option<String>,
     pub mos_min: Option<String>,
     pub mos_max: Option<String>,
-    pub id_sensor: Option<String>,
     pub page: Option<String>,
     pub page_size: Option<String>,
 }
@@ -180,7 +248,13 @@ pub async fn cdr_list(
         cdr::distinct_values(&state.pool, 7, 100),
     );
     let page = page_result?;
-    let distinct = DistinctView::from(distinct_result?);
+    let distinct = DistinctView::from(
+        distinct_result?,
+        &normalized.src_ips,
+        &normalized.dst_ips,
+        &normalized.sip_codes,
+        &normalized.sensor_ids,
+    );
 
     let view = FiltersView::from(&filters);
     let export_url = format!("/cdr/export.csv{}", view.export_query());
@@ -303,14 +377,14 @@ pub async fn cdr_export_csv(
         to: parse_dt(&q.to),
         caller: q.caller.filter(|s| !s.is_empty()),
         called: q.called.filter(|s| !s.is_empty()),
-        src_ip: q.src_ip.filter(|s| !s.is_empty()),
-        dst_ip: q.dst_ip.filter(|s| !s.is_empty()),
-        sip_code: q.sip_code.filter(|s| !s.is_empty()),
+        src_ip: merge_csv(q.src_ip.as_deref()).filter(|s| !s.is_empty()),
+        dst_ip: merge_csv(q.dst_ip.as_deref()).filter(|s| !s.is_empty()),
+        sip_code: merge_csv(q.sip_code.as_deref()).filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: q.id_sensor.filter(|s| !s.is_empty()),
+        id_sensor: merge_csv(q.id_sensor.as_deref()).filter(|s| !s.is_empty()),
         page: None,
         page_size: Some(10_000),
     };
@@ -353,16 +427,45 @@ fn build_filters(q: &ListQuery) -> CdrFilters {
         to: parse_dt(&q.to),
         caller: q.caller.clone().filter(|s| !s.is_empty()),
         called: q.called.clone().filter(|s| !s.is_empty()),
-        src_ip: q.src_ip.clone().filter(|s| !s.is_empty()),
-        dst_ip: q.dst_ip.clone().filter(|s| !s.is_empty()),
-        sip_code: q.sip_code.clone().filter(|s| !s.is_empty()),
+        // Merge all forms of each multi-value field (repeated checkboxes
+        // + comma-separated custom input) into a single canonical string.
+        src_ip: merge_csv(q.src_ip.as_deref()).filter(|s| !s.is_empty()),
+        dst_ip: merge_csv(q.dst_ip.as_deref()).filter(|s| !s.is_empty()),
+        sip_code: merge_csv(q.sip_code.as_deref()).filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: q.id_sensor.clone().filter(|s| !s.is_empty()),
+        id_sensor: merge_csv(q.id_sensor.as_deref()).filter(|s| !s.is_empty()),
         page: parse_opt(q.page.as_deref()),
         page_size: parse_opt(q.page_size.as_deref()),
+    }
+}
+
+/// Take repeated query values (from checkboxes) and split each one on
+/// commas (from a text input). Return a single deduped, comma-joined string.
+fn merge_csv(values: Option<&[String]>) -> Option<String> {
+    let vals = values?;
+    if vals.is_empty() {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for v in vals {
+        for part in v.split(',') {
+            let t = part.trim();
+            if t.is_empty() {
+                continue;
+            }
+            if seen.insert(t.to_string()) {
+                out.push(t.to_string());
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join(","))
     }
 }
 

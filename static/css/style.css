@@ -200,3 +200,111 @@ table.cdrs tr:hover { background: var(--bg-elev-2); }
   font-size: 12px;
   margin: 8px 0 0;
 }
+
+/* multi-select widget */
+.multi-select-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+}
+.multi-select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 10px;
+}
+.multi-select > summary {
+  cursor: pointer;
+  padding: 6px 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  user-select: none;
+  list-style: none;
+  font-size: 13px;
+}
+.multi-select > summary::-webkit-details-marker { display: none; }
+.multi-select > summary::before {
+  content: "\25B8";
+  display: inline-block;
+  width: 12px;
+  margin-right: 6px;
+  color: var(--fg-muted);
+  transition: transform 0.15s;
+}
+.multi-select[open] > summary::before { transform: rotate(90deg); }
+.multi-select > summary .ms-count {
+  font-size: 11px;
+  color: var(--fg-muted);
+  font-weight: normal;
+  text-align: right;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.multi-select > input[type="text"] {
+  width: 100%;
+  background: var(--bg-elev);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 8px;
+  font: inherit;
+  margin: 4px 0 8px;
+}
+.multi-select .chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-bottom: 6px;
+}
+.multi-select .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elev);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.1s, background 0.1s;
+}
+.multi-select .chip:hover { border-color: var(--accent); }
+.multi-select .chip input[type="checkbox"] {
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--fg-muted);
+  border-radius: 2px;
+  margin: 0;
+  display: inline-block;
+  position: relative;
+  cursor: pointer;
+}
+.multi-select .chip input[type="checkbox"]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.multi-select .chip input[type="checkbox"]:checked::after {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: -1px;
+  width: 3px;
+  height: 6px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.multi-select .chip.selected {
+  background: rgba(74, 158, 255, 0.15);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+.small { font-size: 12px; }

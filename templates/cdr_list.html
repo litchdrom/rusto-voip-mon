@@ -10,36 +10,105 @@
 </section>
 
 <form method="get" action="/" class="filters">
-  <datalist id="sip-codes">
-    {% for v in distinct.sip_codes %}<option value="{{ v }}"></option>{% endfor %}
-  </datalist>
-  <datalist id="sensor-ids">
-    {% for v in distinct.sensor_ids %}<option value="{{ v }}"></option>{% endfor %}
-  </datalist>
-  <datalist id="src-ips">
-    {% for v in distinct.src_ips %}<option value="{{ v }}"></option>{% endfor %}
-  </datalist>
-  <datalist id="dst-ips">
-    {% for v in distinct.dst_ips %}<option value="{{ v }}"></option>{% endfor %}
-  </datalist>
 
   <div class="grid">
     <label><span>From</span><input type="datetime-local" name="from" value="{{ filters.from_str }}"></label>
     <label><span>To</span><input type="datetime-local" name="to" value="{{ filters.to_str }}"></label>
-    <label><span>Caller</span><input type="text" name="caller" value="{{ filters.caller }}"></label>
-    <label><span>Called</span><input type="text" name="called" value="{{ filters.called }}"></label>
-    <label><span>Source IP(s)</span><input type="text" name="src_ip" list="src-ips" value="{{ filters.src_ip }}" placeholder="1.2.3.4, 5.6.7.8"></label>
-    <label><span>Dest IP(s)</span><input type="text" name="dst_ip" list="dst-ips" value="{{ filters.dst_ip }}" placeholder="1.2.3.4, 5.6.7.8"></label>
-    <label><span>SIP code(s)</span><input type="text" name="sip_code" list="sip-codes" value="{{ filters.sip_code_str }}" placeholder="200, 486, 503"></label>
-    <label><span>Sensor ID(s)</span><input type="text" name="id_sensor" list="sensor-ids" value="{{ filters.id_sensor_str }}" placeholder="1, 2"></label>
+    <label><span>Caller</span><input type="text" name="caller" value="{{ filters.caller }}" placeholder="contains…"></label>
+    <label><span>Called</span><input type="text" name="called" value="{{ filters.called }}" placeholder="contains…"></label>
     <label><span>MOS min</span><input type="number" step="0.1" min="0" max="5" name="mos_min" value="{{ filters.mos_min_str }}"></label>
     <label><span>MOS max</span><input type="number" step="0.1" min="0" max="5" name="mos_max" value="{{ filters.mos_max_str }}"></label>
   </div>
-  <p class="muted hint">Multiple values: separate with commas. Empty fields are ignored. Pick from suggestions or type custom.</p>
+
+  <div class="multi-select-grid">
+    {# Source IPs #}
+    <details class="multi-select" open>
+      <summary>
+        <span>Source IP(s)</span>
+        <span class="ms-count">{{ filters.src_ip_display }}</span>
+      </summary>
+      <input type="text" name="src_ip" placeholder="Type custom IPs (comma-separated)" value="{{ filters.src_ip }}">
+      <div class="chips">
+        {% for item in distinct.src_ips %}
+        <label class="chip {% if item.is_checked %}selected{% endif %}">
+          <input type="checkbox" name="src_ip" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
+          <span>{{ item.value }}</span>
+        </label>
+        {% endfor %}
+        {% if distinct.src_ips.len() == 0 %}
+          <span class="muted small">No IPs in the last 7 days.</span>
+        {% endif %}
+      </div>
+    </details>
+
+    {# Dest IPs #}
+    <details class="multi-select" open>
+      <summary>
+        <span>Dest IP(s)</span>
+        <span class="ms-count">{{ filters.dst_ip_display }}</span>
+      </summary>
+      <input type="text" name="dst_ip" placeholder="Type custom IPs (comma-separated)" value="{{ filters.dst_ip }}">
+      <div class="chips">
+        {% for item in distinct.dst_ips %}
+        <label class="chip {% if item.is_checked %}selected{% endif %}">
+          <input type="checkbox" name="dst_ip" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
+          <span>{{ item.value }}</span>
+        </label>
+        {% endfor %}
+        {% if distinct.dst_ips.len() == 0 %}
+          <span class="muted small">No IPs in the last 7 days.</span>
+        {% endif %}
+      </div>
+    </details>
+
+    {# SIP codes #}
+    <details class="multi-select">
+      <summary>
+        <span>SIP code(s)</span>
+        <span class="ms-count">{{ filters.sip_code_display }}</span>
+      </summary>
+      <input type="text" name="sip_code" placeholder="Custom (comma-separated)" value="{{ filters.sip_code_str }}">
+      <div class="chips">
+        {% for item in distinct.sip_codes %}
+        <label class="chip {% if item.is_checked %}selected{% endif %}">
+          <input type="checkbox" name="sip_code" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
+          <span>{{ item.value }}</span>
+        </label>
+        {% endfor %}
+        {% if distinct.sip_codes.len() == 0 %}
+          <span class="muted small">No codes in the last 7 days.</span>
+        {% endif %}
+      </div>
+    </details>
+
+    {# Sensor IDs #}
+    <details class="multi-select">
+      <summary>
+        <span>Sensor ID(s)</span>
+        <span class="ms-count">{{ filters.id_sensor_display }}</span>
+      </summary>
+      <input type="text" name="id_sensor" placeholder="Custom (comma-separated)" value="{{ filters.id_sensor_str }}">
+      <div class="chips">
+        {% for item in distinct.sensor_ids %}
+        <label class="chip {% if item.is_checked %}selected{% endif %}">
+          <input type="checkbox" name="id_sensor" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
+          <span>{{ item.value }}</span>
+        </label>
+        {% endfor %}
+        {% if distinct.sensor_ids.len() == 0 %}
+          <span class="muted small">No sensors in the last 7 days.</span>
+        {% endif %}
+      </div>
+    </details>
+  </div>
+
   <div class="filter-actions">
     <button type="submit">Apply</button>
     <a class="link" href="/">Today</a>
     <a class="link" href="/?from={{ filters.yesterday_from }}&to={{ filters.yesterday_to }}">Yesterday</a>
+    {% if distinct.total_selected > 0 %}
+      <span class="muted">· {{ distinct.total_selected }} value(s) selected</span>
+    {% endif %}
   </div>
 </form>
 
