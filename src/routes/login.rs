@@ -1,6 +1,6 @@
 use askama::Template;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
     Form,
@@ -28,16 +28,17 @@ pub struct LoginTemplate {
 pub async fn login_form(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(q): Query<LoginQuery>,
 ) -> Response {
     // If a session cookie is present, send the user to the home page; the
     // home page will bounce them to /login if the session is invalid.
     if parse_session_cookie(&headers).is_some() {
-        return Redirect::to("/").into_response();
+        return Redirect::to(q.next.as_deref().unwrap_or("/")).into_response();
     }
     let _ = state.config.cookie_secret_if_present();
     let tmpl = LoginTemplate {
         error: None,
-        next: None,
+        next: q.next,
         user: None,
     };
     let body = tmpl.render().unwrap_or_else(|e| {
@@ -62,9 +63,14 @@ pub struct LoginForm {
     pub next: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct LoginQuery {
+    pub next: Option<String>,
+}
+
 #[derive(Debug, FromRow)]
 struct UserRow {
-    id: u32,
+    id: i32,
     username: String,
     password: String,
     is_admin: i8,
@@ -121,7 +127,7 @@ pub async fn login_submit(
     }
 
     let session = SessionUser::new(
-        user.id,
+        user.id as u32,
         user.username,
         user.is_admin != 0,
         user.can_cdr.unwrap_or(1) != 0,
@@ -136,7 +142,7 @@ pub async fn login_submit(
         Some(crate::auth::session::TTL_SECS),
     );
 
-    let next = form.next.unwrap_or_else(|| "/".to_string());
+    let next = sanitize_next(form.next.as_deref());
     let mut resp = Redirect::to(&next).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
@@ -144,6 +150,16 @@ pub async fn login_submit(
             .map_err(|e| crate::error::AppError::Internal(format!("cookie header: {e}")))?,
     );
     Ok(resp)
+}
+
+/// `next` is taken straight from a query/form field, so we must defend
+/// against open-redirect attacks. Only relative paths starting with `/`
+/// (and not `//`) are allowed; anything else falls back to `/`.
+fn sanitize_next(next: Option<&str>) -> String {
+    match next {
+        Some(s) if s.starts_with('/') && !s.starts_with("//") => s.to_string(),
+        _ => "/".to_string(),
+    }
 }
 
 pub async fn logout() -> Response {

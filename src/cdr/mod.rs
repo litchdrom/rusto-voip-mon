@@ -2,13 +2,21 @@
 //!
 //! All queries are read-only. The `cdr` table is partitioned by `calldate`
 //! (range partitioning), so date filters are essential to avoid full scans.
+//!
+//! We split the row into two structs:
+//!
+//! - [`CdrRow`]      — fields that come directly from SQL (`FromRow` derive).
+//! - [`CdrSummary`]  — the same data plus pre-formatted display strings
+//!                     (`mos_str`, `src_ip_str`, `dst_ip_str`). Templates
+//!                     consume this one.
 
-use chrono::NaiveDateTime;
+use chrono::{Duration, NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, MySqlPool};
 
-#[derive(Debug, Clone, FromRow, Serialize)]
-pub struct CdrSummary {
+/// Raw row straight from the `cdr` table.
+#[derive(Debug, Clone, FromRow)]
+pub struct CdrRow {
     pub id: u64,
     pub calldate: NaiveDateTime,
     pub callend: NaiveDateTime,
@@ -20,17 +28,58 @@ pub struct CdrSummary {
     pub sipcallerip: Option<u32>,
     pub sipcalledip: Option<u32>,
     pub last_sip_response_num: Option<u16>,
-    pub mos_min_mult10: Option<u8>,    // divide by 10 for actual MOS
+    pub mos_min_mult10: Option<u8>,
     pub a_lost: Option<u32>,
     pub b_lost: Option<u32>,
     pub id_sensor: Option<u16>,
-    // Pre-formatted display strings (filled in after query).
-    #[serde(skip)]
-    pub mos_str: String,
-    #[serde(skip)]
+}
+
+/// View struct used by templates and the CSV exporter.
+#[derive(Debug, Clone, Serialize)]
+pub struct CdrSummary {
+    pub id: u64,
+    pub calldate: NaiveDateTime,
+    pub callend: NaiveDateTime,
+    pub duration: Option<u32>,
+    pub connect_duration: Option<u32>,
+    pub caller: Option<String>,
+    pub callername: Option<String>,
+    pub called: Option<String>,
     pub src_ip_str: String,
-    #[serde(skip)]
     pub dst_ip_str: String,
+    pub last_sip_response_num: Option<u16>,
+    pub mos_str: String,
+    pub a_lost: Option<u32>,
+    pub b_lost: Option<u32>,
+    pub id_sensor: Option<u16>,
+}
+
+impl From<CdrRow> for CdrSummary {
+    fn from(row: CdrRow) -> Self {
+        let mos_str = row
+            .mos_min_mult10
+            .map(|m| format!("{:.1}", m as f32 / 10.0))
+            .unwrap_or_default();
+        let src_ip_str = row.sipcallerip.map(int_to_ipv4).unwrap_or_default();
+        let dst_ip_str = row.sipcalledip.map(int_to_ipv4).unwrap_or_default();
+        Self {
+            id: row.id,
+            calldate: row.calldate,
+            callend: row.callend,
+            duration: row.duration,
+            connect_duration: row.connect_duration,
+            caller: row.caller,
+            callername: row.callername,
+            called: row.called,
+            src_ip_str,
+            dst_ip_str,
+            last_sip_response_num: row.last_sip_response_num,
+            mos_str,
+            a_lost: row.a_lost,
+            b_lost: row.b_lost,
+            id_sensor: row.id_sensor,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -41,7 +90,7 @@ pub struct CdrFilters {
     pub called: Option<String>,
     pub src_ip: Option<String>,
     pub sip_code: Option<u16>,
-    pub mos_min: Option<u8>,    // inclusive lower bound, real MOS not *10
+    pub mos_min: Option<u8>,
     pub mos_max: Option<u8>,
     pub min_duration: Option<u32>,
     pub max_duration: Option<u32>,
@@ -54,9 +103,23 @@ impl CdrFilters {
     pub fn normalized(&self) -> NormalizedFilters {
         let page = self.page.unwrap_or(1).max(1);
         let page_size = self.page_size.unwrap_or(50).clamp(1, 500);
+
+        // Default the time window to "last 24h" when the caller didn't
+        // specify one — keeps COUNT(*) cheap on the partitioned table.
+        let (from, to) = match (self.from, self.to) {
+            (None, None) => {
+                let now = Utc::now().naive_utc();
+                let from = now - Duration::hours(24);
+                (Some(from), Some(now))
+            }
+            (Some(f), None) => (Some(f), None),
+            (None, Some(t)) => (None, Some(t)),
+            (Some(f), Some(t)) => (Some(f), Some(t)),
+        };
+
         NormalizedFilters {
-            from: self.from,
-            to: self.to,
+            from,
+            to,
             caller: self.caller.clone(),
             called: self.called.clone(),
             src_ip: self.src_ip.clone(),
@@ -95,7 +158,6 @@ impl NormalizedFilters {
     }
 
     /// Build the WHERE-clause SQL fragment + matching bind values.
-    /// Returns `(where_sql, binds)` where binds is positional.
     pub fn to_where(&self) -> (String, Vec<FilterBind>) {
         let mut parts: Vec<String> = Vec::new();
         let mut binds: Vec<FilterBind> = Vec::new();
@@ -163,6 +225,11 @@ pub enum FilterBind {
 }
 
 pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrSummary>, sqlx::Error> {
+    let rows = list_raw(pool, f).await?;
+    Ok(rows.into_iter().map(CdrSummary::from).collect())
+}
+
+async fn list_raw(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrRow>, sqlx::Error> {
     let (where_sql, binds) = f.to_where();
     let sql = format!(
         "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
@@ -174,7 +241,7 @@ pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrSumm
           ORDER BY calldate DESC \
           LIMIT ? OFFSET ?",
     );
-    let mut q = sqlx::query_as::<_, CdrSummary>(&sql);
+    let mut q = sqlx::query_as::<_, CdrRow>(&sql);
     for b in &binds {
         q = match b {
             FilterBind::DateTime(d) => q.bind(d),
@@ -184,16 +251,7 @@ pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<Vec<CdrSumm
         };
     }
     q = q.bind(f.page_size).bind(f.offset());
-    let mut rows = q.fetch_all(pool).await?;
-    for row in &mut rows {
-        row.mos_str = row
-            .mos_min_mult10
-            .map(|m| format!("{:.1}", m as f32 / 10.0))
-            .unwrap_or_default();
-        row.src_ip_str = row.sipcallerip.map(int_to_ipv4).unwrap_or_default();
-        row.dst_ip_str = row.sipcalledip.map(int_to_ipv4).unwrap_or_default();
-    }
-    Ok(rows)
+    q.fetch_all(pool).await
 }
 
 pub async fn count(pool: &MySqlPool, f: &NormalizedFilters) -> Result<u64, sqlx::Error> {

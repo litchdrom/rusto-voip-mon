@@ -9,7 +9,7 @@ use serde::Deserialize;
 
 use crate::{
     auth::session::SessionUser,
-    cdr::{self, CdrFilters, CdrSummary},
+    cdr::{self, CdrFilters, CdrRow, CdrSummary},
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -166,7 +166,7 @@ pub async fn cdr_detail(
     _user: SessionUser,
     axum::extract::Path(id): axum::extract::Path<u64>,
 ) -> AppResult<Response> {
-    let row: Option<CdrSummary> = sqlx::query_as(
+    let row: Option<CdrRow> = sqlx::query_as(
         "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
                 caller, callername, called, sipcallerip, sipcalledip, \
                 lastSIPresponseNum AS `last_sip_response_num`, \
@@ -180,6 +180,7 @@ pub async fn cdr_detail(
     let Some(cdr) = row else {
         return Ok((StatusCode::NOT_FOUND, "CDR not found").into_response());
     };
+    let cdr = CdrSummary::from(cdr);
 
     let body = format!(
         r#"<!doctype html>
@@ -195,6 +196,8 @@ pub async fn cdr_detail(
     <tr><th>called</th><td>{called}</td></tr>
     <tr><th>duration</th><td>{duration}s</td></tr>
     <tr><th>last SIP</th><td>{sip}</td></tr>
+    <tr><th>src IP</th><td>{srcip}</td></tr>
+    <tr><th>dst IP</th><td>{dstip}</td></tr>
     <tr><th>MOS</th><td>{mos}</td></tr>
     <tr><th>lost (a/b)</th><td>{al} / {bl}</td></tr>
     <tr><th>sensor</th><td>{sensor}</td></tr>
@@ -208,10 +211,9 @@ pub async fn cdr_detail(
         called = cdr.called.clone().unwrap_or_default(),
         duration = cdr.duration.unwrap_or(0),
         sip = cdr.last_sip_response_num.unwrap_or(0),
-        mos = cdr
-            .mos_min_mult10
-            .map(|m| format!("{:.1}", m as f32 / 10.0))
-            .unwrap_or_else(|| "-".into()),
+        srcip = cdr.src_ip_str,
+        dstip = cdr.dst_ip_str,
+        mos = if cdr.mos_str.is_empty() { "-".to_string() } else { cdr.mos_str },
         al = cdr.a_lost.unwrap_or(0),
         bl = cdr.b_lost.unwrap_or(0),
         sensor = cdr.id_sensor.unwrap_or(0),
@@ -249,10 +251,7 @@ pub async fn cdr_export_csv(
     let mut out = String::with_capacity(rows.len() * 200);
     out.push_str("id,calldate,callend,duration,caller,called,last_sip,mos,id_sensor\n");
     for r in rows {
-        let mos = r
-            .mos_min_mult10
-            .map(|m| format!("{:.1}", m as f32 / 10.0))
-            .unwrap_or_default();
+        let mos = if r.mos_str.is_empty() { String::new() } else { r.mos_str.clone() };
         out.push_str(&format!(
             "{},{},{},{},{},{},{},{},{}\n",
             r.id,
