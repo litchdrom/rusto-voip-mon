@@ -523,8 +523,17 @@ pub async fn cdr_export_csv(
     let filters = build_filters(&q, &params);
     let normalized = filters.normalized_for_export();
 
-    // Stream of raw CDRs (each row in its own message).
-    let row_stream = cdr::list_stream(&state.pool, &normalized);
+    // Pull the env-configured row cap. Per-request `?csv_limit=N` can
+    // override; this lets an admin temporarily allow a large export
+    // without restarting the service.
+    let per_request: Option<usize> = params
+        .first("csv_limit")
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0);
+    let cap = per_request.unwrap_or(state.config.csv_export_limit);
+
+    // Stream of raw CDRs (each row in its own message), capped at `cap` rows.
+    let row_stream = cdr::list_stream(&state.pool, &normalized, cap);
 
     // Channel of formatted CSV byte chunks for the HTTP response.
     let (csv_tx, csv_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
@@ -541,6 +550,7 @@ pub async fn cdr_export_csv(
             return;
         }
 
+        let mut sent = 0usize;
         let mut row_stream = row_stream;
         while let Some(row_result) = row_stream.next().await {
             match row_result {
@@ -561,6 +571,7 @@ pub async fn cdr_export_csv(
                     if csv_tx.send(Ok(Bytes::from(line))).await.is_err() {
                         break; // client disconnected
                     }
+                    sent += 1;
                 }
                 Err(e) => {
                     tracing::error!(error = ?e, "CSV stream error");
@@ -568,6 +579,7 @@ pub async fn cdr_export_csv(
                 }
             }
         }
+        tracing::info!(rows_sent = sent, cap = cap, "CSV export done");
     });
 
     let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(csv_rx));
@@ -578,6 +590,7 @@ pub async fn cdr_export_csv(
             axum::http::header::CONTENT_DISPOSITION,
             "attachment; filename=\"cdr.csv\"",
         )
+        .header("X-Export-Cap", cap.to_string())
         .body(body)
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
 }

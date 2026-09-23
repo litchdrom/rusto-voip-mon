@@ -342,9 +342,14 @@ pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<CdrPage, sq
 /// the SQL string and binds; the returned `Receiver` is a public, easy-to-
 /// consume handle. Used by the CSV exporter so memory stays flat regardless
 /// of result size.
+///
+/// `limit` caps the number of rows returned — applied as a SQL `LIMIT` so
+/// the database stops sending rows once we've hit the cap. Prevents
+/// accidental multi-GB downloads from "all time" filters.
 pub fn list_stream(
     pool: &MySqlPool,
     f: &NormalizedFilters,
+    limit: usize,
 ) -> ReceiverStream<Result<CdrRow, sqlx::Error>> {
     let (where_sql, binds) = f.to_where();
     let sql = format!(
@@ -354,7 +359,8 @@ pub fn list_stream(
                 mos_min_mult10, a_lost, b_lost, id_sensor \
            FROM cdr \
            {where_sql} \
-          ORDER BY calldate DESC, ID DESC",
+          ORDER BY calldate DESC, ID DESC \
+          LIMIT ?",
     );
     let (tx, rx) = mpsc::channel(64);
     let pool = pool.clone();
@@ -368,6 +374,7 @@ pub fn list_stream(
                 FilterBind::U16(v) => q.bind(*v),
             };
         }
+        q = q.bind(limit as i64);
         let mut stream = Box::pin(q.fetch(&pool));
         while let Some(item) = stream.next().await {
             if tx.send(item).await.is_err() {

@@ -8,6 +8,9 @@ pub struct Config {
     pub database_url: String,
     pub pcap_dir: PathBuf,
     pub cookie_secret: String,
+    /// Hard cap on rows returned per CSV export. Prevents accidental
+    /// multi-GB downloads from "all time" filters.
+    pub csv_export_limit: usize,
 }
 
 impl Config {
@@ -21,6 +24,10 @@ impl Config {
             ),
             cookie_secret: std::env::var("APP_COOKIE_SECRET")
                 .context("APP_COOKIE_SECRET not set")?,
+            csv_export_limit: std::env::var("CSV_EXPORT_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
         })
     }
 
