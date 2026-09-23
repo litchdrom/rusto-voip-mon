@@ -55,7 +55,8 @@ impl TarPartRow {
         Ok(Self {
             calldate: r.try_get("calldate")?,
             pos: r.try_get::<u64, _>("pos")?,
-            type_: r.try_get::<i8, _>("type")? as u8,
+            // `type` is TINYINT UNSIGNED in voipmonitor's schema.
+            type_: r.try_get::<u8, _>("type")?,
         })
     }
 }

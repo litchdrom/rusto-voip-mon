@@ -136,10 +136,10 @@ pub struct FiltersView {
 }
 
 impl FiltersView {
-    fn from(f: &CdrFilters) -> Self {
+    fn from(f: &CdrFilters, tz: chrono::FixedOffset) -> Self {
         use chrono::Utc;
-        let now = Utc::now().naive_utc();
-        let yesterday = now.date().pred_opt().unwrap();
+        let now = Utc::now().with_timezone(&tz);
+        let yesterday = now.date_naive().pred_opt().unwrap();
         let src_ip = f.src_ip.clone().unwrap_or_default();
         let dst_ip = f.dst_ip.clone().unwrap_or_default();
         let sip_code = f.sip_code.clone().unwrap_or_default();
@@ -258,12 +258,13 @@ pub async fn cdr_list(
         page_size: params.first("page_size"),
     };
     let filters = build_filters(&q, &params);
-    let normalized = filters.normalized();
+    let tz = state.tz();
+    let normalized = filters.normalized(tz);
 
     // Fetch the rows + distinct values for the dropdowns in parallel.
     let (page_result, distinct_result) = tokio::join!(
         cdr::list(&state.pool, &normalized),
-        cdr::distinct_values(&state.pool, 7, 100),
+        cdr::distinct_values(&state.pool, 7, 100, tz),
     );
     let page = page_result?;
     let distinct = DistinctView::from(
@@ -274,12 +275,12 @@ pub async fn cdr_list(
         &normalized.sensor_ids,
     );
 
-    let view = FiltersView::from(&filters);
+    let view = FiltersView::from(&filters, tz);
     let export_url = format!("/cdr/export.csv{}", view.export_query());
 
     let has_prev = normalized.page > 1;
     let has_more = page.has_more;
-    let day_label = label_for_window(normalized.from, normalized.to);
+    let day_label = label_for_window(normalized.from, normalized.to, tz);
 
     let mut page_q = view.export_query();
     if !page_q.is_empty() {
@@ -521,7 +522,8 @@ pub async fn cdr_export_csv(
         page_size: params.first("page_size"),
     };
     let filters = build_filters(&q, &params);
-    let normalized = filters.normalized_for_export();
+    let tz = state.tz();
+    let normalized = filters.normalized_for_export(tz);
 
     // Pull the env-configured row cap. Per-request `?csv_limit=N` can
     // override; this lets an admin temporarily allow a large export
@@ -755,10 +757,14 @@ fn dt_input(d: NaiveDateTime) -> String {
 
 /// Build a human-readable label for the active time window, shown above
 /// the CDR list. Examples: "Today", "Yesterday", "2026-09-21", "Last 7 days".
-fn label_for_window(from: Option<NaiveDateTime>, to: Option<NaiveDateTime>) -> String {
+fn label_for_window(
+    from: Option<NaiveDateTime>,
+    to: Option<NaiveDateTime>,
+    tz: chrono::FixedOffset,
+) -> String {
     use chrono::Utc;
-    let now = Utc::now().naive_utc();
-    let today = now.date();
+    let now = Utc::now().with_timezone(&tz);
+    let today = now.date_naive();
     match (from, to) {
         (Some(f), Some(t)) if f.date() == t.date() => {
             let d = f.date();

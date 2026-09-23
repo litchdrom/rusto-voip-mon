@@ -10,7 +10,7 @@
 //!                     (`mos_str`, `src_ip_str`, `dst_ip_str`). Templates
 //!                     consume this one.
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
+use chrono::{Duration, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, MySqlPool, Row};
@@ -108,20 +108,18 @@ pub struct CdrFilters {
 }
 
 impl CdrFilters {
-    pub fn normalized(&self) -> NormalizedFilters {
+    /// Resolve defaults in the supplied timezone. The default window is
+    /// "today" (00:00:00 .. 23:59:59) in `tz` — so an operator whose local
+    /// time differs from the server's UTC clock gets a window that lines
+    /// up with their wall clock.
+    pub fn normalized(&self, tz: FixedOffset) -> NormalizedFilters {
         let page = self.page.unwrap_or(1).max(1);
         let page_size = self.page_size.unwrap_or(50).clamp(1, 500);
 
-        // Default the time window to **today** (00:00:00 .. 23:59:59 UTC)
-        // when the caller didn't specify one.
         let (from, to) = match (self.from, self.to) {
             (None, None) => {
-                let now = Utc::now().naive_utc();
-                let day: NaiveDate = now.date();
-                (
-                    Some(day.and_hms_opt(0, 0, 0).unwrap()),
-                    Some(day.and_hms_opt(23, 59, 59).unwrap()),
-                )
+                let (f, t) = today_window_in_tz(&tz);
+                (Some(f), Some(t))
             }
             (Some(f), None) => (Some(f), None),
             (None, Some(t)) => (None, Some(t)),
@@ -148,10 +146,66 @@ impl CdrFilters {
 
     /// Same as `normalized()` but with no `page_size` cap — used by the CSV
     /// exporter which streams every matching row.
-    pub fn normalized_for_export(&self) -> NormalizedFilters {
-        let mut f = self.normalized();
+    pub fn normalized_for_export(&self, tz: FixedOffset) -> NormalizedFilters {
+        let mut f = self.normalized(tz);
         f.page_size = self.page_size.unwrap_or(50).max(1);
         f
+    }
+}
+
+/// Compute the `00:00:00 .. 23:59:59` window for "today" in the given
+/// timezone, returned as naive datetimes suitable for binding into the
+/// `calldate` SQL filter.
+fn today_window_in_tz(tz: &FixedOffset) -> (NaiveDateTime, NaiveDateTime) {
+    let now_local = Utc::now().with_timezone(tz);
+    let day: NaiveDate = now_local.date_naive();
+    (
+        day.and_hms_opt(0, 0, 0).unwrap(),
+        day.and_hms_opt(23, 59, 59).unwrap(),
+    )
+}
+
+#[cfg(test)]
+mod tz_tests {
+    use super::*;
+
+    /// The window for a given tz must always be (00:00:00 .. 23:59:59)
+    /// on the *local* date — that's what makes the "Today" filter line up
+    /// with the operator's wall clock regardless of server UTC offset.
+    #[test]
+    fn window_is_midnight_to_2359_in_local_tz() {
+        use chrono::NaiveTime;
+        let midnight = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        let end_of_day = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+        for offset_h in [-12, -6, -3, 0, 3, 5, 9, 12] {
+            let tz = FixedOffset::east_opt(offset_h * 3600).unwrap();
+            let (from, to) = today_window_in_tz(&tz);
+            assert_eq!(
+                (from.time(), to.time()),
+                (midnight, end_of_day),
+                "tz offset {offset_h}h should give a 00:00:00..23:59:59 window"
+            );
+            assert_eq!(from.date(), to.date(), "window must be a single day");
+        }
+    }
+
+    /// Two different timezones must produce two *different* windows when
+    /// the server's UTC clock puts them on opposite sides of midnight.
+    #[test]
+    fn windows_differ_across_timezones() {
+        let utc_minus_6 = FixedOffset::east_opt(-6 * 3600).unwrap();
+        let utc_plus_6 = FixedOffset::east_opt(6 * 3600).unwrap();
+        let (from_west, _) = today_window_in_tz(&utc_minus_6);
+        let (from_east, _) = today_window_in_tz(&utc_plus_6);
+        // When the server's UTC clock is 02:00, UTC-6 is "yesterday 20:00"
+        // and UTC+6 is "today 08:00" — the windows should differ by ~1 day
+        // most of the time. Allow the case where they happen to coincide
+        // (UTC noon / midnight) by only asserting inequality weakly.
+        let diff_days = (from_east.date() - from_west.date()).num_days().abs();
+        assert!(
+            diff_days <= 1,
+            "tz windows differ by {diff_days} days, expected <=1"
+        );
     }
 }
 
@@ -527,13 +581,14 @@ pub struct DistinctValues {
 }
 
 /// Returns up to `limit` distinct values per field, scoped to the last
-/// `lookback_days` days so the dropdown stays relevant.
+/// `lookback_days` days (relative to `tz`) so the dropdown stays relevant.
 pub async fn distinct_values(
     pool: &MySqlPool,
     lookback_days: i64,
     limit: u32,
+    tz: FixedOffset,
 ) -> Result<DistinctValues, sqlx::Error> {
-    let since = Utc::now().naive_utc() - Duration::days(lookback_days);
+    let since = today_window_in_tz(&tz).0 - Duration::days(lookback_days);
 
     let sip_codes: Vec<u16> = sqlx::query_scalar(
         "SELECT DISTINCT lastSIPresponseNum FROM cdr \

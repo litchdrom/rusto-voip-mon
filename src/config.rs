@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::FixedOffset;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -11,6 +12,12 @@ pub struct Config {
     /// Hard cap on rows returned per CSV export. Prevents accidental
     /// multi-GB downloads from "all time" filters.
     pub csv_export_limit: usize,
+    /// Display/filter timezone offset from UTC, in seconds. Defaults to 0
+    /// (UTC) so behavior is unchanged when unset. Set via
+    /// `APP_TZ_OFFSET_HOURS` to shift the "today" window and labels to
+    /// match the operator's local time when the server clock is in UTC
+    /// but the human isn't.
+    pub tz_offset_secs: i32,
 }
 
 impl Config {
@@ -28,11 +35,23 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
+            tz_offset_secs: std::env::var("APP_TZ_OFFSET_HOURS")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .map(|h| h.saturating_mul(3600))
+                .unwrap_or(0),
         })
     }
 
     /// Convenience for callers that just want to know if the secret exists.
     pub fn cookie_secret_if_present(&self) -> Option<&str> {
         Some(self.cookie_secret.as_str())
+    }
+
+    /// Build a `FixedOffset` matching the configured timezone. Always
+    /// returns a value (UTC if no offset is set).
+    pub fn tz(&self) -> FixedOffset {
+        FixedOffset::east_opt(self.tz_offset_secs)
+            .unwrap_or_else(|| FixedOffset::east_opt(0).unwrap())
     }
 }
