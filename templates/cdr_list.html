@@ -9,7 +9,7 @@
   </div>
 </section>
 
-<form method="get" action="/" class="filters">
+<form method="get" action="/" class="filters" id="cdr-filter-form">
 
   <div class="grid">
     <label><span>From</span><input type="datetime-local" name="from" value="{{ filters.from_str }}"></label>
@@ -22,17 +22,15 @@
 
   <div class="multi-select-grid">
     {# Source IPs #}
-    <details class="multi-select" open x-data="{ text: `{{ filters.src_ip }}` }">
+    <details class="multi-select" open>
       <summary>
         <span>Source IP(s)</span>
-        <span class="ms-count">
-          <template x-if="text">{% raw %}{{ x-text="text" }}{% endraw %}</template>
-          <template x-if="!text">any</template>
-        </span>
-        <button type="button" class="ms-clear" @click="text = ''; $refs.chips.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false)">clear</button>
+        <span class="ms-count">{{ filters.src_ip_display }}</span>
+        <button type="button" class="ms-clear"
+                onclick="clearSection(this, 'text', ['checkbox'])">clear</button>
       </summary>
-      <input type="text" name="src_ip" placeholder="Type custom IPs (comma-separated)" x-model="text" value="{{ filters.src_ip }}">
-      <div class="chips" x-ref="chips">
+      <input type="text" name="src_ip" placeholder="Type custom IPs (comma-separated)" value="{{ filters.src_ip }}">
+      <div class="chips">
         {% for item in distinct.src_ips %}
         <label class="chip {% if item.is_checked %}selected{% endif %}">
           <input type="checkbox" name="src_ip" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
@@ -46,17 +44,15 @@
     </details>
 
     {# Dest IPs #}
-    <details class="multi-select" open x-data="{ text: `{{ filters.dst_ip }}` }">
+    <details class="multi-select" open>
       <summary>
         <span>Dest IP(s)</span>
-        <span class="ms-count">
-          <template x-if="text">{% raw %}{{ x-text="text" }}{% endraw %}</template>
-          <template x-if="!text">any</template>
-        </span>
-        <button type="button" class="ms-clear" @click="text = ''; $refs.chips.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false)">clear</button>
+        <span class="ms-count">{{ filters.dst_ip_display }}</span>
+        <button type="button" class="ms-clear"
+                onclick="clearSection(this, 'text', ['checkbox'])">clear</button>
       </summary>
-      <input type="text" name="dst_ip" placeholder="Type custom IPs (comma-separated)" x-model="text" value="{{ filters.dst_ip }}">
-      <div class="chips" x-ref="chips">
+      <input type="text" name="dst_ip" placeholder="Type custom IPs (comma-separated)" value="{{ filters.dst_ip }}">
+      <div class="chips">
         {% for item in distinct.dst_ips %}
         <label class="chip {% if item.is_checked %}selected{% endif %}">
           <input type="checkbox" name="dst_ip" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
@@ -70,17 +66,15 @@
     </details>
 
     {# SIP codes #}
-    <details class="multi-select" x-data="{ text: `{{ filters.sip_code_str }}` }">
+    <details class="multi-select">
       <summary>
         <span>SIP code(s)</span>
-        <span class="ms-count">
-          <template x-if="text">{% raw %}{{ x-text="text" }}{% endraw %}</template>
-          <template x-if="!text">any</template>
-        </span>
-        <button type="button" class="ms-clear" @click="text = ''; $refs.chips.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false)">clear</button>
+        <span class="ms-count">{{ filters.sip_code_display }}</span>
+        <button type="button" class="ms-clear"
+                onclick="clearSection(this, 'text', ['checkbox'])">clear</button>
       </summary>
-      <input type="text" name="sip_code" placeholder="Custom (comma-separated)" x-model="text" value="{{ filters.sip_code_str }}">
-      <div class="chips" x-ref="chips">
+      <input type="text" name="sip_code" placeholder="Custom (comma-separated)" value="{{ filters.sip_code_str }}">
+      <div class="chips">
         {% for item in distinct.sip_codes %}
         <label class="chip {% if item.is_checked %}selected{% endif %}">
           <input type="checkbox" name="sip_code" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
@@ -94,17 +88,15 @@
     </details>
 
     {# Sensor IDs #}
-    <details class="multi-select" x-data="{ text: `{{ filters.id_sensor_str }}` }">
+    <details class="multi-select">
       <summary>
         <span>Sensor ID(s)</span>
-        <span class="ms-count">
-          <template x-if="text">{% raw %}{{ x-text="text" }}{% endraw %}</template>
-          <template x-if="!text">any</template>
-        </span>
-        <button type="button" class="ms-clear" @click="text = ''; $refs.chips.querySelectorAll('input[type=checkbox]').forEach(c => c.checked = false)">clear</button>
+        <span class="ms-count">{{ filters.id_sensor_display }}</span>
+        <button type="button" class="ms-clear"
+                onclick="clearSection(this, 'text', ['checkbox'])">clear</button>
       </summary>
-      <input type="text" name="id_sensor" placeholder="Custom (comma-separated)" x-model="text" value="{{ filters.id_sensor_str }}">
-      <div class="chips" x-ref="chips">
+      <input type="text" name="id_sensor" placeholder="Custom (comma-separated)" value="{{ filters.id_sensor_str }}">
+      <div class="chips">
         {% for item in distinct.sensor_ids %}
         <label class="chip {% if item.is_checked %}selected{% endif %}">
           <input type="checkbox" name="id_sensor" value="{{ item.value }}" {% if item.is_checked %}checked{% endif %}>
@@ -120,7 +112,7 @@
 
   <div class="filter-actions">
     <button type="submit">Apply</button>
-    <button type="reset" class="link-btn">Reset all</button>
+    <button type="button" class="link-btn" onclick="resetAllFilters()">Reset all</button>
     <a class="link" href="/">Today</a>
     <a class="link" href="/?from={{ filters.yesterday_from }}&to={{ filters.yesterday_to }}">Yesterday</a>
     {% if distinct.total_selected > 0 %}
@@ -182,4 +174,31 @@
   {% endif %}
 </div>
 
+{% endblock %}
+{% block scripts %}
+<script>
+// Clear one multi-select section: empty the text input(s) + uncheck the
+// checkboxes in the same <details>.
+function clearSection(btn) {
+  const section = btn.closest('.multi-select');
+  if (!section) return;
+  section.querySelectorAll('input[type="text"]').forEach(el => { el.value = ''; });
+  section.querySelectorAll('input[type="checkbox"]').forEach(el => { el.checked = false; });
+  // Update the summary count text to "any".
+  const count = section.querySelector('.ms-count');
+  if (count) count.textContent = 'any';
+}
+
+// Reset every input in the CDR filter form to its blank state.
+function resetAllFilters() {
+  const form = document.getElementById('cdr-filter-form');
+  if (!form) return;
+  form.querySelectorAll('input').forEach(el => {
+    if (el.type === 'checkbox' || el.type === 'radio') el.checked = false;
+    else el.value = '';
+  });
+  // Reset the multi-select summary chips back to "any".
+  form.querySelectorAll('.ms-count').forEach(el => { el.textContent = 'any'; });
+}
+</script>
 {% endblock %}
