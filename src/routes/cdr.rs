@@ -1,14 +1,15 @@
 use askama::Template;
 use axum::{
     body::Body,
-    extract::{Query, State},
+    extract::{RawQuery, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use axum::body::Bytes;
 use chrono::NaiveDateTime;
 use futures_util::StreamExt;
-use serde::Deserialize;
+use percent_encoding::percent_decode_str;
+use std::collections::HashMap;
 
 use crate::{
     auth::session::SessionUser,
@@ -216,39 +217,29 @@ fn url_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-#[derive(Debug, Deserialize, Default)]
-pub struct ListQuery {
-    pub from: Option<String>,
-    pub to: Option<String>,
-    pub caller: Option<String>,
-    pub called: Option<String>,
-    // Multi-value fields arrive as repeated query params or comma-separated
-    // text input. Plain `Vec<String>` (not Option<Vec>) because serde_urlencoded
-    // chokes on `Option<Vec<_>>` when the first occurrence is empty —
-    // e.g. `?dst_ip=&dst_ip=x` fails with "expected a sequence".
-    #[serde(default)]
-    pub src_ip: Vec<String>,
-    #[serde(default)]
-    pub dst_ip: Vec<String>,
-    #[serde(default)]
-    pub sip_code: Vec<String>,
-    #[serde(default)]
-    pub id_sensor: Vec<String>,
-    // Numeric fields are taken as raw strings so an empty form value
-    // (e.g. `mos_min=`) doesn't fail deserialization. We parse them
-    // manually in `build_filters`.
-    pub mos_min: Option<String>,
-    pub mos_max: Option<String>,
-    pub page: Option<String>,
-    pub page_size: Option<String>,
-}
+// (No ListQuery struct — multi-value fields don't work with serde_urlencoded,
+// so we parse the raw query string ourselves via RawQuery.)
 
 pub async fn cdr_list(
     State(state): State<AppState>,
     user: SessionUser,
-    Query(q): Query<ListQuery>,
+    raw_query: RawQuery,
 ) -> AppResult<Response> {
-    let filters = build_filters(&q);
+    // We can't use `Query<ListQuery>` alone because serde_urlencoded
+    // doesn't aggregate repeated query keys into Vec<String>. Parse
+    // manually with `RawQuery` instead.
+    let params = parse_query_params(raw_query.0.as_deref().unwrap_or(""));
+    let q = SingleParams {
+        from: params.first("from"),
+        to: params.first("to"),
+        caller: params.first("caller"),
+        called: params.first("called"),
+        mos_min: params.first("mos_min"),
+        mos_max: params.first("mos_max"),
+        page: params.first("page"),
+        page_size: params.first("page_size"),
+    };
+    let filters = build_filters(&q, &params);
     let normalized = filters.normalized();
 
     // Fetch the rows + distinct values for the dropdowns in parallel.
@@ -479,26 +470,20 @@ fn html_escape(s: &str) -> String {
 pub async fn cdr_export_csv(
     State(state): State<AppState>,
     _user: SessionUser,
-    Query(q): Query<ListQuery>,
+    raw_query: RawQuery,
 ) -> AppResult<Response> {
-    let filters = CdrFilters {
-        from: parse_dt(&q.from),
-        to: parse_dt(&q.to),
-        caller: q.caller.filter(|s| !s.is_empty()),
-        called: q.called.filter(|s| !s.is_empty()),
-        src_ip: merge_csv(Some(&q.src_ip)).filter(|s| !s.is_empty()),
-        dst_ip: merge_csv(Some(&q.dst_ip)).filter(|s| !s.is_empty()),
-        sip_code: merge_csv(Some(&q.sip_code)).filter(|s| !s.is_empty()),
-        mos_min: parse_opt(q.mos_min.as_deref()),
-        mos_max: parse_opt(q.mos_max.as_deref()),
-        min_duration: None,
-        max_duration: None,
-        id_sensor: merge_csv(Some(&q.id_sensor)).filter(|s| !s.is_empty()),
-        page: None,
-        // `normalized_for_export` doesn't clamp the page size — CSV wants
-        // every matching row. We still apply offset=0, no pagination.
-        page_size: Some(50),
+    let params = parse_query_params(raw_query.0.as_deref().unwrap_or(""));
+    let q = SingleParams {
+        from: params.first("from"),
+        to: params.first("to"),
+        caller: params.first("caller"),
+        called: params.first("called"),
+        mos_min: params.first("mos_min"),
+        mos_max: params.first("mos_max"),
+        page: params.first("page"),
+        page_size: params.first("page_size"),
     };
+    let filters = build_filters(&q, &params);
     let normalized = filters.normalized_for_export();
 
     // Stream of raw CDRs (each row in its own message).
@@ -560,25 +545,92 @@ pub async fn cdr_export_csv(
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
 }
 
-fn build_filters(q: &ListQuery) -> CdrFilters {
+fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilters {
     CdrFilters {
         from: parse_dt(&q.from),
         to: parse_dt(&q.to),
         caller: q.caller.clone().filter(|s| !s.is_empty()),
         called: q.called.clone().filter(|s| !s.is_empty()),
-        // Merge all forms of each multi-value field (repeated checkboxes
-        // + comma-separated custom input) into a single canonical string.
-        src_ip: merge_csv(Some(&q.src_ip)).filter(|s| !s.is_empty()),
-        dst_ip: merge_csv(Some(&q.dst_ip)).filter(|s| !s.is_empty()),
-        sip_code: merge_csv(Some(&q.sip_code)).filter(|s| !s.is_empty()),
+        // Merge repeated-key values + comma-separated values for each
+        // multi-value field into a single canonical comma-joined string.
+        src_ip: merge_csv(params.all("src_ip")).filter(|s| !s.is_empty()),
+        dst_ip: merge_csv(params.all("dst_ip")).filter(|s| !s.is_empty()),
+        sip_code: merge_csv(params.all("sip_code")).filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: merge_csv(Some(&q.id_sensor)).filter(|s| !s.is_empty()),
+        id_sensor: merge_csv(params.all("id_sensor")).filter(|s| !s.is_empty()),
         page: parse_opt(q.page.as_deref()),
         page_size: parse_opt(q.page_size.as_deref()),
     }
+}
+
+/// All query parameters parsed into a `name -> Vec<value>` map. We parse
+/// manually because `serde_urlencoded` does not aggregate repeated keys
+/// into `Vec<String>` — every `key=value` pair is delivered individually
+/// as a String to deserialize, which fails for sequence types.
+#[derive(Debug, Default, Clone)]
+pub struct QueryParams {
+    inner: HashMap<String, Vec<String>>,
+}
+
+impl QueryParams {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn push(&mut self, key: String, value: String) {
+        self.inner.entry(key).or_default().push(value);
+    }
+
+    /// First value for a key, or `None`.
+    pub fn first(&self, key: &str) -> Option<String> {
+        self.inner.get(key).and_then(|v| v.first().cloned())
+    }
+
+    /// All values for a key (in submission order), or `None` if absent.
+    pub fn all(&self, key: &str) -> Option<&[String]> {
+        self.inner.get(key).map(Vec::as_slice)
+    }
+}
+
+/// Parse a raw query string into a `QueryParams`. Decodes percent-encoding,
+/// splits on `&` and `=`, leaves invalid pairs as empty strings (the caller
+/// filters them).
+pub fn parse_query_params(raw: &str) -> QueryParams {
+    let mut out = QueryParams::new();
+    let raw = raw.trim_start_matches('?');
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        let key = percent_decode_str(k).decode_utf8_lossy().into_owned();
+        let value = percent_decode_str(v).decode_utf8_lossy().into_owned();
+        if !key.is_empty() {
+            out.push(key, value);
+        }
+    }
+    out
+}
+
+/// Scalar params only — multi-value fields are pulled separately from
+/// `QueryParams` because of the serde_urlencoded limitation described
+/// above.
+#[derive(Debug, Default)]
+pub struct SingleParams {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub caller: Option<String>,
+    pub called: Option<String>,
+    pub mos_min: Option<String>,
+    pub mos_max: Option<String>,
+    pub page: Option<String>,
+    pub page_size: Option<String>,
 }
 
 /// Take repeated query values (from checkboxes) and split each one on
