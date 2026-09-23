@@ -122,6 +122,8 @@ pub struct FiltersView {
     pub sip_code_str: String,
     pub mos_min_str: String,
     pub mos_max_str: String,
+    pub duration_min_str: String,
+    pub duration_max_str: String,
     /// Comma-separated input shown in the form.
     pub id_sensor_str: String,
     /// Resolved display strings for the multi-select summary headers.
@@ -162,6 +164,14 @@ impl FiltersView {
                 .mos_max
                 .map(|m| format!("{:.1}", m as f32 / 10.0))
                 .unwrap_or_default(),
+            duration_min_str: f
+                .min_duration
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+            duration_max_str: f
+                .max_duration
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
             id_sensor_str: id_sensor,
             yesterday_from: format!("{}T00:00", yesterday),
             yesterday_to: format!("{}T23:59", yesterday),
@@ -196,6 +206,12 @@ impl FiltersView {
         }
         if !self.mos_max_str.is_empty() {
             parts.push(("mos_max".into(), self.mos_max_str.clone()));
+        }
+        if !self.duration_min_str.is_empty() {
+            parts.push(("duration_min".into(), self.duration_min_str.clone()));
+        }
+        if !self.duration_max_str.is_empty() {
+            parts.push(("duration_max".into(), self.duration_max_str.clone()));
         }
         if !self.id_sensor_str.is_empty() {
             parts.push(("id_sensor".into(), self.id_sensor_str.clone()));
@@ -236,6 +252,8 @@ pub async fn cdr_list(
         called: params.first("called"),
         mos_min: params.first("mos_min"),
         mos_max: params.first("mos_max"),
+        duration_min: params.first("duration_min"),
+        duration_max: params.first("duration_max"),
         page: params.first("page"),
         page_size: params.first("page_size"),
     };
@@ -497,6 +515,8 @@ pub async fn cdr_export_csv(
         called: params.first("called"),
         mos_min: params.first("mos_min"),
         mos_max: params.first("mos_max"),
+        duration_min: params.first("duration_min"),
+        duration_max: params.first("duration_max"),
         page: params.first("page"),
         page_size: params.first("page_size"),
     };
@@ -575,8 +595,8 @@ fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilters {
         sip_code: merge_csv(params.all("sip_code")).filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
-        min_duration: None,
-        max_duration: None,
+        min_duration: parse_opt(q.duration_min.as_deref()),
+        max_duration: parse_opt(q.duration_max.as_deref()),
         id_sensor: merge_csv(params.all("id_sensor")).filter(|s| !s.is_empty()),
         page: parse_opt(q.page.as_deref()),
         page_size: parse_opt(q.page_size.as_deref()),
@@ -646,6 +666,8 @@ pub struct SingleParams {
     pub called: Option<String>,
     pub mos_min: Option<String>,
     pub mos_max: Option<String>,
+    pub duration_min: Option<String>,
+    pub duration_max: Option<String>,
     pub page: Option<String>,
     pub page_size: Option<String>,
 }
