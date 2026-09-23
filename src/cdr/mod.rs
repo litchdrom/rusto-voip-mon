@@ -11,8 +11,11 @@
 //!                     consume this one.
 
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, MySqlPool};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Raw row straight from the `cdr` table.
 #[derive(Debug, Clone, FromRow)]
@@ -141,6 +144,14 @@ impl CdrFilters {
             page,
             page_size,
         }
+    }
+
+    /// Same as `normalized()` but with no `page_size` cap — used by the CSV
+    /// exporter which streams every matching row.
+    pub fn normalized_for_export(&self) -> NormalizedFilters {
+        let mut f = self.normalized();
+        f.page_size = self.page_size.unwrap_or(50).max(1);
+        f
     }
 }
 
@@ -325,6 +336,46 @@ pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<CdrPage, sq
     }
     let summaries = rows.into_iter().map(CdrSummary::from).collect();
     Ok(CdrPage { rows: summaries, has_more })
+}
+
+/// Stream all matching rows in order via a channel. The spawned task owns
+/// the SQL string and binds; the returned `Receiver` is a public, easy-to-
+/// consume handle. Used by the CSV exporter so memory stays flat regardless
+/// of result size.
+pub fn list_stream(
+    pool: &MySqlPool,
+    f: &NormalizedFilters,
+) -> ReceiverStream<Result<CdrRow, sqlx::Error>> {
+    let (where_sql, binds) = f.to_where();
+    let sql = format!(
+        "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
+                caller, callername, called, sipcallerip, sipcalledip, \
+                lastSIPresponseNum AS `last_sip_response_num`, \
+                mos_min_mult10, a_lost, b_lost, id_sensor \
+           FROM cdr \
+           {where_sql} \
+          ORDER BY calldate DESC, ID DESC",
+    );
+    let (tx, rx) = mpsc::channel(64);
+    let pool = pool.clone();
+    tokio::spawn(async move {
+        let mut q = sqlx::query_as::<_, CdrRow>(&sql);
+        for b in &binds {
+            q = match b {
+                FilterBind::DateTime(d) => q.bind(d),
+                FilterBind::Str(s) => q.bind(s),
+                FilterBind::U32(v) => q.bind(*v),
+                FilterBind::U16(v) => q.bind(*v),
+            };
+        }
+        let mut stream = Box::pin(q.fetch(&pool));
+        while let Some(item) = stream.next().await {
+            if tx.send(item).await.is_err() {
+                break; // receiver dropped (client disconnected)
+            }
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 /// Distinct values from the last N days, used to populate the filter

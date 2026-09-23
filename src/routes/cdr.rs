@@ -1,10 +1,13 @@
 use askama::Template;
 use axum::{
+    body::Body,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use axum::body::Bytes;
 use chrono::NaiveDateTime;
+use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::{
@@ -386,39 +389,69 @@ pub async fn cdr_export_csv(
         max_duration: None,
         id_sensor: merge_csv(q.id_sensor.as_deref()).filter(|s| !s.is_empty()),
         page: None,
-        page_size: Some(10_000),
+        // `normalized_for_export` doesn't clamp the page size — CSV wants
+        // every matching row. We still apply offset=0, no pagination.
+        page_size: Some(50),
     };
-    let normalized = filters.normalized();
-    let page = cdr::list(&state.pool, &normalized).await?;
+    let normalized = filters.normalized_for_export();
 
-    let mut out = String::with_capacity(page.rows.len() * 200);
-    out.push_str("id,calldate,callend,duration,caller,called,last_sip,mos,id_sensor\n");
-    for r in &page.rows {
-        let mos = if r.mos_str.is_empty() { String::new() } else { r.mos_str.clone() };
-        out.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{}\n",
-            r.id,
-            r.calldate.format("%Y-%m-%d %H:%M:%S"),
-            r.callend.format("%Y-%m-%d %H:%M:%S"),
-            r.duration.unwrap_or(0),
-            csv_field(&r.caller),
-            csv_field(&r.called),
-            r.last_sip_response_num.unwrap_or(0),
-            mos,
-            r.id_sensor.unwrap_or(0),
-        ));
-    }
-    Ok((
-        [
-            (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-            (
-                axum::http::header::CONTENT_DISPOSITION,
-                "attachment; filename=\"cdr.csv\"",
-            ),
-        ],
-        out,
-    )
-        .into_response())
+    // Stream of raw CDRs (each row in its own message).
+    let row_stream = cdr::list_stream(&state.pool, &normalized);
+
+    // Channel of formatted CSV byte chunks for the HTTP response.
+    let (csv_tx, csv_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+
+    tokio::spawn(async move {
+        // Header row first.
+        if csv_tx
+            .send(Ok(Bytes::from_static(
+                b"id,calldate,callend,duration,caller,called,last_sip,mos,id_sensor\n",
+            )))
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        let mut row_stream = row_stream;
+        while let Some(row_result) = row_stream.next().await {
+            match row_result {
+                Ok(r) => {
+                    let summary = CdrSummary::from(r);
+                    let line = format!(
+                        "{},{},{},{},{},{},{},{},{}\n",
+                        summary.id,
+                        summary.calldate.format("%Y-%m-%d %H:%M:%S"),
+                        summary.callend.format("%Y-%m-%d %H:%M:%S"),
+                        summary.duration.unwrap_or(0),
+                        csv_field(&summary.caller),
+                        csv_field(&summary.called),
+                        summary.last_sip_response_num.unwrap_or(0),
+                        summary.mos_str,
+                        summary.id_sensor.unwrap_or(0),
+                    );
+                    if csv_tx.send(Ok(Bytes::from(line))).await.is_err() {
+                        break; // client disconnected
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, "CSV stream error");
+                    break;
+                }
+            }
+        }
+    });
+
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(csv_rx));
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"cdr.csv\"",
+        )
+        .body(body)
+        .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
 }
 
 fn build_filters(q: &ListQuery) -> CdrFilters {
