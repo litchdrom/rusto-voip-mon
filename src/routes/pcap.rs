@@ -71,7 +71,11 @@ pub async fn download_single(
         return Err(AppError::Forbidden);
     }
 
-    let parts = fetch_parts(&state.pool, cdr_id).await?;
+    let parts = crate::error::with_query_timeout(
+        state.config.query_timeout_secs,
+        fetch_parts(&state.pool, cdr_id),
+    )
+    .await?;
     if parts.is_empty() {
         return Err(AppError::NotFound);
     }

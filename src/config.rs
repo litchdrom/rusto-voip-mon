@@ -18,6 +18,11 @@ pub struct Config {
     /// match the operator's local time when the server clock is in UTC
     /// but the human isn't.
     pub tz_offset_secs: i32,
+    /// Per-query timeout in seconds. Bounds how long a single sqlx call
+    /// (CDR list setup, detail page, distinct-values lookup, pcap parts
+    /// query, etc.) is allowed to run before the client gets a 504 and
+    /// the connection is released back to the pool. 0 disables the cap.
+    pub query_timeout_secs: u64,
 }
 
 impl Config {
@@ -40,6 +45,10 @@ impl Config {
                 .and_then(|v| v.parse::<i32>().ok())
                 .map(|h| h.saturating_mul(3600))
                 .unwrap_or(0),
+            query_timeout_secs: std::env::var("APP_QUERY_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
         })
     }
 

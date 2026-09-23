@@ -260,11 +260,13 @@ pub async fn cdr_list(
     let filters = build_filters(&q, &params);
     let tz = state.tz();
     let normalized = filters.normalized(tz);
+    let timeout = state.config.query_timeout_secs;
 
-    // Fetch the rows + distinct values for the dropdowns in parallel.
+    // Fetch the rows + distinct values for the dropdowns in parallel,
+    // each capped at `timeout` so a slow scan doesn't lock up the page.
     let (page_result, distinct_result) = tokio::join!(
-        cdr::list(&state.pool, &normalized),
-        cdr::distinct_values(&state.pool, 7, 100, tz),
+        crate::error::with_query_timeout(timeout, cdr::list(&state.pool, &normalized)),
+        crate::error::with_query_timeout(timeout, cdr::distinct_values(&state.pool, 7, 100, tz)),
     );
     let page = page_result?;
     let distinct = DistinctView::from(
@@ -327,15 +329,19 @@ pub async fn cdr_detail(
     _user: SessionUser,
     axum::extract::Path(id): axum::extract::Path<u64>,
 ) -> AppResult<Response> {
-    let row: Option<CdrRow> = sqlx::query_as(
-        "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
-                caller, callername, called, sipcallerip, sipcalledip, \
-                lastSIPresponseNum AS `last_sip_response_num`, \
-                mos_min_mult10, a_lost, b_lost, id_sensor \
-           FROM cdr WHERE ID = ? LIMIT 1",
+    let timeout = state.config.query_timeout_secs;
+    let row: Option<CdrRow> = crate::error::with_query_timeout(
+        timeout,
+        sqlx::query_as(
+            "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
+                    caller, callername, called, sipcallerip, sipcalledip, \
+                    lastSIPresponseNum AS `last_sip_response_num`, \
+                    mos_min_mult10, a_lost, b_lost, id_sensor \
+               FROM cdr WHERE ID = ? LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&state.pool),
     )
-    .bind(id)
-    .fetch_optional(&state.pool)
     .await?;
 
     let Some(cdr) = row else {
@@ -345,8 +351,8 @@ pub async fn cdr_detail(
 
     // Pull the optional extension tables in parallel — both are tiny.
     let (next, branches) = tokio::join!(
-        cdr::fetch_cdr_next(&state.pool, id),
-        cdr::fetch_cdr_branches(&state.pool, id),
+        crate::error::with_query_timeout(timeout, cdr::fetch_cdr_next(&state.pool, id)),
+        crate::error::with_query_timeout(timeout, cdr::fetch_cdr_branches(&state.pool, id)),
     );
     let next = next?;
     let branches = branches?;
@@ -524,6 +530,7 @@ pub async fn cdr_export_csv(
     let filters = build_filters(&q, &params);
     let tz = state.tz();
     let normalized = filters.normalized_for_export(tz);
+    let timeout = state.config.query_timeout_secs;
 
     // Pull the env-configured row cap. Per-request `?csv_limit=N` can
     // override; this lets an admin temporarily allow a large export
@@ -534,8 +541,14 @@ pub async fn cdr_export_csv(
         .filter(|&n| n > 0);
     let cap = per_request.unwrap_or(state.config.csv_export_limit);
 
-    // Stream of raw CDRs (each row in its own message), capped at `cap` rows.
-    let row_stream = cdr::list_stream(&state.pool, &normalized, cap);
+    // Spawn the streaming query (sync call). We can't time-bound it
+    // directly — `list_stream` returns immediately and a background task
+    // drives the cursor. Instead, we wait for the *first* row with the
+    // configured timeout: if the server can't produce one within `timeout`
+    // seconds, we 504 and drop the channel. Once rows start flowing, the
+    // stream runs as long as needed (a 100k-row export shouldn't trip a
+    // 30s cap).
+    let mut row_stream = cdr::list_stream(&state.pool, &normalized, cap);
 
     // Channel of formatted CSV byte chunks for the HTTP response.
     let (csv_tx, csv_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
@@ -552,9 +565,44 @@ pub async fn cdr_export_csv(
             return;
         }
 
+        // Wait for the first row with a timeout — bounds the initial
+        // query latency. Subsequent rows stream without a per-row cap.
+        let first_row = if timeout > 0 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(timeout),
+                row_stream.next(),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("first row not produced within {timeout}s"),
+                )
+            })
+            .and_then(|v| match v {
+                Some(r) => Ok(Some(r)),
+                None => Ok(None),
+            })
+        } else {
+            Ok(row_stream.next().await)
+        };
+
+        let mut next_row: Option<Result<CdrRow, sqlx::Error>> = match first_row {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(timeout, error = %e, "CSV export: first row timed out");
+                let _ = csv_tx.send(Err(e)).await;
+                return;
+            }
+        };
+
         let mut sent = 0usize;
-        let mut row_stream = row_stream;
-        while let Some(row_result) = row_stream.next().await {
+        loop {
+            let row_result = match next_row.take() {
+                Some(v) => Some(v),
+                None => row_stream.next().await,
+            };
+            let Some(row_result) = row_result else { break };
             match row_result {
                 Ok(r) => {
                     let summary = CdrSummary::from(r);
