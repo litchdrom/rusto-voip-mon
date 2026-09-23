@@ -308,3 +308,32 @@ table.cdrs tr:hover { background: var(--bg-elev-2); }
   color: var(--fg);
 }
 .small { font-size: 12px; }
+
+/* Per-section "clear" button inside the summary header */
+.ms-clear {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 8px;
+  margin-left: 6px;
+  cursor: pointer;
+}
+.ms-clear:hover {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+/* "Reset all" inside filter-actions */
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-decoration: underline;
+}
+.link-btn:hover { color: var(--accent-hover); }
