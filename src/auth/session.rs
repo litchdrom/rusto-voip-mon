@@ -32,6 +32,13 @@ pub struct SessionUser {
     pub can_cdr: bool,
     pub can_pcap: bool,
     pub expires_at: i64,
+    /// Per-user timezone offset from UTC in hours. `None` means "use the
+    /// server's `APP_TZ_OFFSET_HOURS` default". Stored in the session so
+    /// the operator's choice survives navigation and page reloads.
+    /// Defaulted on deserialize so cookies minted before this field
+    /// existed keep working.
+    #[serde(default)]
+    pub tz_offset_hours: Option<i8>,
 }
 
 impl SessionUser {
@@ -47,7 +54,21 @@ impl SessionUser {
             can_cdr,
             can_pcap,
             expires_at,
+            tz_offset_hours: None,
         }
+    }
+
+    /// Return a copy of this session with the timezone override updated.
+    /// The encoded cookie's HMAC changes too, so the browser must be
+    /// re-issued the cookie.
+    pub fn with_tz(mut self, tz_offset_hours: Option<i8>) -> Self {
+        self.tz_offset_hours = tz_offset_hours;
+        // Re-stamp the TTL so a TZ change bumps the session lifetime.
+        self.expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 + TTL_SECS)
+            .unwrap_or(self.expires_at);
+        self
     }
 
     pub fn is_expired(&self) -> bool {

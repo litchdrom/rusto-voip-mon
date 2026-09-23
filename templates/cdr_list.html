@@ -1,5 +1,22 @@
 {% extends "base.html" %}
 {% block title %}CDR list · rusto-voip-mon{% endblock %}
+{% block topbar_tools %}
+  {# Timezone override. Submits to POST /tz, which re-encodes the session
+     cookie and bounces back here so the new TZ sticks across navigation. #}
+  <form method="post" action="/tz" class="tz-form" id="tz-form">
+    <label for="tz-select" class="muted small">TZ</label>
+    <select name="tz_offset_hours" id="tz-select">
+      {% for h in -12..=14 %}
+        <option value="{{ h }}" {% if h == tz_offset_hours %}selected{% endif %}>
+          {% if h == 0 %}UTC{% else if h > 0 %}UTC+{{ h }}{% else %}UTC{{ h }}{% endif %}
+          {% if h == tz_default_hours %} (server default){% endif %}
+        </option>
+      {% endfor %}
+    </select>
+    <input type="hidden" name="next" value="" id="tz-next">
+    {# Submit on change so the user doesn't have to click a button. #}
+  </form>
+{% endblock %}
 {% block head %}
   {# Prefetch adjacent pages so Next/Prev feels instant.
      Browsers fetch these at low priority, sending cookies for same-origin,
@@ -12,6 +29,19 @@
   {% endif %}
   {# Warm the CSV endpoint too — large exports benefit most from a head start. #}
   <link rel="prefetch" href="{{ export_url }}">
+{% endblock %}
+{% block scripts %}
+  <script>
+    // Pre-populate `next` with the current URL (path + query) so the
+    // server redirects back to where the user was, filters preserved.
+    const tzNext = document.getElementById('tz-next');
+    if (tzNext) tzNext.value = window.location.pathname + window.location.search;
+    // Auto-submit the TZ selector so changing the dropdown re-renders the
+    // page immediately with the new default-window.
+    document.getElementById('tz-select')?.addEventListener('change', () => {
+      document.getElementById('tz-form')?.submit();
+    });
+  </script>
 {% endblock %}
 {% block content %}
 

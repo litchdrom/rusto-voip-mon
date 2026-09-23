@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/cdr/export.csv", get(routes::cdr::cdr_export_csv))
         .route("/pcap/:cdr_id", get(routes::pcap::download_single))
         .route("/pcap/batch", post(routes::pcap::download_batch))
+        .route("/tz", post(routes::login::set_tz))
         .route_layer(axum_middleware::from_fn(require_login));
 
     // Public routes — login, health, static assets.

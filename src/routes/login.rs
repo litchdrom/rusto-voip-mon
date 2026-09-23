@@ -11,7 +11,7 @@ use sqlx::FromRow;
 use crate::{
     auth::{
         password,
-        session::{encode_cookie, SessionUser, COOKIE_NAME},
+        session::{encode_cookie, SessionUser, COOKIE_NAME, TTL_SECS},
     },
     error::AppResult,
     state::AppState,
@@ -169,6 +169,49 @@ pub async fn logout() -> Response {
         resp.headers_mut().insert(header::SET_COOKIE, v);
     }
     resp
+}
+
+/// Update the session-stored timezone and redirect back. Accepts form
+/// fields:
+///   `tz_offset_hours`  — required, integer in [-12, 14]. Empty / 0
+///                        clears the override and falls back to the
+///                        server's `APP_TZ_OFFSET_HOURS`.
+///   `next`             — relative URL to bounce back to.
+pub async fn set_tz(
+    State(state): State<crate::state::AppState>,
+    user: SessionUser,
+    Form(form): Form<SetTzForm>,
+) -> AppResult<Response> {
+    // Parse + range-check, then collapse "0 means clear" so we return
+    // Option<i8> instead of Option<Option<i8>>: 0 = clear (None), any
+    // other valid hour = Some(h).
+    let parsed: Option<i8> = form
+        .tz_offset_hours
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i8>().ok())
+        .filter(|&h| (-12..=14).contains(&h))
+        .and_then(|h| if h == 0 { None } else { Some(h) });
+
+    let new_session = user.with_tz(parsed);
+    let value = encode_cookie(&new_session, state.config.cookie_secret.as_bytes());
+    let cookie_header = format_set_cookie(COOKIE_NAME, &value, "/", Some(TTL_SECS));
+
+    let next = sanitize_next(form.next.as_deref());
+    let mut resp = Redirect::to(&next).into_response();
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie_header)
+            .map_err(|e| crate::error::AppError::Internal(format!("cookie header: {e}")))?,
+    );
+    Ok(resp)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetTzForm {
+    pub tz_offset_hours: Option<String>,
+    pub next: Option<String>,
 }
 
 /// Build a Set-Cookie header value with HttpOnly + SameSite=Lax.

@@ -16,6 +16,9 @@
         <span class="brand-text">rusto-voip-mon</span>
       </a>
     </div>
+    <div class="topbar-tools">
+      {% block topbar_tools %}{% endblock %}
+    </div>
     <div class="user">
       <span>{{ u.username }}</span>
       <form method="post" action="/logout" style="display:inline">

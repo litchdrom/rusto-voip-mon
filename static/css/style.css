@@ -59,6 +59,19 @@ h2 { font-size: 18px; margin: 16px 0 12px; }
 .topbar .brand-text { line-height: 1; }
 .topbar .user { color: var(--fg-muted); font-size: 13px; }
 .topbar .user form { display: inline; }
+.topbar .topbar-tools { display: flex; align-items: center; gap: 8px; }
+.topbar .tz-form { display: inline-flex; align-items: center; gap: 6px; }
+.topbar .tz-form select {
+  background: var(--bg-elev-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 4px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+.topbar .tz-form select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.topbar .tz-form label { font-size: 12px; }
 
 .link-button {
   background: none;

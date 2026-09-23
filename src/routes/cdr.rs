@@ -33,6 +33,12 @@ pub struct CdrListTemplate {
     pub next_url: String,
     pub prev_url: String,
     pub day_label: String,
+    /// Active TZ offset hours (the one driving the page), for the
+    /// dropdown's `selected` attribute.
+    pub tz_offset_hours: i8,
+    /// Server default TZ offset hours, so the dropdown can label
+    /// "Server default (-3h)" distinctly from "user override".
+    pub tz_default_hours: i8,
 }
 
 /// Stringified versions of the distinct values, ready for the template.
@@ -258,7 +264,12 @@ pub async fn cdr_list(
         page_size: params.first("page_size"),
     };
     let filters = build_filters(&q, &params);
-    let tz = state.tz();
+    // Per-request TZ override wins, then session-stored, then env default.
+    let query_tz: Option<i8> = params
+        .first("tz_offset_hours")
+        .as_deref()
+        .and_then(|s| s.parse().ok());
+    let (tz, session_tz_hours) = state.resolve_tz(&user, query_tz);
     let normalized = filters.normalized(tz);
     let timeout = state.config.query_timeout_secs;
 
@@ -313,6 +324,8 @@ pub async fn cdr_list(
         next_url,
         prev_url,
         day_label,
+        tz_offset_hours: (tz.local_minus_utc() / 3600) as i8,
+        tz_default_hours: (state.config.tz_offset_secs / 3600) as i8,
     };
     let body = tmpl
         .render()
@@ -528,7 +541,7 @@ pub async fn cdr_export_csv(
         page_size: params.first("page_size"),
     };
     let filters = build_filters(&q, &params);
-    let tz = state.tz();
+    let tz = state.tz_default();
     let normalized = filters.normalized_for_export(tz);
     let timeout = state.config.query_timeout_secs;
 
