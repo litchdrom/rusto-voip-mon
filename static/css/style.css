@@ -44,7 +44,19 @@ h2 { font-size: 18px; margin: 16px 0 12px; }
   justify-content: space-between;
   align-items: center;
 }
-.topbar .brand a { color: var(--fg); font-weight: 600; }
+.topbar .brand a {
+  color: var(--fg);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.topbar .brand-logo {
+  height: 28px;
+  width: auto;
+  display: block;
+}
+.topbar .brand-text { line-height: 1; }
 .topbar .user { color: var(--fg-muted); font-size: 13px; }
 .topbar .user form { display: inline; }
 

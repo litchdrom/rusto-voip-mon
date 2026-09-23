@@ -10,7 +10,12 @@
 <body>
   {% if let Some(u) = user %}
   <nav class="topbar">
-    <div class="brand"><a href="/">rusto-voip-mon</a></div>
+    <div class="brand">
+      <a href="/">
+        <img src="/static/img/logo.svg" alt="rusto-voip-mon" class="brand-logo">
+        <span class="brand-text">rusto-voip-mon</span>
+      </a>
+    </div>
     <div class="user">
       <span>{{ u.username }}</span>
       <form method="post" action="/logout" style="display:inline">
