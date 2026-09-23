@@ -335,17 +335,43 @@ pub async fn cdr_detail(
     let next = next?;
     let branches = branches?;
 
-    let fbasename = next
-        .as_ref()
+    let static_fields = next.static_fields.as_ref();
+    let fbasename = static_fields
         .and_then(|n| n.fbasename.as_deref())
         .unwrap_or("");
-    let match_header = next
-        .as_ref()
+    let match_header = static_fields
         .and_then(|n| n.match_header.as_deref())
         .unwrap_or("");
+    let digest_username = static_fields
+        .and_then(|n| n.digest_username.as_deref())
+        .unwrap_or("");
+    let geo_position = static_fields
+        .and_then(|n| n.geo_position.as_deref())
+        .unwrap_or("");
+    let hold = static_fields
+        .and_then(|n| n.hold.as_deref())
+        .unwrap_or("");
+    let spool_index = static_fields
+        .and_then(|n| n.spool_index)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
     let branch_ids: Vec<String> = branches
         .into_iter()
         .filter_map(|b| b.call_id)
+        .collect();
+
+    // Build the custom-headers table dynamically.
+    let custom_header_rows: String = next
+        .custom_headers
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(col, v)| {
+            format!(
+                "<tr><th>{}</th><td><code>{}</code></td></tr>",
+                html_escape(col),
+                html_escape(v)
+            )
+        })
         .collect();
 
     let body = format!(
@@ -374,7 +400,12 @@ pub async fn cdr_detail(
   <table class="cdrs">
     <tr><th>fbasename</th><td><code>{fbasename}</code> <span class="muted small">(derived from SIP Call-ID; matches the inner pcap filename)</span></td></tr>
     <tr><th>match_header</th><td><code>{match_header}</code> <span class="muted small">(custom header used to link call legs)</span></td></tr>
+    <tr><th>digest_username</th><td><code>{digest_username}</code></td></tr>
+    <tr><th>GeoPosition</th><td>{geo_position}</td></tr>
+    <tr><th>hold</th><td>{hold}</td></tr>
+    <tr><th>spool_index</th><td>{spool_index} <span class="muted small">(tar.zst type bucket: 0=SIP, 1=RTP, …)</span></td></tr>
   </table>
+  {custom_headers_html}
   {branches_html}
 
   <p><a class="button" href="/pcap/{id}">Download PCAP</a></p>
@@ -394,6 +425,17 @@ pub async fn cdr_detail(
         sensor = cdr.id_sensor.unwrap_or(0),
         fbasename = html_escape(fbasename),
         match_header = html_escape(match_header),
+        digest_username = html_escape(digest_username),
+        geo_position = html_escape(geo_position),
+        hold = html_escape(hold),
+        spool_index = spool_index,
+        custom_headers_html = if custom_header_rows.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<h3>Custom headers</h3><table class=\"cdrs\">{custom_header_rows}</table>"
+            )
+        },
         branches_html = render_branches(&branch_ids),
     );
     Ok((

@@ -11,9 +11,9 @@
 //!                     consume this one.
 
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow, MySqlPool};
+use sqlx::{FromRow, MySqlPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -378,32 +378,104 @@ pub fn list_stream(
     ReceiverStream::new(rx)
 }
 
-/// `cdr_next` — 1:1 extension to `cdr` that holds per-call derived state:
-///   - `fbasename`     — Call-ID with special chars → underscores (matches the
-///                       PCAP inner filename and is used to correlate pcaps
-///                       with calls).
-///   - `match_header`  — content of the configured custom header, used by
-///                       VoIPmonitor to link call legs.
+/// `cdr_next` — 1:1 extension to `cdr` that holds per-call derived state.
 ///
-/// Columns we read: `fbasename`, `match_header`. Other columns are ignored
-/// for now; if the schema adds more, this struct + query is the only place
-/// to update.
+/// Static, known columns:
+///   - `fbasename`        — Call-ID with special chars → underscores. Matches
+///                          the PCAP inner filename; used to correlate pcaps
+///                          with calls.
+///   - `match_header`     — content of the configured custom header, used by
+///                          VoIPmonitor to link call legs.
+///   - `digest_username`  — SIP digest auth username (for INVITE challenges).
+///   - `GeoPosition`      — caller geo (city, country) when GeoIP is on.
+///   - `hold`             — hold/transfer history (semicolon-separated).
+///   - `spool_index`      — which minute-bucket tar.zst this call was found in
+///                          (matches `cdr_tar_part.type`).
+///
+/// Dynamic columns:
+///   - `custom_header1`, `custom_header2`, ... — one per configured
+///     custom-header mapping in voipmonitor.conf. Number varies per
+///     install; we discover them at runtime from `INFORMATION_SCHEMA`.
 #[derive(Debug, Clone, FromRow)]
 pub struct CdrNext {
     pub fbasename: Option<String>,
     pub match_header: Option<String>,
+    pub digest_username: Option<String>,
+    pub geo_position: Option<String>,
+    pub hold: Option<String>,
+    pub spool_index: Option<u8>,
 }
 
+/// Discover every `custom_header%` column in the live `cdr_next` schema.
+/// Called once per detail-page render (cheap — INFORMATION_SCHEMA is cached
+/// by MySQL); if it gets hot we can stash the result in `AppState`.
+pub async fn list_custom_header_columns(pool: &MySqlPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT COLUMN_NAME \
+           FROM information_schema.COLUMNS \
+          WHERE TABLE_SCHEMA = DATABASE() \
+            AND TABLE_NAME   = 'cdr_next' \
+            AND COLUMN_NAME LIKE 'custom_header%' \
+          ORDER BY COLUMN_NAME",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Fetch the static + dynamic fields for one CDR.
 pub async fn fetch_cdr_next(
     pool: &MySqlPool,
     cdr_id: u64,
-) -> Result<Option<CdrNext>, sqlx::Error> {
-    sqlx::query_as::<_, CdrNext>(
-        "SELECT fbasename, match_header FROM cdr_next WHERE cdr_ID = ? LIMIT 1",
+) -> Result<CdrNextBundle, sqlx::Error> {
+    let static_row: Option<CdrNext> = sqlx::query_as(
+        "SELECT fbasename, match_header, digest_username, \
+                GeoPosition AS `geo_position`, hold, spool_index \
+           FROM cdr_next WHERE cdr_ID = ? LIMIT 1",
     )
     .bind(cdr_id)
     .fetch_optional(pool)
-    .await
+    .await?;
+
+    let custom_cols = list_custom_header_columns(pool).await?;
+    let custom_values = if !custom_cols.is_empty() {
+        // Quote identifiers with backticks (column names may contain digits
+        // after `custom_header`).
+        let select_list = custom_cols
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {select_list} FROM cdr_next WHERE cdr_ID = ? LIMIT 1"
+        );
+        let row: Option<sqlx::mysql::MySqlRow> =
+            sqlx::query(&sql).bind(cdr_id).fetch_optional(pool).await?;
+        row.map(|r| {
+            custom_cols
+                .iter()
+                .map(|c| {
+                    let v: Option<String> = r.try_get(c.as_str()).ok().flatten();
+                    (c.clone(), v.unwrap_or_default())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    Ok(CdrNextBundle {
+        static_fields: static_row,
+        custom_headers: custom_values,
+    })
+}
+
+/// Combined `cdr_next` payload — typed columns plus a list of
+/// `(column_name, value)` for every dynamic `custom_headerN`.
+#[derive(Debug, Clone)]
+pub struct CdrNextBundle {
+    pub static_fields: Option<CdrNext>,
+    pub custom_headers: Vec<(String, String)>,
 }
 
 /// `cdr_next_branches` — one row per leg of a forked call, identified by
