@@ -327,6 +327,27 @@ pub async fn cdr_detail(
     };
     let cdr = CdrSummary::from(cdr);
 
+    // Pull the optional extension tables in parallel — both are tiny.
+    let (next, branches) = tokio::join!(
+        cdr::fetch_cdr_next(&state.pool, id),
+        cdr::fetch_cdr_branches(&state.pool, id),
+    );
+    let next = next?;
+    let branches = branches?;
+
+    let fbasename = next
+        .as_ref()
+        .and_then(|n| n.fbasename.as_deref())
+        .unwrap_or("");
+    let match_header = next
+        .as_ref()
+        .and_then(|n| n.match_header.as_deref())
+        .unwrap_or("");
+    let branch_ids: Vec<String> = branches
+        .into_iter()
+        .filter_map(|b| b.call_id)
+        .collect();
+
     let body = format!(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>CDR #{id}</title>
@@ -334,6 +355,7 @@ pub async fn cdr_detail(
 <body><main class="content">
   <h1>CDR #{id}</h1>
   <p><a href="/">&larr; back to list</a></p>
+  <h2>Call</h2>
   <table class="cdrs">
     <tr><th>calldate</th><td>{calldate}</td></tr>
     <tr><th>callend</th><td>{callend}</td></tr>
@@ -347,6 +369,14 @@ pub async fn cdr_detail(
     <tr><th>lost (a/b)</th><td>{al} / {bl}</td></tr>
     <tr><th>sensor</th><td>{sensor}</td></tr>
   </table>
+
+  <h2>Custom headers &amp; PCAP linking</h2>
+  <table class="cdrs">
+    <tr><th>fbasename</th><td><code>{fbasename}</code> <span class="muted small">(derived from SIP Call-ID; matches the inner pcap filename)</span></td></tr>
+    <tr><th>match_header</th><td><code>{match_header}</code> <span class="muted small">(custom header used to link call legs)</span></td></tr>
+  </table>
+  {branches_html}
+
   <p><a class="button" href="/pcap/{id}">Download PCAP</a></p>
 </main></body></html>"#,
         id = cdr.id,
@@ -362,12 +392,40 @@ pub async fn cdr_detail(
         al = cdr.a_lost.unwrap_or(0),
         bl = cdr.b_lost.unwrap_or(0),
         sensor = cdr.id_sensor.unwrap_or(0),
+        fbasename = html_escape(fbasename),
+        match_header = html_escape(match_header),
+        branches_html = render_branches(&branch_ids),
     );
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         body,
     )
         .into_response())
+}
+
+fn render_branches(call_ids: &[String]) -> String {
+    if call_ids.is_empty() {
+        return String::new();
+    }
+    let items: Vec<String> = call_ids
+        .iter()
+        .map(|c| format!("<li><code>{}</code></li>", html_escape(c)))
+        .collect();
+    format!(
+        "<h2>Call legs (cdr_next_branches)</h2><ul>{}</ul>",
+        items.join("")
+    )
+}
+
+/// Minimal HTML escape — good enough for v0.1 since headers come from
+/// trusted admin-configured SIP traffic, but use a real sanitizer if you
+/// ever start rendering attacker-controlled data.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 pub async fn cdr_export_csv(

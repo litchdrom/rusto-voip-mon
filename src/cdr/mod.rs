@@ -378,6 +378,54 @@ pub fn list_stream(
     ReceiverStream::new(rx)
 }
 
+/// `cdr_next` — 1:1 extension to `cdr` that holds per-call derived state:
+///   - `fbasename`     — Call-ID with special chars → underscores (matches the
+///                       PCAP inner filename and is used to correlate pcaps
+///                       with calls).
+///   - `match_header`  — content of the configured custom header, used by
+///                       VoIPmonitor to link call legs.
+///
+/// Columns we read: `fbasename`, `match_header`. Other columns are ignored
+/// for now; if the schema adds more, this struct + query is the only place
+/// to update.
+#[derive(Debug, Clone, FromRow)]
+pub struct CdrNext {
+    pub fbasename: Option<String>,
+    pub match_header: Option<String>,
+}
+
+pub async fn fetch_cdr_next(
+    pool: &MySqlPool,
+    cdr_id: u64,
+) -> Result<Option<CdrNext>, sqlx::Error> {
+    sqlx::query_as::<_, CdrNext>(
+        "SELECT fbasename, match_header FROM cdr_next WHERE cdr_ID = ? LIMIT 1",
+    )
+    .bind(cdr_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// `cdr_next_branches` — one row per leg of a forked call, identified by
+/// SIP Call-ID. We render them as a list so the user can spot multi-leg
+/// calls (e.g. forking proxies, B2BUA setups).
+#[derive(Debug, Clone, FromRow)]
+pub struct CdrNextBranch {
+    pub call_id: Option<String>,
+}
+
+pub async fn fetch_cdr_branches(
+    pool: &MySqlPool,
+    cdr_id: u64,
+) -> Result<Vec<CdrNextBranch>, sqlx::Error> {
+    sqlx::query_as::<_, CdrNextBranch>(
+        "SELECT call_id FROM cdr_next_branches WHERE cdr_ID = ? ORDER BY id",
+    )
+    .bind(cdr_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// Distinct values from the last N days, used to populate the filter
 /// `<datalist>` pickers so users can choose from observed values OR type
 /// custom ones (the text input + datalist combo).
