@@ -490,8 +490,11 @@ pub async fn fetch_cdr_branches(
     pool: &MySqlPool,
     cdr_id: u64,
 ) -> Result<Vec<CdrNextBranch>, sqlx::Error> {
+    // `cdr_next_branches` may or may not have an `id` column depending on
+    // VoIPmonitor version — sort by `cdr_ID` (always present) which is
+    // a stable-enough order for the small set of legs per call.
     sqlx::query_as::<_, CdrNextBranch>(
-        "SELECT call_id FROM cdr_next_branches WHERE cdr_ID = ? ORDER BY id",
+        "SELECT call_id FROM cdr_next_branches WHERE cdr_ID = ? ORDER BY cdr_ID",
     )
     .bind(cdr_id)
     .fetch_all(pool)
