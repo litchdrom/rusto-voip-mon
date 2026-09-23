@@ -195,12 +195,17 @@ async fn fetch_parts(pool: &MySqlPool, cdr_id: u64) -> AppResult<Vec<TarPartRow>
 }
 
 /// Compute `{PCAP_DIR}/YYYY-MM-DD/HH/MM/{TYPE}/{TYPE}_YYYY-MM-DD-HH-MM.tar.zst`.
+///
+/// VoIPmonitor uses lowercase directory + file prefixes on disk
+/// (`sip/`, `rtp/`, `graph/`, …) even though the documentation often
+/// renders them uppercase. The numeric type column comes from
+/// `cdr_tar_part.type`.
 fn compute_path(pcap_dir: &Path, calldate: NaiveDateTime, type_: u8) -> PathBuf {
     let type_name = match type_ {
-        0 => "SIP",
-        1 => "RTP",
-        2 => "GRAPH",
-        _ => "OTHER",
+        0 => "sip",
+        1 => "rtp",
+        2 => "graph",
+        _ => "other",
     };
     pcap_dir
         .join(calldate.format("%Y-%m-%d").to_string())
@@ -332,13 +337,17 @@ mod tests {
         let ts = NaiveDateTime::parse_from_str("2026-09-21 14:35:00", "%Y-%m-%d %H:%M:%S").unwrap();
         let p = compute_path(&dir, ts, 0);
         let s = p.to_string_lossy().replace('\\', "/");
-        assert!(s.ends_with("SIP/SIP_2026-09-21-14-35.tar.zst"), "got {s}");
+        // VoIPmonitor uses lowercase prefixes on disk (`sip/`, `rtp/`, ...).
+        assert!(s.ends_with("sip/sip_2026-09-21-14-35.tar.zst"), "got {s}");
         assert!(s.contains("2026-09-21/14/35/"), "got {s}");
         let p = compute_path(&dir, ts, 1);
         let s = p.to_string_lossy().replace('\\', "/");
-        assert!(s.ends_with("RTP/RTP_2026-09-21-14-35.tar.zst"), "got {s}");
+        assert!(s.ends_with("rtp/rtp_2026-09-21-14-35.tar.zst"), "got {s}");
+        let p = compute_path(&dir, ts, 2);
+        let s = p.to_string_lossy().replace('\\', "/");
+        assert!(s.ends_with("graph/graph_2026-09-21-14-35.tar.zst"), "got {s}");
         let p = compute_path(&dir, ts, 9);
         let s = p.to_string_lossy().replace('\\', "/");
-        assert!(s.ends_with("OTHER/OTHER_2026-09-21-14-35.tar.zst"), "got {s}");
+        assert!(s.ends_with("other/other_2026-09-21-14-35.tar.zst"), "got {s}");
     }
 }
