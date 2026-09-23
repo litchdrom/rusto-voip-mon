@@ -216,18 +216,24 @@ fn url_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ListQuery {
     pub from: Option<String>,
     pub to: Option<String>,
     pub caller: Option<String>,
     pub called: Option<String>,
     // Multi-value fields arrive as repeated query params or comma-separated
-    // text input — we accept Vec<String> and merge both in build_filters.
-    pub src_ip: Option<Vec<String>>,
-    pub dst_ip: Option<Vec<String>>,
-    pub sip_code: Option<Vec<String>>,
-    pub id_sensor: Option<Vec<String>>,
+    // text input. Plain `Vec<String>` (not Option<Vec>) because serde_urlencoded
+    // chokes on `Option<Vec<_>>` when the first occurrence is empty —
+    // e.g. `?dst_ip=&dst_ip=x` fails with "expected a sequence".
+    #[serde(default)]
+    pub src_ip: Vec<String>,
+    #[serde(default)]
+    pub dst_ip: Vec<String>,
+    #[serde(default)]
+    pub sip_code: Vec<String>,
+    #[serde(default)]
+    pub id_sensor: Vec<String>,
     // Numeric fields are taken as raw strings so an empty form value
     // (e.g. `mos_min=`) doesn't fail deserialization. We parse them
     // manually in `build_filters`.
@@ -480,14 +486,14 @@ pub async fn cdr_export_csv(
         to: parse_dt(&q.to),
         caller: q.caller.filter(|s| !s.is_empty()),
         called: q.called.filter(|s| !s.is_empty()),
-        src_ip: merge_csv(q.src_ip.as_deref()).filter(|s| !s.is_empty()),
-        dst_ip: merge_csv(q.dst_ip.as_deref()).filter(|s| !s.is_empty()),
-        sip_code: merge_csv(q.sip_code.as_deref()).filter(|s| !s.is_empty()),
+        src_ip: merge_csv(Some(&q.src_ip)).filter(|s| !s.is_empty()),
+        dst_ip: merge_csv(Some(&q.dst_ip)).filter(|s| !s.is_empty()),
+        sip_code: merge_csv(Some(&q.sip_code)).filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: merge_csv(q.id_sensor.as_deref()).filter(|s| !s.is_empty()),
+        id_sensor: merge_csv(Some(&q.id_sensor)).filter(|s| !s.is_empty()),
         page: None,
         // `normalized_for_export` doesn't clamp the page size — CSV wants
         // every matching row. We still apply offset=0, no pagination.
@@ -562,14 +568,14 @@ fn build_filters(q: &ListQuery) -> CdrFilters {
         called: q.called.clone().filter(|s| !s.is_empty()),
         // Merge all forms of each multi-value field (repeated checkboxes
         // + comma-separated custom input) into a single canonical string.
-        src_ip: merge_csv(q.src_ip.as_deref()).filter(|s| !s.is_empty()),
-        dst_ip: merge_csv(q.dst_ip.as_deref()).filter(|s| !s.is_empty()),
-        sip_code: merge_csv(q.sip_code.as_deref()).filter(|s| !s.is_empty()),
+        src_ip: merge_csv(Some(&q.src_ip)).filter(|s| !s.is_empty()),
+        dst_ip: merge_csv(Some(&q.dst_ip)).filter(|s| !s.is_empty()),
+        sip_code: merge_csv(Some(&q.sip_code)).filter(|s| !s.is_empty()),
         mos_min: parse_opt(q.mos_min.as_deref()),
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: None,
         max_duration: None,
-        id_sensor: merge_csv(q.id_sensor.as_deref()).filter(|s| !s.is_empty()),
+        id_sensor: merge_csv(Some(&q.id_sensor)).filter(|s| !s.is_empty()),
         page: parse_opt(q.page.as_deref()),
         page_size: parse_opt(q.page_size.as_deref()),
     }
