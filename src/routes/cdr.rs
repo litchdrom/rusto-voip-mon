@@ -352,11 +352,6 @@ pub async fn cdr_detail(
         .and_then(|n| n.spool_index)
         .map(|v| v.to_string())
         .unwrap_or_default();
-    let branch_ids: Vec<String> = branches
-        .into_iter()
-        .filter_map(|b| b.call_id)
-        .collect();
-
     // Build the custom-headers table dynamically.
     let custom_header_rows: String = next
         .custom_headers
@@ -433,7 +428,7 @@ pub async fn cdr_detail(
                 "<h3>Custom headers</h3><table class=\"cdrs\">{custom_header_rows}</table>"
             )
         },
-        branches_html = render_branches(&branch_ids),
+        branches_html = render_branches(&branches),
     );
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -442,16 +437,38 @@ pub async fn cdr_detail(
         .into_response())
 }
 
-fn render_branches(call_ids: &[String]) -> String {
-    if call_ids.is_empty() {
+fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
+    if branches.is_empty() {
         return String::new();
     }
-    let items: Vec<String> = call_ids
+    let items: Vec<String> = branches
         .iter()
-        .map(|c| format!("<li><code>{}</code></li>", html_escape(c)))
+        .map(|b| {
+            let ts = b
+                .calldate
+                .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let call_id = b.call_id.as_deref().unwrap_or("");
+            let fbasename = b.fbasename.as_deref().unwrap_or("");
+            format!(
+                "<li><span class=\"muted small\">[{ts}]</span> \
+                 call_id=<code>{ci}</code> \
+                 {fb}</li>",
+                ts = html_escape(&ts),
+                ci = html_escape(call_id),
+                fb = if fbasename.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "<span class=\"muted small\">· fbasename=<code>{}</code></span>",
+                        html_escape(fbasename)
+                    )
+                }
+            )
+        })
         .collect();
     format!(
-        "<h2>Call legs (cdr_next_branches)</h2><ul>{}</ul>",
+        "<h2>Call legs (cdr_next_branches)</h2><ul class=\"branches\">{}</ul>",
         items.join("")
     )
 }

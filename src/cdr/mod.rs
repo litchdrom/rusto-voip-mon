@@ -478,23 +478,30 @@ pub struct CdrNextBundle {
     pub custom_headers: Vec<(String, String)>,
 }
 
-/// `cdr_next_branches` — one row per leg of a forked call, identified by
-/// SIP Call-ID. We render them as a list so the user can spot multi-leg
-/// calls (e.g. forking proxies, B2BUA setups).
+/// `cdr_next_branches` — one row per leg of a forked call. Primary key
+/// on this table is `(cdr_ID, calldate)`, NOT `(id)` — so we sort by
+/// `calldate` for a deterministic chronological order of the legs.
+///
+/// The table actually carries a full set of SIP fields per leg (caller,
+/// called, IPs, response code, custom headers…). For v0.1 we read just
+/// `calldate`, `call_id`, and `fbasename` — the minimum needed to render a
+/// useful "call legs" panel. Pulling the rest is a v1.1 concern.
 #[derive(Debug, Clone, FromRow)]
 pub struct CdrNextBranch {
+    pub calldate: Option<NaiveDateTime>,
     pub call_id: Option<String>,
+    pub fbasename: Option<String>,
 }
 
 pub async fn fetch_cdr_branches(
     pool: &MySqlPool,
     cdr_id: u64,
 ) -> Result<Vec<CdrNextBranch>, sqlx::Error> {
-    // `cdr_next_branches` may or may not have an `id` column depending on
-    // VoIPmonitor version — sort by `cdr_ID` (always present) which is
-    // a stable-enough order for the small set of legs per call.
     sqlx::query_as::<_, CdrNextBranch>(
-        "SELECT call_id FROM cdr_next_branches WHERE cdr_ID = ? ORDER BY cdr_ID",
+        "SELECT calldate, call_id, fbasename \
+           FROM cdr_next_branches \
+          WHERE cdr_ID = ? \
+          ORDER BY calldate",
     )
     .bind(cdr_id)
     .fetch_all(pool)
