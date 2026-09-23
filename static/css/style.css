@@ -337,3 +337,32 @@ table.cdrs tr:hover { background: var(--bg-elev-2); }
   text-decoration: underline;
 }
 .link-btn:hover { color: var(--accent-hover); }
+
+/* Loading state on the Apply button after click — small CSS-only spinner. */
+button.loading {
+  position: relative;
+  color: transparent !important;
+  pointer-events: none;
+}
+button.loading::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border: 2px solid #fff;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Subtle fade-in on page load — fades the main content over 200ms so
+   prefetched page transitions feel smooth instead of jarringly instant. */
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+main.content { animation: fade-in 200ms ease-out; }

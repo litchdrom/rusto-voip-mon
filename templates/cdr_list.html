@@ -1,5 +1,18 @@
 {% extends "base.html" %}
 {% block title %}CDR list · rusto-voip-mon{% endblock %}
+{% block head %}
+  {# Prefetch adjacent pages so Next/Prev feels instant.
+     Browsers fetch these at low priority, sending cookies for same-origin,
+     so the prefetched HTML is ready when the user clicks. #}
+  {% if has_more %}
+  <link rel="prefetch" href="{{ next_url }}">
+  {% endif %}
+  {% if has_prev %}
+  <link rel="prefetch" href="{{ prev_url }}">
+  {% endif %}
+  {# Warm the CSV endpoint too — large exports benefit most from a head start. #}
+  <link rel="prefetch" href="{{ export_url }}">
+{% endblock %}
 {% block content %}
 
 <section class="page-header">
@@ -113,7 +126,7 @@
   </div>
 
   <div class="filter-actions">
-    <button type="submit">Apply</button>
+    <button type="submit" id="apply-btn" onclick="this.classList.add('loading'); this.disabled = true;">Apply</button>
     <button type="button" class="link-btn" onclick="resetAllFilters()">Reset all</button>
     <a class="link" href="/">Today</a>
     <a class="link" href="/?from={{ filters.yesterday_from }}&to={{ filters.yesterday_to }}">Yesterday</a>
