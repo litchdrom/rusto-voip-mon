@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="static/img/logo.svg" alt="rusto-voip-mon logo" width="240">
+</p>
+
 # rusto-voip-mon
 
 An open-source web GUI for [VoIPmonitor](https://www.voipmonitor.org/), written in Rust.
