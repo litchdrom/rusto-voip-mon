@@ -52,7 +52,8 @@
   </div>
 </section>
 
-<form method="get" action="/" class="filters" id="cdr-filter-form">
+<form method="get" action="/" class="filters" id="cdr-filter-form"
+      onsubmit="var b=document.getElementById('apply-btn'); if(b){b.classList.add('loading'); setTimeout(function(){b.disabled=true;},0);}">
 
   <div class="grid">
     <label><span>From</span><input type="datetime-local" name="from" value="{{ filters.from_str }}"></label>
@@ -156,7 +157,7 @@
   </div>
 
   <div class="filter-actions">
-    <button type="submit" id="apply-btn" onclick="this.classList.add('loading'); this.disabled = true;">Apply</button>
+    <button type="submit" id="apply-btn">Apply</button>
     <button type="button" class="link-btn" onclick="resetAllFilters()">Reset all</button>
     <a class="link" href="/">Today</a>
     <a class="link" href="/?from={{ filters.yesterday_from }}&to={{ filters.yesterday_to }}">Yesterday</a>
