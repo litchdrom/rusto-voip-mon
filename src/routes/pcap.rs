@@ -250,18 +250,28 @@ async fn resolve_source_to_chunks(
                 bytes = chunks.iter().map(|c| c.len()).sum::<usize>(),
                 "fbasename matched in archive"
             );
-            // Concatenate all chunks for this source, stripping the
-            // 24-byte pcap global header from every chunk after the first.
-            // Otherwise Wireshark reads chunk-2's header as a packet
-            // record and the rest of the file falls apart.
+            // Some VoIPmonitor versions store RTP as a list of small
+            // inner pcaps (one per chunk, each with a 24-byte global
+            // header). Others store just the raw pcap packet records
+            // concatenated (no header per chunk). Detect which format
+            // we have by sniffing the second chunk's first bytes.
+            let has_pcap_header_per_chunk = chunks.iter().skip(1).any(|c| {
+                c.len() >= 4 && (&c[..4] == b"\xd4\xc3\xb2\xa1" || &c[..4] == b"\xa1\xb2\xc3\xd4")
+            });
             let total: usize = chunks
                 .iter()
                 .enumerate()
-                .map(|(i, c)| if i == 0 { c.len() } else { c.len().saturating_sub(PCAP_GLOBAL_HEADER_LEN) })
+                .map(|(i, c)| {
+                    if i == 0 || !has_pcap_header_per_chunk {
+                        c.len()
+                    } else {
+                        c.len().saturating_sub(PCAP_GLOBAL_HEADER_LEN)
+                    }
+                })
                 .sum();
             let mut buf = Vec::with_capacity(total);
             for (i, c) in chunks.iter().enumerate() {
-                if i == 0 {
+                if i == 0 || !has_pcap_header_per_chunk {
                     buf.extend_from_slice(c);
                 } else if c.len() > PCAP_GLOBAL_HEADER_LEN {
                     buf.extend_from_slice(&c[PCAP_GLOBAL_HEADER_LEN..]);
