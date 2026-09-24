@@ -26,7 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use chrono::NaiveDateTime;
+use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use sqlx::{MySqlPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -40,6 +40,26 @@ use crate::{
 /// Pcap global header is exactly 24 bytes; we strip it from all but the
 /// first chunk when concatenating SIP+RTP into a single pcap.
 const PCAP_GLOBAL_HEADER_LEN: usize = 24;
+
+/// What to pull from a given archive: a precise slice (used when
+/// `cdr_tar_part.pos` is known) or the full pcap (used as a fallback
+/// when only GRAPH parts exist for this CDR).
+#[derive(Debug, Clone)]
+enum SliceKind {
+    /// Start at this byte offset inside the inner pcap.
+    From(u64),
+    /// Use the entire pcap.
+    Full,
+}
+
+/// One archive to stream, with how to slice it.
+#[derive(Debug, Clone)]
+struct PcapSource {
+    archive: PathBuf,
+    slice: SliceKind,
+    /// Free-form label used in log lines and the response header.
+    label: String,
+}
 
 /// `cdr_tar_part` row — the only columns we need.
 #[derive(Debug, Clone)]
@@ -76,88 +96,104 @@ pub async fn download_single(
         fetch_parts(&state.pool, cdr_id),
     )
     .await?;
-    if parts.is_empty() {
-        return Err(AppError::NotFound);
-    }
 
-    // Group parts by file path so each tar.zst is opened and decompressed
-    // only once even if the same archive holds multiple slices. Move the
-    // rows (not references) so the closure below can be `'static`.
-    let mut by_file: HashMap<PathBuf, Vec<TarPartRow>> = HashMap::new();
-    for p in parts {
-        let path = match resolve_archive_path(&state.config.pcap_dir, p.calldate, p.type_) {
-            Some(p) => p,
-            None => {
-                tracing::error!(
-                    calldate = %p.calldate,
-                    type_ = p.type_,
-                    "no tar.zst archive found for this part"
-                );
-                continue;
-            }
-        };
-        by_file.entry(path).or_default().push(p);
-    }
+    // Decide between precise slicing (cdr_tar_part.pos is known) and a
+    // fallback that downloads the whole minute's pcap when only GRAPH
+    // entries exist (cdr_tar_part only covers GRAPH for some installs,
+    // and GRAPH archives hold `.graph` files, not `.pcap`).
+    let sources: Vec<PcapSource> = if parts.iter().any(|p| p.type_ != 2) {
+        build_sources_from_parts(&state.config.pcap_dir, parts)
+    } else if !parts.is_empty() {
+        tracing::warn!(
+            cdr_id,
+            "cdr_tar_part only has GRAPH entries; falling back to minute-range pcap download"
+        );
+        let (from, to) = fetch_cdr_time_range(&state.pool, cdr_id).await?;
+        build_sources_from_minutes(&state.config.pcap_dir, from, to)
+    } else {
+        // No cdr_tar_part rows at all — try the same fallback.
+        match fetch_cdr_time_range(&state.pool, cdr_id).await {
+            Ok((from, to)) => build_sources_from_minutes(&state.config.pcap_dir, from, to),
+            Err(_) => return Err(AppError::NotFound),
+        }
+    };
 
-    // Sort files deterministically: SIP → RTP → GRAPH → OTHER, then by
-    // path so tarballs from different minutes stay ordered within a type.
-    let mut file_order: Vec<(PathBuf, Vec<TarPartRow>)> = by_file.into_iter().collect();
-    file_order.sort_by_key(|(path, parts)| {
-        (
-            parts.first().map(|p| p.type_).unwrap_or(255),
-            path.clone(),
+    if sources.is_empty() {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            "no pcap archives found for this CDR",
         )
-    });
+            .into_response());
+    }
 
-    let total_parts: usize = file_order.iter().map(|(_, v)| v.len()).sum();
+    let total_sources = sources.len();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
 
     tokio::task::spawn_blocking(move || {
         let mut sent_header = false;
-        for (path, parts) in file_order {
-            let archive = match read_archive(&path) {
+        for src in sources {
+            let archive = match read_archive(&src.archive) {
                 Ok(a) => a,
                 Err(e) => {
-                    tracing::error!(error = ?e, path = %path.display(),
-                        "failed to read pcap archive");
+                    tracing::error!(
+                        error = ?e,
+                        path = %src.archive.display(),
+                        label = %src.label,
+                        "failed to read pcap archive"
+                    );
                     let _ = tx.blocking_send(Err(e));
                     return;
                 }
             };
-
-            for part in parts {
-                let pos = part.pos;
-                let bytes = match extract_at_pos(&archive, pos) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::error!(error = ?e, cdr_id, pos,
-                            "failed to extract pcap slice");
-                        let err = std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("pos {}: {}", pos, e),
-                        );
-                        let _ = tx.blocking_send(Err(err));
-                        return;
-                    }
-                };
-
-                if sent_header {
-                    if bytes.len() <= PCAP_GLOBAL_HEADER_LEN {
-                        continue; // empty pcap, skip
-                    }
-                    let payload = Bytes::copy_from_slice(&bytes[PCAP_GLOBAL_HEADER_LEN..]);
-                    if tx.blocking_send(Ok(payload)).is_err() {
-                        return; // client disconnected
-                    }
-                } else {
-                    if tx.blocking_send(Ok(Bytes::copy_from_slice(bytes))).is_err() {
-                        return;
-                    }
-                    sent_header = true;
+            let pcap = match find_pcap_in_tar(&archive) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        error = ?e,
+                        path = %src.archive.display(),
+                        label = %src.label,
+                        "no .pcap entry in archive (GRAPH-only?)"
+                    );
+                    continue;
                 }
+            };
+            let bytes: &[u8] = match src.slice {
+                SliceKind::From(pos) => match pos as usize {
+                    n if n <= pcap.len() => &pcap[n..],
+                    _ => {
+                        tracing::error!(
+                            cdr_id,
+                            pos,
+                            pcap_len = pcap.len(),
+                            label = %src.label,
+                            "pos past end of inner pcap"
+                        );
+                        continue;
+                    }
+                },
+                SliceKind::Full => pcap,
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            if sent_header {
+                // Strip the 24-byte global header from every chunk after
+                // the first so the concatenated output is a single valid pcap.
+                if bytes.len() <= PCAP_GLOBAL_HEADER_LEN {
+                    continue;
+                }
+                let payload = Bytes::copy_from_slice(&bytes[PCAP_GLOBAL_HEADER_LEN..]);
+                if tx.blocking_send(Ok(payload)).is_err() {
+                    return; // client disconnected
+                }
+            } else {
+                if tx.blocking_send(Ok(Bytes::copy_from_slice(bytes))).is_err() {
+                    return;
+                }
+                sent_header = true;
             }
         }
-        tracing::info!(cdr_id, parts = total_parts, "pcap stream complete");
+        tracing::info!(cdr_id, sources = total_sources, "pcap stream complete");
     });
 
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -171,6 +207,102 @@ pub async fn download_single(
         )
         .body(body)
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
+/// Build the source list when `cdr_tar_part` has at least one row — use
+/// each row's pos to slice precisely into the matching archive.
+fn build_sources_from_parts(pcap_dir: &Path, parts: Vec<TarPartRow>) -> Vec<PcapSource> {
+    let mut by_file: HashMap<PathBuf, Vec<TarPartRow>> = HashMap::new();
+    for p in parts {
+        let path = match resolve_archive_path(pcap_dir, p.calldate, p.type_) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    calldate = %p.calldate,
+                    type_ = p.type_,
+                    "no tar.zst archive found for this part; skipping"
+                );
+                continue;
+            }
+        };
+        by_file.entry(path).or_default().push(p);
+    }
+    let mut out: Vec<PcapSource> = Vec::new();
+    for (archive, rows) in by_file {
+        for r in rows {
+            out.push(PcapSource {
+                archive: archive.clone(),
+                slice: SliceKind::From(r.pos),
+                label: format!("type={} pos={}", r.type_, r.pos),
+            });
+        }
+    }
+    // Stable order: SIP (0) → RTP (1) → GRAPH (2) → OTHER, then by path.
+    out.sort_by_key(|s| {
+        let first_type = match &s.slice {
+            SliceKind::Full => 0,
+            SliceKind::From(_) => {
+                // Best-effort: parse the type from the label.
+                s.label
+                    .strip_prefix("type=")
+                    .and_then(|t| t.split(' ').next())
+                    .and_then(|t| t.parse::<u8>().ok())
+                    .unwrap_or(255)
+            }
+        };
+        (first_type, s.archive.clone())
+    });
+    out
+}
+
+/// Build a source list covering every minute from `from` to `to`
+/// (inclusive) using the SIP archive (type=0) for each minute. Falls
+/// back to RTP (type=1) if no SIP archive exists for a given minute.
+/// This is the fallback path used when `cdr_tar_part` only has GRAPH
+/// entries, so we don't have byte offsets into the SIP/RTP pcaps.
+fn build_sources_from_minutes(
+    pcap_dir: &Path,
+    from: NaiveDateTime,
+    to: NaiveDateTime,
+) -> Vec<PcapSource> {
+    let mut out = Vec::new();
+    let mut cur = floor_to_minute(from);
+    let end = floor_to_minute(to);
+    while cur <= end {
+        // Try SIP first, then RTP — covers most calls. Skips any minute
+        // where neither archive exists.
+        for type_ in [0u8, 1u8] {
+            if let Some(p) = resolve_archive_path(pcap_dir, cur, type_) {
+                out.push(PcapSource {
+                    archive: p,
+                    slice: SliceKind::Full,
+                    label: format!("{} type={}", cur.format("%Y-%m-%d %H:%M"), type_),
+                });
+                break; // SIP found; don't also pull RTP for the same minute
+            }
+        }
+        cur += Duration::minutes(1);
+    }
+    out
+}
+
+/// Truncate seconds+ns to the start of the minute.
+fn floor_to_minute(dt: NaiveDateTime) -> NaiveDateTime {
+    NaiveDateTime::new(dt.date(), NaiveTime::from_hms_opt(dt.hour(), dt.minute(), 0).unwrap())
+}
+
+async fn fetch_cdr_time_range(
+    pool: &MySqlPool,
+    cdr_id: u64,
+) -> AppResult<(NaiveDateTime, NaiveDateTime)> {
+    let row: Option<(NaiveDateTime, NaiveDateTime)> = sqlx::query_as(
+        "SELECT calldate, callend FROM cdr WHERE ID = ? LIMIT 1",
+    )
+    .bind(cdr_id)
+    .fetch_optional(pool)
+    .await?;
+    let (from, to) = row.ok_or(AppError::NotFound)?;
+    Ok((from, to))
 }
 
 /// Batch download — left as a 501 for v0.2.1 (requires async-zip +
@@ -313,6 +445,7 @@ fn read_archive(path: &Path) -> std::io::Result<Vec<u8>> {
 /// `cdr_tar_part.pos` is the byte offset **within that inner pcap**, not
 /// within the tar itself — so we ignore tar offsets and slice from `pos`
 /// into the pcap body.
+#[cfg(test)]
 fn extract_at_pos(archive: &[u8], pos: u64) -> std::io::Result<&[u8]> {
     let pcap = find_pcap_in_tar(archive)?;
     let pos = pos as usize;
