@@ -243,38 +243,56 @@ async fn resolve_source_to_chunks(
                 );
                 return Ok(Vec::new());
             }
+            // Per-chunk header detection. Each chunk's first 4 bytes tell
+            // us whether it's a self-contained pcap (needs 24-byte header
+            // stripped before concat), a pcapng Section Header Block
+            // (needs SHB stripped — but currently we just keep as-is and
+            // warn), or raw concatenated pcap packet records (no header).
+            let chunk_kinds: Vec<&'static str> = chunks
+                .iter()
+                .map(|c| match c.get(..4) {
+                    Some(b"\xd4\xc3\xb2\xa1") | Some(b"\xa1\xb2\xc3\xd4") => "pcap",
+                    Some(b"\x0a\x0d\x0d\x0a") => "pcapng",
+                    _ => "raw",
+                })
+                .collect();
+            let chunk_sizes: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
             tracing::info!(
                 path = %src.archive.display(),
                 target = %name,
                 chunks = chunks.len(),
-                bytes = chunks.iter().map(|c| c.len()).sum::<usize>(),
+                kinds = ?chunk_kinds,
+                sizes = ?chunk_sizes,
                 "fbasename matched in archive"
             );
-            // Some VoIPmonitor versions store RTP as a list of small
-            // inner pcaps (one per chunk, each with a 24-byte global
-            // header). Others store just the raw pcap packet records
-            // concatenated (no header per chunk). Detect which format
-            // we have by sniffing the second chunk's first bytes.
-            let has_pcap_header_per_chunk = chunks.iter().skip(1).any(|c| {
-                c.len() >= 4 && (&c[..4] == b"\xd4\xc3\xb2\xa1" || &c[..4] == b"\xa1\xb2\xc3\xd4")
-            });
+            // Build the concat buffer per-chunk:
+            //   - "pcap" chunks: strip the 24-byte global header
+            //   - "pcapng" chunks: keep as-is (pcapng SHBs must stay;
+            //     reader will skip them only if the file is full pcapng,
+            //     which our output isn't — so we WARN about these below)
+            //   - "raw" chunks: keep as-is
             let total: usize = chunks
                 .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if i == 0 || !has_pcap_header_per_chunk {
-                        c.len()
-                    } else {
+                .zip(chunk_kinds.iter())
+                .map(|(c, k)| {
+                    if *k == "pcap" {
                         c.len().saturating_sub(PCAP_GLOBAL_HEADER_LEN)
+                    } else {
+                        c.len()
                     }
                 })
                 .sum();
+            if chunk_kinds.iter().any(|k| *k == "pcapng") {
+                tracing::warn!(
+                    "RTP chunks include pcapng format; concatenated output may be unreadable"
+                );
+            }
             let mut buf = Vec::with_capacity(total);
-            for (i, c) in chunks.iter().enumerate() {
-                if i == 0 || !has_pcap_header_per_chunk {
-                    buf.extend_from_slice(c);
-                } else if c.len() > PCAP_GLOBAL_HEADER_LEN {
+            for (c, k) in chunks.iter().zip(chunk_kinds.iter()) {
+                if *k == "pcap" && c.len() > PCAP_GLOBAL_HEADER_LEN {
                     buf.extend_from_slice(&c[PCAP_GLOBAL_HEADER_LEN..]);
+                } else {
+                    buf.extend_from_slice(c);
                 }
             }
             Ok(buf)
