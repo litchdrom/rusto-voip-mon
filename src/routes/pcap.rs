@@ -26,7 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike};
 use sqlx::{MySqlPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -50,6 +50,9 @@ enum SliceKind {
     From(u64),
     /// Use the entire pcap.
     Full,
+    /// Use only the inner tar entry whose name equals this string
+    /// (matched with or without a `.pcap` extension).
+    ByName(String),
 }
 
 /// One archive to stream, with how to slice it.
@@ -96,22 +99,34 @@ pub async fn download_single(
         fetch_parts(&state.pool, cdr_id),
     )
     .await?;
+    let fbasename = crate::error::with_query_timeout(
+        state.config.query_timeout_secs,
+        fetch_fbasename(&state.pool, cdr_id),
+    )
+    .await
+    .ok()
+    .flatten();
 
-    // Decide between precise slicing (cdr_tar_part.pos is known) and a
-    // fallback that downloads the whole minute's pcap when only GRAPH
-    // entries exist (cdr_tar_part only covers GRAPH for some installs,
-    // and GRAPH archives hold `.graph` files, not `.pcap`).
+    // Three paths, in order of precision:
+    //   1. cdr_tar_part has SIP/RTP rows with byte offsets → use them
+    //   2. Otherwise, look up the CDR's fbasename and search the SIP/RTP
+    //      archives across the call's minute range for a matching
+    //      per-call pcap file
+    //   3. Last resort: download the whole minute's pcap and let the
+    //      user filter in Wireshark
     let sources: Vec<PcapSource> = if parts.iter().any(|p| p.type_ != 2) {
         build_sources_from_parts(&state.config.pcap_dir, parts)
+    } else if let Some(ref fb) = fbasename {
+        let (from, to) = fetch_cdr_time_range(&state.pool, cdr_id).await?;
+        build_sources_from_fbasename(&state.config.pcap_dir, from, to, fb)
     } else if !parts.is_empty() {
         tracing::warn!(
             cdr_id,
-            "cdr_tar_part only has GRAPH entries; falling back to minute-range pcap download"
+            "cdr_tar_part only has GRAPH entries and no cdr_next.fbasename; falling back to minute-range download"
         );
         let (from, to) = fetch_cdr_time_range(&state.pool, cdr_id).await?;
         build_sources_from_minutes(&state.config.pcap_dir, from, to)
     } else {
-        // No cdr_tar_part rows at all — try the same fallback.
         match fetch_cdr_time_range(&state.pool, cdr_id).await {
             Ok((from, to)) => build_sources_from_minutes(&state.config.pcap_dir, from, to),
             Err(_) => return Err(AppError::NotFound),
@@ -145,33 +160,52 @@ pub async fn download_single(
                     return;
                 }
             };
-            let pcap = match find_pcap_in_tar(&archive) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!(
-                        error = ?e,
-                        path = %src.archive.display(),
-                        label = %src.label,
-                        "no .pcap entry in archive (GRAPH-only?)"
-                    );
-                    continue;
+            let bytes: &[u8] = match &src.slice {
+                SliceKind::ByName(name) => {
+                    match find_file_in_tar_by_name(&archive, name) {
+                        Some(p) => p,
+                        None => {
+                            tracing::debug!(
+                                path = %src.archive.display(),
+                                target = %name,
+                                label = %src.label,
+                                "fbasename not found in this archive; skipping"
+                            );
+                            continue;
+                        }
+                    }
+                }
+                SliceKind::From(_) | SliceKind::Full => {
+                    match find_pcap_in_tar(&archive) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::error!(
+                                error = ?e,
+                                path = %src.archive.display(),
+                                label = %src.label,
+                                "no .pcap entry in archive (GRAPH-only?)"
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
-            let bytes: &[u8] = match src.slice {
-                SliceKind::From(pos) => match pos as usize {
-                    n if n <= pcap.len() => &pcap[n..],
+            let bytes: &[u8] = match &src.slice {
+                SliceKind::ByName(_) => bytes,
+                SliceKind::From(pos) => match *pos as usize {
+                    n if n <= bytes.len() => &bytes[n..],
                     _ => {
                         tracing::error!(
                             cdr_id,
-                            pos,
-                            pcap_len = pcap.len(),
+                            pos = *pos,
+                            pcap_len = bytes.len(),
                             label = %src.label,
                             "pos past end of inner pcap"
                         );
                         continue;
                     }
                 },
-                SliceKind::Full => pcap,
+                SliceKind::Full => bytes,
             };
             if bytes.is_empty() {
                 continue;
@@ -241,7 +275,7 @@ fn build_sources_from_parts(pcap_dir: &Path, parts: Vec<TarPartRow>) -> Vec<Pcap
     out.sort_by_key(|s| {
         let first_type = match &s.slice {
             SliceKind::Full => 0,
-            SliceKind::From(_) => {
+            SliceKind::From(_) | SliceKind::ByName(_) => {
                 // Best-effort: parse the type from the label.
                 s.label
                     .strip_prefix("type=")
@@ -303,6 +337,57 @@ async fn fetch_cdr_time_range(
     .await?;
     let (from, to) = row.ok_or(AppError::NotFound)?;
     Ok((from, to))
+}
+
+/// Look up `cdr_next.fbasename` — the per-call pcap filename VoIPmonitor
+/// uses inside its tar archives. Used to locate the call's pcap when
+/// `cdr_tar_part` doesn't have SIP/RTP byte offsets (the common case
+/// where only GRAPH entries are indexed).
+async fn fetch_fbasename(pool: &MySqlPool, cdr_id: u64) -> AppResult<Option<String>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as(
+        "SELECT fbasename FROM cdr_next WHERE cdr_ID = ? LIMIT 1",
+    )
+    .bind(cdr_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.and_then(|(f,)| f))
+}
+
+/// Walk every minute the call spans, look in the SIP archive (and RTP
+/// as fallback) for an inner pcap whose name matches `fbasename`. Used
+/// when `cdr_tar_part` is GRAPH-only on this install — the inner pcaps
+/// still exist, they're just one file per call instead of one combined
+/// pcap with byte offsets.
+fn build_sources_from_fbasename(
+    pcap_dir: &Path,
+    from: NaiveDateTime,
+    to: NaiveDateTime,
+    fbasename: &str,
+) -> Vec<PcapSource> {
+    let mut out = Vec::new();
+    let mut cur = floor_to_minute(from);
+    let end = floor_to_minute(to);
+    while cur <= end {
+        // Try SIP first (most pcap data is here for most installs), then
+        // RTP. Each archive may use .tar.zst or plain .tar — handled by
+        // read_archive().
+        for type_ in [0u8, 1u8] {
+            if let Some(p) = resolve_archive_path(pcap_dir, cur, type_) {
+                out.push(PcapSource {
+                    archive: p,
+                    slice: SliceKind::ByName(fbasename.to_string()),
+                    label: format!(
+                        "{} type={} name={}",
+                        cur.format("%Y-%m-%d %H:%M"),
+                        type_,
+                        fbasename
+                    ),
+                });
+            }
+        }
+        cur += Duration::minutes(1);
+    }
+    out
 }
 
 /// Batch download — left as a 501 for v0.2.1 (requires async-zip +
@@ -410,31 +495,78 @@ fn compute_path_with(
         ))
 }
 
-/// Read + zstd-decompress an entire tar.zst archive into memory. Tar.zst
-/// archives are minute-bucketed (one type, one minute) so they stay
-/// small; if that ever changes we can switch to seekable-zstd.
-///
-/// Tolerates a trailing `UnexpectedEof`: VoIPmonitor appends to the
-/// `.tar.zst` continuously throughout the minute, so a download
-/// triggered while capture is still active will hit an incomplete
-/// trailing frame. We swallow that error and return whatever frames
-/// decoded cleanly — usually enough to get the call's pcap out.
+/// Read an entire tar archive (compressed or plain) into memory.
+/// VoIPmonitor uses `.tar.zst` for SIP/GRAPH and `.tar` (uncompressed)
+/// for RTP — handle both. Also tolerates a truncated trailing zstd
+/// frame when capture is still in progress.
 fn read_archive(path: &Path) -> std::io::Result<Vec<u8>> {
     let f = std::fs::File::open(path)?;
-    let mut dec = zstd::Decoder::new(f)?;
+    let is_zst = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".tar.zst"))
+        .unwrap_or(false);
     let mut out = Vec::new();
-    match dec.read_to_end(&mut out) {
-        Ok(_) => Ok(out),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            tracing::warn!(
-                path = %path.display(),
-                bytes = out.len(),
-                "zstd stream truncated (capture still in progress); returning partial archive"
-            );
-            Ok(out)
+    if is_zst {
+        let mut dec = zstd::Decoder::new(f)?;
+        match dec.read_to_end(&mut out) {
+            Ok(_) => Ok(out),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                tracing::warn!(
+                    path = %path.display(),
+                    bytes = out.len(),
+                    "zstd stream truncated (capture still in progress); returning partial archive"
+                );
+                Ok(out)
+            }
+            Err(e) => Err(e),
         }
-        Err(e) => Err(e),
+    } else {
+        // Plain tar.
+        let mut r = std::io::BufReader::new(f);
+        r.read_to_end(&mut out)?;
+        Ok(out)
     }
+}
+
+/// Walk the (decompressed) tar and return the body of the entry whose
+/// name matches `target_name`. Match is exact, or with a `.pcap`
+/// extension stripped (so passing `"abc123"` matches both `"abc123"` and
+/// `"abc123.pcap"`). Used when VoIPmonitor stores pcaps as one
+/// file-per-call, named after the call.
+fn find_file_in_tar_by_name<'a>(
+    archive: &'a [u8],
+    target_name: &str,
+) -> Option<&'a [u8]> {
+    let mut offset = 0usize;
+    while offset + 512 <= archive.len() {
+        let header = &archive[offset..offset + 512];
+        let raw_name = &header[0..100];
+        let name_end = raw_name.iter().position(|&b| b == 0).unwrap_or(100);
+        let entry_name = std::str::from_utf8(&raw_name[..name_end])
+            .unwrap_or("")
+            .trim_end();
+        let size = match parse_tar_size(&header[124..136]) {
+            Ok(s) => s as usize,
+            Err(_) => break,
+        };
+        if entry_name.is_empty() && size == 0 {
+            break;
+        }
+        let body_start = offset + 512;
+        let body_end = (body_start + size).min(archive.len());
+
+        let stripped = entry_name
+            .strip_suffix(".pcap")
+            .unwrap_or(entry_name);
+        if entry_name == target_name || stripped == target_name {
+            return Some(&archive[body_start..body_end]);
+        }
+
+        let padded = (size + 511) & !511;
+        offset = body_start + padded;
+    }
+    None
 }
 
 /// Walk the (decompressed) tar and return a slice that points at the
