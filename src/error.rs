@@ -9,6 +9,10 @@ pub enum AppError {
     #[error("not found")]
     NotFound,
 
+    /// Reserved for future endpoints that want a 401 rather than redirect.
+    /// Currently the auth middleware bounces unauthenticated requests to
+    /// `/login` so this variant isn't constructed yet.
+    #[allow(dead_code)]
     #[error("unauthorized")]
     Unauthorized,
 

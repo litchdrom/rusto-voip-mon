@@ -24,6 +24,9 @@ pub struct CdrListTemplate {
     pub user: Option<SessionUser>,
     pub cdrs: Vec<CdrSummary>,
     pub page: u32,
+    /// Stored for template symmetry; not currently rendered. Could
+    /// power a "X rows of Y" header in the future.
+    #[allow(dead_code)]
     pub page_size: u32,
     pub has_more: bool,
     pub has_prev: bool,
@@ -269,7 +272,7 @@ pub async fn cdr_list(
         .first("tz_offset_hours")
         .as_deref()
         .and_then(|s| s.parse().ok());
-    let (tz, session_tz_hours) = state.resolve_tz(&user, query_tz);
+    let (tz, _) = state.resolve_tz(&user, query_tz);
     let normalized = filters.normalized(tz);
     let timeout = state.config.query_timeout_secs;
 
