@@ -20,18 +20,25 @@ impl AppState {
     /// Resolve the effective timezone for a request.
     ///
     /// Resolution order:
-    ///   1. `?tz_offset_hours=N` query parameter (per-request override)
+    ///   1. `?tz_offset_hours=N` query parameter — but `N == 0` is treated
+    ///      as "no override" (use the env default), mirroring the
+    ///      behavior of `POST /tz` which uses 0 as the "reset" sentinel.
     ///   2. The user's session-stored TZ (set via the topbar dropdown)
     ///   3. The server's `APP_TZ_OFFSET_HOURS` env default
     ///
-    /// Returns `(FixedOffset, Option<i8>)` — the offset and the value that
-    /// ended up driving it (the session-stored hours, if any). Handlers
-    /// use the value to render the TZ selector with the active choice.
+    /// Returns `(FixedOffset, Option<i8>)` — the offset and the active
+    /// session-stored hours (if any), used to render the dropdown's
+    /// `selected` attribute.
     pub fn resolve_tz(
         &self,
         user: &SessionUser,
         query_override: Option<i8>,
     ) -> (chrono::FixedOffset, Option<i8>) {
+        // Treat query_override == 0 as "reset / use default". Otherwise an
+        // accidental tz_offset_hours=0 in the URL would shadow the
+        // session TZ forever (the hidden form field would keep rendering
+        // 0 and clobbering the user's dropdown choice).
+        let query_override = query_override.filter(|&h| h != 0);
         let hours = query_override
             .or(user.tz_offset_hours)
             .unwrap_or((self.config.tz_offset_secs / 3600) as i8);
