@@ -250,13 +250,22 @@ async fn resolve_source_to_chunks(
                 bytes = chunks.iter().map(|c| c.len()).sum::<usize>(),
                 "fbasename matched in archive"
             );
-            // Concatenate all chunks for this source into a single buffer;
-            // the streaming loop will strip the 24-byte pcap global header
-            // from every chunk after the first.
-            let total: usize = chunks.iter().map(|c| c.len()).sum();
+            // Concatenate all chunks for this source, stripping the
+            // 24-byte pcap global header from every chunk after the first.
+            // Otherwise Wireshark reads chunk-2's header as a packet
+            // record and the rest of the file falls apart.
+            let total: usize = chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| if i == 0 { c.len() } else { c.len().saturating_sub(PCAP_GLOBAL_HEADER_LEN) })
+                .sum();
             let mut buf = Vec::with_capacity(total);
-            for c in chunks {
-                buf.extend_from_slice(c);
+            for (i, c) in chunks.iter().enumerate() {
+                if i == 0 {
+                    buf.extend_from_slice(c);
+                } else if c.len() > PCAP_GLOBAL_HEADER_LEN {
+                    buf.extend_from_slice(&c[PCAP_GLOBAL_HEADER_LEN..]);
+                }
             }
             Ok(buf)
         }
