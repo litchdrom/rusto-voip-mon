@@ -541,14 +541,26 @@ fn read_archive(path: &Path) -> std::io::Result<Vec<u8>> {
 }
 
 /// Walk the (decompressed) tar and return the body of the entry whose
-/// name matches `target_name`. Match is exact, or with a `.pcap`
-/// extension stripped (so passing `"abc123"` matches both `"abc123"` and
-/// `"abc123.pcap"`). Used when VoIPmonitor stores pcaps as one
-/// file-per-call, named after the call.
+/// name matches `target_name` (the `cdr_next.fbasename`).
+///
+/// VoIPmonitor stores pcaps as one file per call, named
+/// `<fbasename>.pcap`. Some installs add a `#<chunk>` suffix for
+/// RTP captures split across multiple files, e.g.
+/// `WTL_xxx.pcap#0`, `WTL_xxx.pcap#1`, …, `WTL_xxx.pcap#480`. We match:
+///   - exact `<target_name>` or `<target_name>.pcap`
+///   - prefix `<target_name>.pcap#` (any chunk index — caller can
+///     concat all chunks; for v0.2 we return the first match)
+///
+/// Returns the body slice of the first match.
 fn find_file_in_tar_by_name<'a>(
     archive: &'a [u8],
     target_name: &str,
 ) -> Option<&'a [u8]> {
+    let candidates: [String; 3] = [
+        target_name.to_string(),
+        format!("{}.pcap", target_name),
+        format!("{}.pcap#", target_name), // prefix match for chunked files
+    ];
     let mut offset = 0usize;
     while offset + 512 <= archive.len() {
         let header = &archive[offset..offset + 512];
@@ -567,10 +579,10 @@ fn find_file_in_tar_by_name<'a>(
         let body_start = offset + 512;
         let body_end = (body_start + size).min(archive.len());
 
-        let stripped = entry_name
-            .strip_suffix(".pcap")
-            .unwrap_or(entry_name);
-        if entry_name == target_name || stripped == target_name {
+        if entry_name == candidates[0]
+            || entry_name == candidates[1]
+            || entry_name.starts_with(&candidates[2])
+        {
             return Some(&archive[body_start..body_end]);
         }
 
