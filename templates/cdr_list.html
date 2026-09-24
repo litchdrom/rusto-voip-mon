@@ -2,10 +2,13 @@
 {% block title %}CDR list · rusto-voip-mon{% endblock %}
 {% block topbar_tools %}
   {# Timezone override. Submits to POST /tz, which re-encodes the session
-     cookie and bounces back here so the new TZ sticks across navigation. #}
+     cookie and bounces back here so the new TZ sticks across navigation.
+     The onchange="this.form.submit()" handles auto-submit without
+     relying on an external listener; the <noscript> button covers
+     environments where JS is disabled. #}
   <form method="post" action="/tz" class="tz-form" id="tz-form">
     <label for="tz-select" class="muted small">TZ</label>
-    <select name="tz_offset_hours" id="tz-select">
+    <select name="tz_offset_hours" id="tz-select" onchange="this.form.submit()">
       {% for h in -12..=14 %}
         <option value="{{ h }}" {% if h == tz_offset_hours %}selected{% endif %}>
           {% if h == 0 %}UTC{% else if h > 0 %}UTC+{{ h }}{% else %}UTC{{ h }}{% endif %}
@@ -14,7 +17,7 @@
       {% endfor %}
     </select>
     <input type="hidden" name="next" value="" id="tz-next">
-    {# Submit on change so the user doesn't have to click a button. #}
+    <noscript><button type="submit">Apply</button></noscript>
   </form>
 {% endblock %}
 {% block head %}
@@ -32,15 +35,12 @@
 {% endblock %}
 {% block scripts %}
   <script>
-    // Pre-populate `next` with the current URL (path + query) so the
-    // server redirects back to where the user was, filters preserved.
-    const tzNext = document.getElementById('tz-next');
-    if (tzNext) tzNext.value = window.location.pathname + window.location.search;
-    // Auto-submit the TZ selector so changing the dropdown re-renders the
-    // page immediately with the new default-window.
-    document.getElementById('tz-select')?.addEventListener('change', () => {
-      document.getElementById('tz-form')?.submit();
-    });
+    // Pre-populate the TZ form's `next` hidden field with the current URL
+    // (path + query) so the server redirects back to where the user was,
+    // filters preserved. The onchange handler on the <select> itself does
+    // the auto-submit; this is just the URL capture.
+    document.querySelector('#tz-form #tz-next')?.setAttribute('value',
+      window.location.pathname + window.location.search);
   </script>
 {% endblock %}
 {% block content %}
