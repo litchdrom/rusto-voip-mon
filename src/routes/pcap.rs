@@ -756,13 +756,17 @@ fn merge_pcaps(primary_header: &[u8; 24], blobs: &[&[u8]]) -> Vec<u8> {
     // closure so we can sort/ship them out.
     let mut records_storage: Vec<&[u8]> = Vec::new();
     let mut packets: Vec<(u64, usize)> = Vec::new();
+    let mut per_blob_counts: Vec<usize> = Vec::new();
+    let mut truncated_count = 0usize;
     for blob in blobs {
-        let body = if blob.len() >= 24 && is_pcap_magic(&blob[..4]) {
+        let had_header = blob.len() >= 24 && is_pcap_magic(&blob[..4]);
+        let body = if had_header {
             &blob[24..] // strip header
         } else {
             blob // raw packet records, no header
         };
         let mut off = 0usize;
+        let mut count = 0usize;
         while off + 16 <= body.len() {
             let ts_sec = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as u64;
             let ts_usec = u32::from_le_bytes(body[off + 4..off + 8].try_into().unwrap()) as u64;
@@ -771,16 +775,27 @@ fn merge_pcaps(primary_header: &[u8; 24], blobs: &[&[u8]]) -> Vec<u8> {
             let ts = ts_sec.saturating_mul(1_000_000).saturating_add(ts_usec);
             let record_len = 16 + incl_len;
             if body.len() < off + record_len {
+                truncated_count += 1;
                 break;
             }
             let idx = records_storage.len();
             records_storage.push(&body[off..off + record_len]);
             packets.push((ts, idx));
+            count += 1;
             off += record_len;
         }
+        per_blob_counts.push(count);
     }
     // Sort by timestamp ascending (stable so identical ts preserves order).
     packets.sort_by_key(|(ts, _)| *ts);
+
+    tracing::info!(
+        blobs = blobs.len(),
+        per_blob = ?per_blob_counts,
+        truncated = truncated_count,
+        total_packets = packets.len(),
+        "merge_pcaps parsed"
+    );
 
     let total: usize = records_storage.iter().map(|r| r.len()).sum();
     let mut out = Vec::with_capacity(24 + total);
