@@ -85,7 +85,17 @@ pub async fn download_single(
     // rows (not references) so the closure below can be `'static`.
     let mut by_file: HashMap<PathBuf, Vec<TarPartRow>> = HashMap::new();
     for p in parts {
-        let path = compute_path(&state.config.pcap_dir, p.calldate, p.type_);
+        let path = match resolve_archive_path(&state.config.pcap_dir, p.calldate, p.type_) {
+            Some(p) => p,
+            None => {
+                tracing::error!(
+                    calldate = %p.calldate,
+                    type_ = p.type_,
+                    "no tar.zst archive found for this part"
+                );
+                continue;
+            }
+        };
         by_file.entry(path).or_default().push(p);
     }
 
@@ -194,19 +204,39 @@ async fn fetch_parts(pool: &MySqlPool, cdr_id: u64) -> AppResult<Vec<TarPartRow>
     Ok(out)
 }
 
-/// Compute `{PCAP_DIR}/YYYY-MM-DD/HH/MM/{TYPE}/{TYPE}_YYYY-MM-DD-HH-MM.tar.zst`.
-///
-/// VoIPmonitor uses lowercase directory + file prefixes on disk
-/// (`sip/`, `rtp/`, `graph/`, …) even though the documentation often
-/// renders them uppercase. The numeric type column comes from
-/// `cdr_tar_part.type`.
-fn compute_path(pcap_dir: &Path, calldate: NaiveDateTime, type_: u8) -> PathBuf {
-    let type_name = match type_ {
-        0 => "sip",
-        1 => "rtp",
-        2 => "graph",
-        _ => "other",
-    };
+/// All casings we know VoIPmonitor has shipped for archive dirs. Tried
+/// in order; the first existing file wins.
+const TYPE_DIR_VARIANTS: &[&str] = &[
+    "sip", "SIP", "rtp", "RTP", "graph", "GRAPH", "other", "OTHER",
+];
+
+/// Compute `{PCAP_DIR}/YYYY-MM-DD/HH/MM/{TYPE}/{TYPE}_YYYY-MM-DD-HH-MM.tar.zst`
+/// and return the first path that exists on disk, falling back across
+/// common casings. VoIPmonitor is inconsistent across versions and even
+/// across archives on the same install (recent logs show `GRAPH/`,
+/// older ones show `graph/`), so we try both.
+fn resolve_archive_path(
+    pcap_dir: &Path,
+    calldate: NaiveDateTime,
+    _type_: u8,
+) -> Option<PathBuf> {
+    for variant in TYPE_DIR_VARIANTS {
+        let p = compute_path_with(pcap_dir, calldate, variant);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Build the full archive path for a given type-name casing. Caller is
+/// responsible for passing one of the entries in `TYPE_DIR_VARIANTS` for
+/// the matching numeric type (e.g. `"graph"` or `"GRAPH"` for type 2).
+fn compute_path_with(
+    pcap_dir: &Path,
+    calldate: NaiveDateTime,
+    type_name: &str,
+) -> PathBuf {
     pcap_dir
         .join(calldate.format("%Y-%m-%d").to_string())
         .join(calldate.format("%H").to_string())
@@ -335,19 +365,26 @@ mod tests {
     fn compute_path_basic() {
         let dir = PathBuf::from("/var/spool/voipmonitor");
         let ts = NaiveDateTime::parse_from_str("2026-09-21 14:35:00", "%Y-%m-%d %H:%M:%S").unwrap();
-        let p = compute_path(&dir, ts, 0);
-        let s = p.to_string_lossy().replace('\\', "/");
-        // VoIPmonitor uses lowercase prefixes on disk (`sip/`, `rtp/`, ...).
-        assert!(s.ends_with("sip/sip_2026-09-21-14-35.tar.zst"), "got {s}");
-        assert!(s.contains("2026-09-21/14/35/"), "got {s}");
-        let p = compute_path(&dir, ts, 1);
-        let s = p.to_string_lossy().replace('\\', "/");
-        assert!(s.ends_with("rtp/rtp_2026-09-21-14-35.tar.zst"), "got {s}");
-        let p = compute_path(&dir, ts, 2);
-        let s = p.to_string_lossy().replace('\\', "/");
-        assert!(s.ends_with("graph/graph_2026-09-21-14-35.tar.zst"), "got {s}");
-        let p = compute_path(&dir, ts, 9);
-        let s = p.to_string_lossy().replace('\\', "/");
-        assert!(s.ends_with("other/other_2026-09-21-14-35.tar.zst"), "got {s}");
+        // All four known casings build a sensible path.
+        for variant in ["sip", "SIP"] {
+            let p = compute_path_with(&dir, ts, variant);
+            let s = p.to_string_lossy().replace('\\', "/");
+            assert!(s.ends_with(&format!("{variant}/{variant}_2026-09-21-14-35.tar.zst")), "got {s}");
+        }
+        for variant in ["rtp", "RTP"] {
+            let p = compute_path_with(&dir, ts, variant);
+            let s = p.to_string_lossy().replace('\\', "/");
+            assert!(s.ends_with(&format!("{variant}/{variant}_2026-09-21-14-35.tar.zst")), "got {s}");
+        }
+        for variant in ["graph", "GRAPH"] {
+            let p = compute_path_with(&dir, ts, variant);
+            let s = p.to_string_lossy().replace('\\', "/");
+            assert!(s.ends_with(&format!("{variant}/{variant}_2026-09-21-14-35.tar.zst")), "got {s}");
+        }
+        for variant in ["other", "OTHER"] {
+            let p = compute_path_with(&dir, ts, variant);
+            let s = p.to_string_lossy().replace('\\', "/");
+            assert!(s.ends_with(&format!("{variant}/{variant}_2026-09-21-14-35.tar.zst")), "got {s}");
+        }
     }
 }
