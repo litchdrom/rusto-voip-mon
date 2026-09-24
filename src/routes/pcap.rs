@@ -305,31 +305,61 @@ fn read_archive(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Find the file at the given byte offset inside a (decompressed) tar
-/// archive and return its raw body bytes (header + contents excluded).
+/// Walk the (decompressed) tar and return a slice that points at the
+/// start of the `.pcap` entry's body. Each VoIPmonitor minute-bucket
+/// tar.zst wraps a single inner pcap file that contains all the calls
+/// captured during that minute.
 ///
-/// Tolerant of truncated archives (the tar.zst file may still be being
-/// written when we read it): if the body extends past what we got, we
-/// return whatever's available. The pcap decoder is happy with a
-/// truncated tail — it'll just show the packets that did make it.
+/// `cdr_tar_part.pos` is the byte offset **within that inner pcap**, not
+/// within the tar itself — so we ignore tar offsets and slice from `pos`
+/// into the pcap body.
 fn extract_at_pos(archive: &[u8], pos: u64) -> std::io::Result<&[u8]> {
+    let pcap = find_pcap_in_tar(archive)?;
     let pos = pos as usize;
-    if pos + 512 > archive.len() {
+    if pos > pcap.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
-            format!("pos {pos} past end of archive ({} bytes)", archive.len()),
+            format!(
+                "pos {pos} past end of inner pcap ({} bytes)",
+                pcap.len()
+            ),
         ));
     }
+    // If the pcap is truncated (capture still in progress), return
+    // whatever bytes we have rather than failing.
+    Ok(&pcap[pos..])
+}
 
-    let header = &archive[pos..pos + 512];
-    let size = parse_tar_size(&header[124..136])? as usize;
-
-    let data_start = pos + 512;
-    // Clamp to whatever bytes are actually available rather than erroring
-    // out — captures in progress are common and we want to return the
-    // packets that did make it through.
-    let data_end = (data_start + size).min(archive.len());
-    Ok(&archive[data_start..data_end])
+/// Iterate tar entries until we find a `.pcap` file, then return its
+/// raw body slice. Tar entries are 512-byte-aligned (size rounded up).
+fn find_pcap_in_tar(archive: &[u8]) -> std::io::Result<&[u8]> {
+    let mut offset = 0usize;
+    while offset + 512 <= archive.len() {
+        let header = &archive[offset..offset + 512];
+        // Name is null-terminated ASCII in the first 100 bytes.
+        let raw_name = &header[0..100];
+        let name_end = raw_name.iter().position(|&b| b == 0).unwrap_or(100);
+        let name = std::str::from_utf8(&raw_name[..name_end])
+            .unwrap_or("")
+            .trim_end();
+        let size = parse_tar_size(&header[124..136])? as usize;
+        // Two zero blocks at the end of a tar = end of archive.
+        if name.is_empty() && size == 0 {
+            break;
+        }
+        let body_start = offset + 512;
+        let body_end = (body_start + size).min(archive.len());
+        if name.ends_with(".pcap") {
+            return Ok(&archive[body_start..body_end]);
+        }
+        // Round size up to a multiple of 512 (tar block alignment).
+        let padded = (size + 511) & !511;
+        offset = body_start + padded;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no .pcap entry found in tar archive",
+    ))
 }
 
 /// Parse a 12-byte tar size field. Handles:
@@ -427,5 +457,67 @@ mod tests {
             let s = p.to_string_lossy().replace('\\', "/");
             assert!(s.ends_with(&format!("{variant}/{variant}_2026-09-21-14-35.tar.zst")), "got {s}");
         }
+    }
+
+    /// Build a synthetic tar in memory containing one .pcap entry and
+    /// verify the walker finds it and respects `pos` as a byte offset
+    /// inside the pcap body.
+    #[test]
+    fn find_pcap_in_tar_respects_pos() {
+        let pcap_body: Vec<u8> = (0..200u8).collect();
+        let tar = build_tar_with_one_pcap("inner.pcap", &pcap_body);
+        let found = find_pcap_in_tar(&tar).unwrap();
+        assert_eq!(found, &pcap_body[..]);
+        // Slice from offset 50 should give the last 150 bytes.
+        let sliced = extract_at_pos(&tar, 50).unwrap();
+        assert_eq!(sliced.len(), 150);
+        assert_eq!(sliced[0], pcap_body[50]);
+    }
+
+    /// Build a minimal tar with one named file of the given size, padded
+    /// to the next 512-byte boundary. Format:
+    ///   [name (100 bytes)][mode (8)][uid (8)][gid (8)][size (12)][mtime (12)]
+    ///   [checksum (8)][typeflag (1)][linkname (100)][magic (6)][ver (2)]
+    ///   [uname (32)][gname (32)][devmajor (8)][devminor (8)][prefix (155)]
+    ///   ...padding to 512...
+    ///   [body, padded to 512 multiple]
+    ///   [two zero blocks (end-of-archive marker)]
+    fn build_tar_with_one_pcap(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut tar = Vec::new();
+        let mut header = [b' '; 512];
+        // name (100 bytes)
+        let name_bytes = name.as_bytes();
+        header[..name_bytes.len()].copy_from_slice(name_bytes);
+        // mode "0000644\0"
+        let mode = b"0000644\0";
+        header[100..108].copy_from_slice(mode);
+        // uid "0000000\0"
+        let uid = b"0000000\0";
+        header[108..116].copy_from_slice(uid);
+        // gid "0000000\0"
+        let gid = b"0000000\0";
+        header[116..124].copy_from_slice(gid);
+        // size as 11-byte octal + NUL
+        let size_str = format!("{:011o}\0", body.len());
+        header[124..136].copy_from_slice(size_str.as_bytes());
+        // mtime "00000000000\0"
+        let mtime = b"00000000000\0";
+        header[136..148].copy_from_slice(mtime);
+        // checksum placeholder: 8 spaces (tar checksums use sum of bytes
+        // treating the checksum field as spaces — we don't validate the
+        // checksum so leaving spaces is fine for our walker).
+        header[148..156].copy_from_slice(b"        ");
+        // typeflag: '0' = regular file
+        header[156] = b'0';
+        // ustar magic + version
+        header[257..263].copy_from_slice(b"ustar\0");
+        header[263..265].copy_from_slice(b"00");
+        tar.extend_from_slice(&header);
+        tar.extend_from_slice(body);
+        let pad = (512 - body.len() % 512) % 512;
+        tar.extend(std::iter::repeat(b'\0').take(pad));
+        // End-of-archive: two zero blocks.
+        tar.extend(std::iter::repeat(b'\0').take(1024));
+        tar
     }
 }
