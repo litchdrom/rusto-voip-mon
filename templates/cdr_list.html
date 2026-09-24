@@ -54,6 +54,10 @@
 
 <form method="get" action="/" class="filters" id="cdr-filter-form"
       onsubmit="var b=document.getElementById('apply-btn'); if(b){b.classList.add('loading'); setTimeout(function(){b.disabled=true;},0);}">
+  {# Carry the active TZ into the URL so the filter view is shareable
+     and survives even if the session cookie is dropped. Server precedence
+     still: ?tz_offset_hours=N > session > env default. #}
+  <input type="hidden" name="tz_offset_hours" value="{{ tz_offset_hours }}" id="tz-hidden">
 
   <div class="grid">
     <label><span>From</span><input type="datetime-local" name="from" value="{{ filters.from_str }}"></label>
