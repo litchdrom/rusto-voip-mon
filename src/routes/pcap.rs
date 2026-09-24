@@ -281,16 +281,37 @@ fn compute_path_with(
 /// Read + zstd-decompress an entire tar.zst archive into memory. Tar.zst
 /// archives are minute-bucketed (one type, one minute) so they stay
 /// small; if that ever changes we can switch to seekable-zstd.
+///
+/// Tolerates a trailing `UnexpectedEof`: VoIPmonitor appends to the
+/// `.tar.zst` continuously throughout the minute, so a download
+/// triggered while capture is still active will hit an incomplete
+/// trailing frame. We swallow that error and return whatever frames
+/// decoded cleanly — usually enough to get the call's pcap out.
 fn read_archive(path: &Path) -> std::io::Result<Vec<u8>> {
     let f = std::fs::File::open(path)?;
     let mut dec = zstd::Decoder::new(f)?;
     let mut out = Vec::new();
-    dec.read_to_end(&mut out)?;
-    Ok(out)
+    match dec.read_to_end(&mut out) {
+        Ok(_) => Ok(out),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            tracing::warn!(
+                path = %path.display(),
+                bytes = out.len(),
+                "zstd stream truncated (capture still in progress); returning partial archive"
+            );
+            Ok(out)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Find the file at the given byte offset inside a (decompressed) tar
 /// archive and return its raw body bytes (header + contents excluded).
+///
+/// Tolerant of truncated archives (the tar.zst file may still be being
+/// written when we read it): if the body extends past what we got, we
+/// return whatever's available. The pcap decoder is happy with a
+/// truncated tail — it'll just show the packets that did make it.
 fn extract_at_pos(archive: &[u8], pos: u64) -> std::io::Result<&[u8]> {
     let pos = pos as usize;
     if pos + 512 > archive.len() {
@@ -301,23 +322,13 @@ fn extract_at_pos(archive: &[u8], pos: u64) -> std::io::Result<&[u8]> {
     }
 
     let header = &archive[pos..pos + 512];
-    let size = parse_tar_size(&header[124..136])?;
+    let size = parse_tar_size(&header[124..136])? as usize;
 
     let data_start = pos + 512;
-    let data_end = data_start
-        .checked_add(size as usize)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "size overflow"))?;
-    if data_end > archive.len() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!(
-                "file body ({} bytes at {}) past end of archive ({} bytes)",
-                size,
-                data_start,
-                archive.len()
-            ),
-        ));
-    }
+    // Clamp to whatever bytes are actually available rather than erroring
+    // out — captures in progress are common and we want to return the
+    // packets that did make it through.
+    let data_end = (data_start + size).min(archive.len());
     Ok(&archive[data_start..data_end])
 }
 
