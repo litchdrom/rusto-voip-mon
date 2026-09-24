@@ -204,34 +204,64 @@ async fn fetch_parts(pool: &MySqlPool, cdr_id: u64) -> AppResult<Vec<TarPartRow>
     Ok(out)
 }
 
-/// All casings we know VoIPmonitor has shipped for archive dirs. Tried
-/// in order; the first existing file wins.
-const TYPE_DIR_VARIANTS: &[&str] = &[
-    "sip", "SIP", "rtp", "RTP", "graph", "GRAPH", "other", "OTHER",
-];
-
-/// Compute `{PCAP_DIR}/YYYY-MM-DD/HH/MM/{TYPE}/{TYPE}_YYYY-MM-DD-HH-MM.tar.zst`
-/// and return the first path that exists on disk, falling back across
-/// common casings. VoIPmonitor is inconsistent across versions and even
-/// across archives on the same install (recent logs show `GRAPH/`,
-/// older ones show `graph/`), so we try both.
+/// Resolve `{PCAP_DIR}/YYYY-MM-DD/HH/MM/{TYPE}/{TYPE}_YYYY-MM-DD-HH-MM.tar.zst`
+/// to a real path on disk. VoIPmonitor is wildly inconsistent across
+/// versions — sometimes `GRAPH/graph_*.tar.zst`, sometimes
+/// `graph/graph_*.tar.zst`, sometimes `GRAPH/GRAPH_*.tar.zst`. We do a
+/// case-insensitive scan of the minute dir to find whatever's there.
 fn resolve_archive_path(
     pcap_dir: &Path,
     calldate: NaiveDateTime,
-    _type_: u8,
+    type_: u8,
 ) -> Option<PathBuf> {
-    for variant in TYPE_DIR_VARIANTS {
-        let p = compute_path_with(pcap_dir, calldate, variant);
-        if p.is_file() {
-            return Some(p);
+    // Map numeric type to the canonical lowercase type name.
+    let type_lc = match type_ {
+        0 => "sip",
+        1 => "rtp",
+        2 => "graph",
+        _ => "other",
+    };
+
+    let minute_dir = pcap_dir
+        .join(calldate.format("%Y-%m-%d").to_string())
+        .join(calldate.format("%H").to_string())
+        .join(calldate.format("%M").to_string());
+
+    // Scan immediate subdirs (case-insensitive) for one whose name
+    // matches our type, then look for any *.tar.zst inside it.
+    let entries = std::fs::read_dir(&minute_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name();
+        let Some(dir_name) = dir_name.to_str() else { continue };
+        if dir_name.to_ascii_lowercase() != type_lc {
+            continue;
+        }
+        // Found the type dir (case-corrected). Pick any .tar.zst inside.
+        let inner = std::fs::read_dir(&path).ok()?;
+        for inner_entry in inner.flatten() {
+            let inner_path = inner_entry.path();
+            if inner_path.is_file()
+                && inner_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.to_ascii_lowercase().ends_with(".tar.zst"))
+                    .unwrap_or(false)
+            {
+                return Some(inner_path);
+            }
         }
     }
     None
 }
 
-/// Build the full archive path for a given type-name casing. Caller is
-/// responsible for passing one of the entries in `TYPE_DIR_VARIANTS` for
-/// the matching numeric type (e.g. `"graph"` or `"GRAPH"` for type 2).
+/// Build the full archive path for a given type-name casing. Test-only
+/// helper — production lookups go through `resolve_archive_path` which
+/// scans the disk case-insensitively.
+#[cfg(test)]
 fn compute_path_with(
     pcap_dir: &Path,
     calldate: NaiveDateTime,
