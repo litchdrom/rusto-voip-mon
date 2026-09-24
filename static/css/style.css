@@ -55,6 +55,12 @@ h2 { font-size: 18px; margin: 16px 0 12px; }
   height: 28px;
   width: auto;
   display: block;
+  /* Subtle accent-coloured glow so the logo doesn't get lost against
+     the dark topbar background. drop-shadow (not box-shadow) follows
+     the actual SVG shape so the glow hugs the curves, not a rectangle. */
+  filter:
+    drop-shadow(0 0 4px rgba(74, 158, 255, 0.55))
+    drop-shadow(0 0 10px rgba(74, 158, 255, 0.25));
 }
 .topbar .brand-text { line-height: 1; }
 .topbar .user { color: var(--fg-muted); font-size: 13px; }
