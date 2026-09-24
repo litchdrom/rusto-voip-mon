@@ -163,9 +163,17 @@ pub async fn download_single(
             let bytes: &[u8] = match &src.slice {
                 SliceKind::ByName(name) => {
                     match find_file_in_tar_by_name(&archive, name) {
-                        Some(p) => p,
+                        Some(p) => {
+                            tracing::info!(
+                                path = %src.archive.display(),
+                                target = %name,
+                                bytes = p.len(),
+                                "fbasename matched in archive"
+                            );
+                            p
+                        }
                         None => {
-                            tracing::debug!(
+                            tracing::warn!(
                                 path = %src.archive.display(),
                                 target = %name,
                                 label = %src.label,
@@ -457,17 +465,20 @@ fn resolve_archive_path(
         if dir_name.to_ascii_lowercase() != type_lc {
             continue;
         }
-        // Found the type dir (case-corrected). Pick any .tar.zst inside.
+        // Found the type dir (case-corrected). Pick any .tar.zst or .tar
+        // inside it (SIP/GRAPH uses zstd, RTP uses uncompressed tar on
+        // some installs — read_archive() picks the right decoder).
         let inner = std::fs::read_dir(&path).ok()?;
         for inner_entry in inner.flatten() {
             let inner_path = inner_entry.path();
-            if inner_path.is_file()
-                && inner_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.to_ascii_lowercase().ends_with(".tar.zst"))
-                    .unwrap_or(false)
-            {
+            if !inner_path.is_file() {
+                continue;
+            }
+            let Some(name) = inner_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let lname = name.to_ascii_lowercase();
+            if lname.ends_with(".tar.zst") || lname.ends_with(".tar") {
                 return Some(inner_path);
             }
         }
