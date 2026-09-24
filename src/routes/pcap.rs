@@ -144,98 +144,54 @@ pub async fn download_single(
     let total_sources = sources.len();
     let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
 
+    // Resolve every source into a flat list of chunks up front so the
+    // streaming loop has nothing to do except emit bytes. This avoids
+    // any thread-local / async-state trickery for the "this source has
+    // multiple chunks (RTP #N)" case.
+    let resolver = state.clone();
+    let resolved: Vec<Result<Vec<u8>, AppError>> = {
+        let mut out = Vec::with_capacity(sources.len());
+        for src in &sources {
+            out.push(resolve_source_to_chunks(&resolver, cdr_id, src).await);
+        }
+        out
+    };
+
     tokio::task::spawn_blocking(move || {
         let mut sent_header = false;
-        for src in sources {
-            let archive = match read_archive(&src.archive) {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::error!(
-                        error = ?e,
-                        path = %src.archive.display(),
-                        label = %src.label,
-                        "failed to read pcap archive"
-                    );
-                    let _ = tx.blocking_send(Err(e));
-                    return;
-                }
+        let mut total_chunks = 0usize;
+        for chunk_res in resolved {
+            let chunk = match chunk_res {
+                Ok(c) => c,
+                Err(_) => continue, // already logged inside resolve_source_to_chunks
             };
-            let bytes: &[u8] = match &src.slice {
-                SliceKind::ByName(name) => {
-                    match find_file_in_tar_by_name(&archive, name) {
-                        Some(p) => {
-                            tracing::info!(
-                                path = %src.archive.display(),
-                                target = %name,
-                                bytes = p.len(),
-                                "fbasename matched in archive"
-                            );
-                            p
-                        }
-                        None => {
-                            tracing::warn!(
-                                path = %src.archive.display(),
-                                target = %name,
-                                label = %src.label,
-                                "fbasename not found in this archive; skipping"
-                            );
-                            continue;
-                        }
-                    }
-                }
-                SliceKind::From(_) | SliceKind::Full => {
-                    match find_pcap_in_tar(&archive) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!(
-                                error = ?e,
-                                path = %src.archive.display(),
-                                label = %src.label,
-                                "no .pcap entry in archive (GRAPH-only?)"
-                            );
-                            continue;
-                        }
-                    }
-                }
-            };
-            let bytes: &[u8] = match &src.slice {
-                SliceKind::ByName(_) => bytes,
-                SliceKind::From(pos) => match *pos as usize {
-                    n if n <= bytes.len() => &bytes[n..],
-                    _ => {
-                        tracing::error!(
-                            cdr_id,
-                            pos = *pos,
-                            pcap_len = bytes.len(),
-                            label = %src.label,
-                            "pos past end of inner pcap"
-                        );
-                        continue;
-                    }
-                },
-                SliceKind::Full => bytes,
-            };
-            if bytes.is_empty() {
+            total_chunks += 1;
+            if chunk.is_empty() {
                 continue;
             }
             if sent_header {
                 // Strip the 24-byte global header from every chunk after
                 // the first so the concatenated output is a single valid pcap.
-                if bytes.len() <= PCAP_GLOBAL_HEADER_LEN {
+                if chunk.len() <= PCAP_GLOBAL_HEADER_LEN {
                     continue;
                 }
-                let payload = Bytes::copy_from_slice(&bytes[PCAP_GLOBAL_HEADER_LEN..]);
+                let payload = Bytes::copy_from_slice(&chunk[PCAP_GLOBAL_HEADER_LEN..]);
                 if tx.blocking_send(Ok(payload)).is_err() {
                     return; // client disconnected
                 }
             } else {
-                if tx.blocking_send(Ok(Bytes::copy_from_slice(bytes))).is_err() {
+                if tx.blocking_send(Ok(Bytes::copy_from_slice(&chunk))).is_err() {
                     return;
                 }
                 sent_header = true;
             }
         }
-        tracing::info!(cdr_id, sources = total_sources, "pcap stream complete");
+        tracing::info!(
+            cdr_id,
+            chunks = total_chunks,
+            sources = total_sources,
+            "pcap stream complete"
+        );
     });
 
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -249,6 +205,100 @@ pub async fn download_single(
         )
         .body(body)
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
+/// Resolve one `PcapSource` to one or more byte chunks ready to stream.
+///
+/// For `SliceKind::From`/`Full`, the result is a single chunk (or empty on
+/// error). For `SliceKind::ByName`, the result may be multiple chunks
+/// (RTP captures split across `<fbasename>.pcap#0`, `.pcap#1`, …) — they
+/// all get returned in tar order so the streaming pipeline can concat
+/// them with a single global-header strip after the first chunk.
+async fn resolve_source_to_chunks(
+    _state: &AppState,
+    cdr_id: u64,
+    src: &PcapSource,
+) -> Result<Vec<u8>, AppError> {
+    let archive = match read_archive(&src.archive) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                error = ?e,
+                path = %src.archive.display(),
+                label = %src.label,
+                "failed to read pcap archive"
+            );
+            return Err(AppError::Internal(format!("read archive: {e}")));
+        }
+    };
+    match &src.slice {
+        SliceKind::ByName(name) => {
+            let chunks = find_files_in_tar_by_name(&archive, name);
+            if chunks.is_empty() {
+                tracing::warn!(
+                    path = %src.archive.display(),
+                    target = %name,
+                    label = %src.label,
+                    "fbasename not found in this archive; skipping"
+                );
+                return Ok(Vec::new());
+            }
+            tracing::info!(
+                path = %src.archive.display(),
+                target = %name,
+                chunks = chunks.len(),
+                bytes = chunks.iter().map(|c| c.len()).sum::<usize>(),
+                "fbasename matched in archive"
+            );
+            // Concatenate all chunks for this source into a single buffer;
+            // the streaming loop will strip the 24-byte pcap global header
+            // from every chunk after the first.
+            let total: usize = chunks.iter().map(|c| c.len()).sum();
+            let mut buf = Vec::with_capacity(total);
+            for c in chunks {
+                buf.extend_from_slice(c);
+            }
+            Ok(buf)
+        }
+        SliceKind::From(pos) => {
+            let pcap = match find_pcap_in_tar(&archive) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(
+                        error = ?e,
+                        path = %src.archive.display(),
+                        label = %src.label,
+                        "no .pcap entry in archive (GRAPH-only?)"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
+            let start = *pos as usize;
+            if start > pcap.len() {
+                tracing::error!(
+                    cdr_id,
+                    pos = *pos,
+                    pcap_len = pcap.len(),
+                    label = %src.label,
+                    "pos past end of inner pcap"
+                );
+                return Ok(Vec::new());
+            }
+            Ok(pcap[start..].to_vec())
+        }
+        SliceKind::Full => match find_pcap_in_tar(&archive) {
+            Ok(p) => Ok(p.to_vec()),
+            Err(e) => {
+                tracing::error!(
+                    error = ?e,
+                    path = %src.archive.display(),
+                    label = %src.label,
+                    "no .pcap entry in archive (GRAPH-only?)"
+                );
+                Ok(Vec::new())
+            }
+        },
+    }
 }
 
 /// Build the source list when `cdr_tar_part` has at least one row — use
@@ -540,7 +590,7 @@ fn read_archive(path: &Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// Walk the (decompressed) tar and return the body of the entry whose
+/// Walk the (decompressed) tar and return **all** entry bodies whose
 /// name matches `target_name` (the `cdr_next.fbasename`).
 ///
 /// VoIPmonitor stores pcaps as one file per call, named
@@ -548,19 +598,20 @@ fn read_archive(path: &Path) -> std::io::Result<Vec<u8>> {
 /// RTP captures split across multiple files, e.g.
 /// `WTL_xxx.pcap#0`, `WTL_xxx.pcap#1`, …, `WTL_xxx.pcap#480`. We match:
 ///   - exact `<target_name>` or `<target_name>.pcap`
-///   - prefix `<target_name>.pcap#` (any chunk index — caller can
-///     concat all chunks; for v0.2 we return the first match)
+///   - any name starting with `<target_name>.pcap#` (chunked)
 ///
-/// Returns the body slice of the first match.
-fn find_file_in_tar_by_name<'a>(
+/// Returns bodies in tar order — caller concatenates them, stripping
+/// the 24-byte pcap global header from every chunk after the first.
+fn find_files_in_tar_by_name<'a>(
     archive: &'a [u8],
     target_name: &str,
-) -> Option<&'a [u8]> {
-    let candidates: [String; 3] = [
+) -> Vec<&'a [u8]> {
+    let exact = [
         target_name.to_string(),
         format!("{}.pcap", target_name),
-        format!("{}.pcap#", target_name), // prefix match for chunked files
     ];
+    let chunked_prefix = format!("{}.pcap#", target_name);
+    let mut out = Vec::new();
     let mut offset = 0usize;
     while offset + 512 <= archive.len() {
         let header = &archive[offset..offset + 512];
@@ -579,17 +630,14 @@ fn find_file_in_tar_by_name<'a>(
         let body_start = offset + 512;
         let body_end = (body_start + size).min(archive.len());
 
-        if entry_name == candidates[0]
-            || entry_name == candidates[1]
-            || entry_name.starts_with(&candidates[2])
-        {
-            return Some(&archive[body_start..body_end]);
+        if exact.iter().any(|c| c == entry_name) || entry_name.starts_with(&chunked_prefix) {
+            out.push(&archive[body_start..body_end]);
         }
 
         let padded = (size + 511) & !511;
         offset = body_start + padded;
     }
-    None
+    out
 }
 
 /// Walk the (decompressed) tar and return a slice that points at the
