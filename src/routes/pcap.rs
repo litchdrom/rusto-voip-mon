@@ -158,40 +158,47 @@ pub async fn download_single(
     };
 
     tokio::task::spawn_blocking(move || {
-        let mut sent_header = false;
-        let mut total_chunks = 0usize;
-        for chunk_res in resolved {
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(_) => continue, // already logged inside resolve_source_to_chunks
-            };
-            total_chunks += 1;
-            if chunk.is_empty() {
-                continue;
-            }
-            if sent_header {
-                // Strip the 24-byte global header from every chunk after
-                // the first so the concatenated output is a single valid pcap.
-                if chunk.len() <= PCAP_GLOBAL_HEADER_LEN {
-                    continue;
-                }
-                let payload = Bytes::copy_from_slice(&chunk[PCAP_GLOBAL_HEADER_LEN..]);
-                if tx.blocking_send(Ok(payload)).is_err() {
-                    return; // client disconnected
-                }
-            } else {
-                if tx.blocking_send(Ok(Bytes::copy_from_slice(&chunk))).is_err() {
-                    return;
-                }
-                sent_header = true;
+        // Collect raw pcap blobs (each with its own header if present).
+        // merge_pcaps() picks the first valid header, parses every blob
+        // (stripping per-blob headers when present), and emits packets
+        // sorted by timestamp — same approach as `mergecap -w`.
+        let blobs: Vec<Vec<u8>> = resolved.into_iter().flatten().collect();
+        if blobs.is_empty() {
+            tracing::warn!(cdr_id, "no pcap blobs collected");
+            let _ = tx.blocking_send(Ok(Bytes::new()));
+            return;
+        }
+        // Pick the first valid pcap header. Fall back to a synthetic
+        // Ethernet/Little-Endian header if none of the blobs have one.
+        let mut primary_header: [u8; 24] = {
+            let mut h = [0u8; 24];
+            h[0..4].copy_from_slice(&[0xd4, 0xc3, 0xb2, 0xa1]); // LE magic
+            h[4..6].copy_from_slice(&[2, 4]); // version 2.4
+            h[8..12].copy_from_slice(&0xffff_u32.to_le_bytes()); // snaplen
+            h[20..24].copy_from_slice(&1_u32.to_le_bytes()); // LINKTYPE_ETHERNET
+            h
+        };
+        for blob in &blobs {
+            if blob.len() >= 24 && is_pcap_magic(&blob[..4]) {
+                primary_header.copy_from_slice(&blob[..24]);
+                break;
             }
         }
+
+        let blob_refs: Vec<&[u8]> = blobs.iter().map(|b| b.as_slice()).collect();
+        let merged = merge_pcaps(&primary_header, &blob_refs);
+
         tracing::info!(
             cdr_id,
-            chunks = total_chunks,
+            blobs = blob_refs.len(),
             sources = total_sources,
+            output_bytes = merged.len(),
             "pcap stream complete"
         );
+
+        if tx.blocking_send(Ok(Bytes::from(merged))).is_err() {
+            // client disconnected
+        }
     });
 
     let body = Body::from_stream(ReceiverStream::new(rx));
@@ -735,6 +742,59 @@ fn find_pcap_in_tar(archive: &[u8]) -> std::io::Result<&[u8]> {
     ))
 }
 
+/// Merge multiple pcap blobs into a single pcap by sorting all packets
+/// across the inputs by their timestamp. Equivalent to `mergecap -w`.
+/// Returns the merged bytes (header from `primary_header` + sorted packets).
+///
+/// `primary_header` must be the 24-byte pcap global header from the
+/// first input — we use its link type and snaplen in the output. The
+/// input blobs may each be a full pcap (with header) or just the raw
+/// concatenated packet records (no header); we detect per-blob.
+fn merge_pcaps(primary_header: &[u8; 24], blobs: &[&[u8]]) -> Vec<u8> {
+    // Walk each blob, collect (timestamp, packet_bytes) pairs. Indices
+    // into `records_storage` keep the borrowed slice alive across the
+    // closure so we can sort/ship them out.
+    let mut records_storage: Vec<&[u8]> = Vec::new();
+    let mut packets: Vec<(u64, usize)> = Vec::new();
+    for blob in blobs {
+        let body = if blob.len() >= 24 && is_pcap_magic(&blob[..4]) {
+            &blob[24..] // strip header
+        } else {
+            blob // raw packet records, no header
+        };
+        let mut off = 0usize;
+        while off + 16 <= body.len() {
+            let ts_sec = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as u64;
+            let ts_usec = u32::from_le_bytes(body[off + 4..off + 8].try_into().unwrap()) as u64;
+            let incl_len =
+                u32::from_le_bytes(body[off + 8..off + 12].try_into().unwrap()) as usize;
+            let ts = ts_sec.saturating_mul(1_000_000).saturating_add(ts_usec);
+            let record_len = 16 + incl_len;
+            if body.len() < off + record_len {
+                break;
+            }
+            let idx = records_storage.len();
+            records_storage.push(&body[off..off + record_len]);
+            packets.push((ts, idx));
+            off += record_len;
+        }
+    }
+    // Sort by timestamp ascending (stable so identical ts preserves order).
+    packets.sort_by_key(|(ts, _)| *ts);
+
+    let total: usize = records_storage.iter().map(|r| r.len()).sum();
+    let mut out = Vec::with_capacity(24 + total);
+    out.extend_from_slice(primary_header);
+    for (_, idx) in &packets {
+        out.extend_from_slice(records_storage[*idx]);
+    }
+    out
+}
+
+fn is_pcap_magic(magic: &[u8]) -> bool {
+    magic.len() >= 4 && (magic == b"\xd4\xc3\xb2\xa1" || magic == b"\xa1\xb2\xc3\xd4")
+}
+
 /// Parse a 12-byte tar size field. Handles:
 ///  - octal ASCII (POSIX ustar, null/space padded)
 ///  - GNU base-256 (high bit set on first byte → binary little-endian,
@@ -845,6 +905,58 @@ mod tests {
         let sliced = extract_at_pos(&tar, 50).unwrap();
         assert_eq!(sliced.len(), 150);
         assert_eq!(sliced[0], pcap_body[50]);
+    }
+
+    /// Helper: make a minimal pcap blob with one packet record at the
+    /// given timestamp (in microseconds since epoch) carrying the given
+    /// payload bytes. Used to test merge_pcaps().
+    fn make_pcap_with_packet(ts_us: u64, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        // pcap global header (24 bytes): magic + version 2.4 + thiszone +
+        // sigfigs + snaplen + linktype. Ethernet linktype = 1.
+        out.extend_from_slice(&[0xd4, 0xc3, 0xb2, 0xa1]); // magic
+        out.extend_from_slice(&[2, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // ver + tz + sig
+        out.extend_from_slice(&0xffff_u32.to_le_bytes()); // snaplen
+        out.extend_from_slice(&1_u32.to_le_bytes()); // linktype = Ethernet
+        // Packet record (16 bytes header + payload): ts_sec + ts_usec +
+        // incl_len + orig_len + payload.
+        out.extend_from_slice(&((ts_us / 1_000_000) as u32).to_le_bytes());
+        out.extend_from_slice(&((ts_us % 1_000_000) as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// merge_pcaps should sort packets from multiple blobs by timestamp
+    /// even if they arrive out of order, and should strip per-blob pcap
+    /// headers so a raw-record-only blob is also accepted.
+    #[test]
+    fn merge_pcaps_sorts_by_timestamp() {
+        let pcap_a = make_pcap_with_packet(2_000_000, b"AAA");
+        let pcap_b = make_pcap_with_packet(1_000_000, b"BBB");
+        let pcap_c = make_pcap_with_packet(3_000_000, b"CCC");
+        let header: [u8; 24] = pcap_a[..24].try_into().unwrap();
+        // Pass in reverse order — merge should still sort ascending.
+        let merged = merge_pcaps(&header, &[&pcap_c, &pcap_a, &pcap_b]);
+        assert_eq!(merged.len(), 24 + 3 * 19);
+        // After the 24-byte primary header, packets appear in ts order.
+        // ts_sec=1 (BBB), ts_sec=2 (AAA), ts_sec=3 (CCC).
+        assert_eq!(
+            u32::from_le_bytes(merged[24..28].try_into().unwrap()),
+            1
+        );
+        assert_eq!(&merged[24 + 16..24 + 16 + 3], b"BBB");
+        assert_eq!(
+            u32::from_le_bytes(merged[43..47].try_into().unwrap()),
+            2
+        );
+        assert_eq!(&merged[43 + 16..43 + 16 + 3], b"AAA");
+        assert_eq!(
+            u32::from_le_bytes(merged[62..66].try_into().unwrap()),
+            3
+        );
+        assert_eq!(&merged[62 + 16..62 + 16 + 3], b"CCC");
     }
 
     /// Build a minimal tar with one named file of the given size, padded
