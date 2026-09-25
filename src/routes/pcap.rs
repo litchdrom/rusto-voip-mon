@@ -95,6 +95,35 @@ pub async fn download_single(
         return Err(AppError::Forbidden);
     }
 
+    let pcap_bytes = build_pcap_bytes(&state, cdr_id).await?;
+
+    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        if tx.send(Ok(Bytes::from(pcap_bytes))).await.is_err() {
+            // client disconnected
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(rx));
+    let filename = format!("cdr-{cdr_id}.pcap");
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.tcpdump.pcap")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(body)
+        .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
+/// Per-CDR pcap reconstruction. Used by both `download_single` and
+/// `download_batch` so the byte format stays identical across endpoints.
+///
+/// Returns the full merged pcap bytes (header + every packet from SIP
+/// and RTP sources for the call, sorted by timestamp). The caller decides
+/// how to ship those bytes back to the client.
+async fn build_pcap_bytes(state: &AppState, cdr_id: u64) -> AppResult<Vec<u8>> {
     let parts = crate::error::with_query_timeout(
         state.config.query_timeout_secs,
         fetch_parts(&state.pool, cdr_id),
@@ -135,19 +164,14 @@ pub async fn download_single(
     };
 
     if sources.is_empty() {
-        return Ok((
-            StatusCode::NOT_FOUND,
-            "no pcap archives found for this CDR",
-        )
-            .into_response());
+        return Err(AppError::NotFound);
     }
 
     let total_sources = sources.len();
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(8);
 
     // Resolve every source into a flat list of chunks up front so the
-    // streaming loop has nothing to do except emit bytes. This avoids
-    // any thread-local / async-state trickery for the "this source has
+    // merge step has nothing to do except emit bytes. This avoids any
+    // thread-local / async-state trickery for the "this source has
     // multiple chunks (RTP #N)" case.
     let resolver = state.clone();
     let resolved: Vec<Result<Vec<u8>, AppError>> = {
@@ -158,6 +182,10 @@ pub async fn download_single(
         out
     };
 
+    // The merge + LZO-decompress path is sync + CPU-bound, so it lives
+    // on a blocking worker. The async side just feeds it pre-resolved
+    // tar chunks and a return channel.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
     tokio::task::spawn_blocking(move || {
         // Collect raw pcap blobs (each with its own header if present).
         // merge_pcaps() picks the first valid header, parses every blob
@@ -166,7 +194,7 @@ pub async fn download_single(
         let blobs: Vec<Vec<u8>> = resolved.into_iter().flatten().collect();
         if blobs.is_empty() {
             tracing::warn!(cdr_id, "no pcap blobs collected");
-            let _ = tx.blocking_send(Ok(Bytes::new()));
+            let _ = tx.send(Vec::new());
             return;
         }
         // Some VoIPmonitor archives store RTP chunks as LZO-compressed
@@ -225,25 +253,19 @@ pub async fn download_single(
             blobs = blob_refs.len(),
             sources = total_sources,
             output_bytes = merged.len(),
-            "pcap stream complete"
+            "pcap build complete"
         );
 
-        if tx.blocking_send(Ok(Bytes::from(merged))).is_err() {
-            // client disconnected
-        }
+        let _ = tx.send(merged);
     });
 
-    let body = Body::from_stream(ReceiverStream::new(rx));
-    let filename = format!("cdr-{cdr_id}.pcap");
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/vnd.tcpdump.pcap")
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{filename}\""),
-        )
-        .body(body)
-        .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+    let merged = rx.await.map_err(|_| {
+        AppError::Internal("pcap builder thread dropped before sending result".into())
+    })?;
+    if merged.is_empty() {
+        return Err(AppError::NotFound);
+    }
+    Ok(merged)
 }
 
 /// Resolve one `PcapSource` to one or more byte chunks ready to stream.
@@ -530,18 +552,168 @@ fn build_sources_from_fbasename(
     out
 }
 
-/// Batch download — left as a 501 for v0.2.1 (requires async-zip +
-/// streamed-zip-from-mpsc glue, which is fiddly in axum 0.7). The
-/// single-CDR download covers the 99% case.
+/// Maximum number of CDRs accepted in a single batch download. Keeps the
+/// in-memory zip bounded and avoids pathological client requests that
+/// would consume worker threads for minutes.
+const BATCH_MAX: usize = 100;
+
+/// Request body for `POST /pcap/batch`. A plain JSON object with one
+/// field — the caller decides which IDs (filter-driven, manual paste,
+/// checkbox selection, …).
+#[derive(serde::Deserialize)]
+pub struct BatchPcapRequest {
+    pub ids: Vec<u64>,
+}
+
+/// Batch download — produce a zip of N pcaps, one entry per CDR.
+///
+/// The flow:
+///   1. Validate `ids` (dedupe, drop zero, cap at `BATCH_MAX`).
+///   2. Spawn one async task per CDR. Each calls `build_pcap_bytes` and
+///      pushes `(cdr_id, Vec<u8>)` into a tokio mpsc.
+///   3. A `spawn_blocking` task pulls from that mpsc and writes a zip
+///      into a `Vec<u8>`. We use the sync `zip` crate inside the blocking
+///      worker because its std I/O API plays well with `tokio::sync::mpsc`'s
+///      `blocking_recv()`; async-zip's duplex-stream wiring is more code
+///      for no real win at this batch size.
+///   4. Once the zip is finalised, the buffer goes into the response body
+///      via another mpsc. Failures inside one CDR are logged and the
+///      entry is skipped — a single bad CDR doesn't fail the whole batch.
 pub async fn download_batch(
-    State(_state): State<AppState>,
-    _user: SessionUser,
+    State(state): State<AppState>,
+    user: SessionUser,
+    axum::Json(req): axum::Json<BatchPcapRequest>,
 ) -> AppResult<Response> {
-    Ok((
-        StatusCode::NOT_IMPLEMENTED,
-        "batch PCAP download not yet implemented (v0.2.1); use /pcap/:id per CDR",
-    )
-        .into_response())
+    if !user.can_pcap {
+        return Err(AppError::Forbidden);
+    }
+
+    // Dedupe + drop zero + cap. Preserves the caller's order so the zip
+    // entries are deterministic for a given selection.
+    let mut seen = std::collections::HashSet::with_capacity(req.ids.len());
+    let mut cdr_ids: Vec<u64> = Vec::with_capacity(req.ids.len());
+    for id in req.ids {
+        if id > 0 && seen.insert(id) {
+            cdr_ids.push(id);
+        }
+    }
+    if cdr_ids.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "no valid CDR IDs in request",
+        )
+            .into_response());
+    }
+    if cdr_ids.len() > BATCH_MAX {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "batch too large: {} IDs (max {BATCH_MAX})",
+                cdr_ids.len()
+            ),
+        )
+            .into_response());
+    }
+
+    let total = cdr_ids.len();
+    tracing::info!(count = total, "batch pcap download requested");
+
+    // Async pipeline: each CDR builds its bytes concurrently.
+    let (pcap_tx, mut pcap_rx) =
+        mpsc::channel::<(u64, AppResult<Vec<u8>>)>(total.max(1));
+    for cdr_id in cdr_ids {
+        let state = state.clone();
+        let pcap_tx = pcap_tx.clone();
+        tokio::spawn(async move {
+            let result = build_pcap_bytes(&state, cdr_id).await;
+            // Receiver is dropped below; if it's gone, the client
+            // disconnected — that's fine.
+            let _ = pcap_tx.send((cdr_id, result)).await;
+        });
+    }
+    drop(pcap_tx);
+
+    // Blocking pipeline: zip writer consumes pcaps and emits bytes.
+    let (body_tx, body_rx) =
+        mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut written = 0usize;
+        let mut failed = 0usize;
+        // We build the zip inside a small helper so the inner Cursor
+        // (which mutably borrows `buf`) is fully dropped before we
+        // move `buf` into Bytes.
+        let zip_result: Result<(), zip::result::ZipError> = (|| {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip = zip::ZipWriter::new(cursor);
+            // Deflate level 1 — pcap frames compress ~40% at level 1 and
+            // we don't care about zip latency since the client is already
+            // paying per-CDR pcap-build time.
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated)
+                .compression_level(Some(1));
+
+            while let Some((cdr_id, result)) = pcap_rx.blocking_recv() {
+                match result {
+                    Ok(pcap_bytes) => {
+                        let name = format!("cdr-{cdr_id}.pcap");
+                        if let Err(e) = zip.start_file(&name, options) {
+                            tracing::error!(
+                                cdr_id, error = %e, "batch zip: start_file failed"
+                            );
+                            failed += 1;
+                            continue;
+                        }
+                        if let Err(e) = zip.write_all(&pcap_bytes) {
+                            tracing::error!(
+                                cdr_id, error = %e, "batch zip: write_all failed"
+                            );
+                            failed += 1;
+                            continue;
+                        }
+                        written += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            cdr_id, error = %e, "batch zip: skipping CDR"
+                        );
+                        failed += 1;
+                    }
+                }
+            }
+            zip.finish().map(|_| ())
+        })();
+
+        match zip_result {
+            Ok(()) => {
+                tracing::info!(
+                    requested = total,
+                    written,
+                    failed,
+                    bytes = buf.len(),
+                    "batch pcap zip complete"
+                );
+                let _ = body_tx.blocking_send(Ok(Bytes::from(buf)));
+            }
+            Err(e) => {
+                let msg = format!("zip finish failed: {e}");
+                tracing::error!(error = %e, "batch zip finish failed");
+                let _ = body_tx.blocking_send(Err(std::io::Error::other(msg)));
+            }
+        }
+    });
+
+    let body = Body::from_stream(ReceiverStream::new(body_rx));
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"pcaps.zip\"",
+        )
+        .body(body)
+        .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
 }
 
 async fn fetch_parts(pool: &MySqlPool, cdr_id: u64) -> AppResult<Vec<TarPartRow>> {

@@ -49,6 +49,10 @@
   <h1>Call Detail Records <span class="muted day-label">— {{ day_label }}</span></h1>
   <div class="actions">
     <a class="button" href="{{ export_url }}">Export CSV</a>
+    <button type="button" id="batch-pcap-btn" class="button" disabled
+            title="Select rows below, then click to download a single zip of pcaps.">
+      Download zip of selected
+    </button>
   </div>
 </section>
 
@@ -180,6 +184,10 @@
 <table class="cdrs">
   <thead>
     <tr>
+      <th class="select-col">
+        <input type="checkbox" id="cdr-select-all" title="Select all rows on this page"
+               onclick="toggleSelectAll(this); updateBatchBtn();">
+      </th>
       <th>calldate</th>
       <th>caller</th>
       <th>called</th>
@@ -196,6 +204,10 @@
   <tbody>
     {% for c in cdrs %}
     <tr>
+      <td class="select-col">
+        <input type="checkbox" class="cdr-select" name="cdr_id" value="{{ c.id }}"
+               onclick="updateBatchBtn();" title="Select CDR {{ c.id }} for batch download">
+      </td>
       <td>{{ c.calldate.format("%Y-%m-%d %H:%M:%S") }}</td>
       <td>{{ c.caller.as_deref().unwrap_or("") }}</td>
       <td>{{ c.called.as_deref().unwrap_or("") }}</td>
@@ -250,5 +262,62 @@ function resetAllFilters() {
   // Reset the multi-select summary chips back to "any".
   form.querySelectorAll('.ms-count').forEach(el => { el.textContent = 'any'; });
 }
+
+// --- Batch PCAP download (POST /pcap/batch) ---
+
+function toggleSelectAll(master) {
+  document.querySelectorAll('input.cdr-select').forEach(cb => { cb.checked = master.checked; });
+}
+
+function updateBatchBtn() {
+  const btn = document.getElementById('batch-pcap-btn');
+  if (!btn) return;
+  const n = document.querySelectorAll('input.cdr-select:checked').length;
+  btn.disabled = n === 0;
+  btn.textContent = n === 0
+    ? 'Download zip of selected'
+    : 'Download zip of selected (' + n + ')';
+}
+
+async function downloadBatchZip() {
+  const ids = Array.from(document.querySelectorAll('input.cdr-select:checked'))
+    .map(el => parseInt(el.value, 10))
+    .filter(n => Number.isFinite(n) && n > 0);
+  if (ids.length === 0) return;
+  const btn = document.getElementById('batch-pcap-btn');
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Building zip…';
+  try {
+    const resp = await fetch('/pcap/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: ids })
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      alert('Batch download failed (' + resp.status + '): ' + body);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'pcaps.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Batch download error: ' + e);
+  } finally {
+    btn.textContent = original;
+    updateBatchBtn();
+  }
+}
+
+// Wire the batch button + per-row checkboxes on load.
+document.getElementById('batch-pcap-btn')?.addEventListener('click', downloadBatchZip);
+updateBatchBtn();
 </script>
 {% endblock %}

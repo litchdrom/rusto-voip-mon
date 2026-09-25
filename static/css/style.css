@@ -108,6 +108,7 @@ h2 { font-size: 18px; margin: 16px 0 12px; }
   font: inherit;
 }
 .button:hover { background: var(--accent-hover); }
+.button:disabled { background: var(--bg-elev-2); color: var(--muted); cursor: not-allowed; }
 
 .filters {
   background: var(--bg-elev);
@@ -165,6 +166,19 @@ table.cdrs th {
 }
 table.cdrs tr:last-child td { border-bottom: none; }
 table.cdrs tr:hover { background: var(--bg-elev-2); }
+
+/* Selection column for batch-PCAP download. Kept narrow so the data
+   columns stay readable; the master checkbox in the header mirrors each
+   row's selection state via JS. */
+table.cdrs th.select-col,
+table.cdrs td.select-col {
+  width: 28px;
+  padding: 8px 6px;
+  text-align: center;
+}
+table.cdrs input[type="checkbox"] {
+  cursor: pointer;
+}
 
 .error {
   background: rgba(255, 84, 112, 0.1);
