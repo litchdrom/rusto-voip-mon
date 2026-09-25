@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="static/img/logo.svg" alt="rusto-voip-mon logo" width="240">
+  <img src="static/img/logo.svg" alt="rusto-voip-mon logo" width="240"
+       style="filter: drop-shadow(2px 1px 0 rgba(74, 158, 255, 0.45)) drop-shadow(0 0 4px rgba(74, 158, 255, 0.55)) drop-shadow(-2px -2px 12px rgba(74, 158, 255, 0.25)); transition: filter 0.15s ease-out;"
+       onmouseover="this.style.filter='drop-shadow(2px 1px 0 rgba(74, 158, 255, 0.55)) drop-shadow(0 0 6px rgba(74, 158, 255, 0.70)) drop-shadow(-3px -3px 16px rgba(74, 158, 255, 0.35))';"
+       onmouseout="this.style.filter='drop-shadow(2px 1px 0 rgba(74, 158, 255, 0.45)) drop-shadow(0 0 4px rgba(74, 158, 255, 0.55)) drop-shadow(-2px -2px 12px rgba(74, 158, 255, 0.25))';">
 </p>
 
 # rusto-voip-mon

@@ -89,8 +89,26 @@ impl From<CdrRow> for CdrSummary {
 pub struct CdrFilters {
     pub from: Option<NaiveDateTime>,
     pub to: Option<NaiveDateTime>,
+    /// Substring match on `caller`. Kept for fuzzy "show me anything
+    /// containing this digit sequence" queries; use `caller_in` for
+    /// exact multi-value lookups.
     pub caller: Option<String>,
+    /// Substring match on `called`. Same note as `caller`.
     pub called: Option<String>,
+    /// Exact-match caller list. Use this for `OR`-over-many-values
+    /// queries — the SQL is `caller IN (?, ?, ?)` rather than a
+    /// chain of `LIKE`s, which is dramatically cheaper and lets the
+    /// planner use indexes. Populated from repeated `caller_in=...`
+    /// query keys.
+    #[serde(default)]
+    pub caller_in: Vec<String>,
+    /// Exact-match called list. Same idea as `caller_in`. Populated
+    /// from repeated `called_in=...` query keys; the values are parsed
+    /// as `u64` so `?called_in=1234567` matches the digit sequence
+    /// stored in `cdr.called` (VoIPmonitor stores phone numbers as
+    /// digit strings, not numeric types).
+    #[serde(default)]
+    pub called_in: Vec<u64>,
     /// Caller-side IPs (matches `sipcallerip`). Comma-separated in the form.
     pub src_ip: Option<String>,
     /// Callee-side IPs (matches `sipcalledip`). Comma-separated in the form.
@@ -131,6 +149,8 @@ impl CdrFilters {
             to,
             caller: self.caller.clone(),
             called: self.called.clone(),
+            caller_in: self.caller_in.clone(),
+            called_in: self.called_in.clone(),
             src_ips: parse_ip_list(self.src_ip.as_deref()),
             dst_ips: parse_ip_list(self.dst_ip.as_deref()),
             sip_codes: parse_u16_list(self.sip_code.as_deref()),
@@ -209,12 +229,100 @@ mod tz_tests {
     }
 }
 
+#[cfg(test)]
+mod in_clause_tests {
+    use super::*;
+
+    fn f(caller_in: Vec<String>, called_in: Vec<u64>) -> NormalizedFilters {
+        NormalizedFilters {
+            from: None,
+            to: None,
+            caller: None,
+            called: None,
+            caller_in,
+            called_in,
+            src_ips: vec![],
+            dst_ips: vec![],
+            sip_codes: vec![],
+            sensor_ids: vec![],
+            mos_min_mult10: None,
+            mos_max_mult10: None,
+            min_duration: None,
+            max_duration: None,
+            page: 1,
+            page_size: 50,
+        }
+    }
+
+    #[test]
+    fn caller_in_emits_in_clause_with_one_bind_per_value() {
+        let (sql, binds) = f(
+            vec!["alice".into(), "bob".into(), "carol".into()],
+            vec![],
+        )
+        .to_where();
+        assert_eq!(sql, "WHERE caller IN (?,?,?)");
+        let got: Vec<String> = binds
+            .into_iter()
+            .map(|b| match b {
+                FilterBind::Str(s) => s,
+                _ => panic!("expected Str bind for caller_in"),
+            })
+            .collect();
+        assert_eq!(got, vec!["alice", "bob", "carol"]);
+    }
+
+    #[test]
+    fn called_in_emits_in_clause_with_stringified_u64s() {
+        let (sql, binds) = f(
+            vec![],
+            vec![491234567, 491234568],
+        )
+        .to_where();
+        assert_eq!(sql, "WHERE called IN (?,?)");
+        let got: Vec<String> = binds
+            .into_iter()
+            .map(|b| match b {
+                FilterBind::Str(s) => s,
+                _ => panic!("expected Str bind (column is VARCHAR) for called_in"),
+            })
+            .collect();
+        assert_eq!(got, vec!["491234567", "491234568"]);
+    }
+
+    #[test]
+    fn empty_in_lists_add_no_clause() {
+        let (sql, binds) = f(vec![], vec![]).to_where();
+        assert_eq!(sql, "");
+        assert!(binds.is_empty());
+    }
+
+    #[test]
+    fn caller_substring_and_in_list_are_anded() {
+        let mut f = f(vec!["alice".into(), "bob".into()], vec![]);
+        f.caller = Some("a".into());
+        let (sql, _) = f.to_where();
+        // Substring LIKE first, then IN, joined with AND. Order matters
+        // because callers may write tools that grep on the SQL string —
+        // keep the existing LIKE clause position.
+        assert_eq!(sql, "WHERE caller LIKE ? AND caller IN (?,?)");
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NormalizedFilters {
     pub from: Option<NaiveDateTime>,
     pub to: Option<NaiveDateTime>,
     pub caller: Option<String>,
     pub called: Option<String>,
+    /// Exact-match caller list. Emits `caller IN (?, ?, ?)` in `to_where()`.
+    pub caller_in: Vec<String>,
+    /// Exact-match called list. Emits `called IN (?, ?, ?)`. Values are
+    /// `u64` because VoIPmonitor stores phone numbers as digit strings —
+    /// parsing on the way in validates that the caller meant a number
+    /// (not, say, a SIP URI) and lets us dedupe cheaply. We stringify
+    /// on bind because the column type is VARCHAR.
+    pub called_in: Vec<u64>,
     pub src_ips: Vec<u32>,
     pub dst_ips: Vec<u32>,
     pub sip_codes: Vec<u16>,
@@ -252,6 +360,24 @@ impl NormalizedFilters {
         if let Some(c) = &self.called {
             parts.push("called LIKE ?".into());
             binds.push(FilterBind::Str(format!("%{c}%")));
+        }
+        if !self.caller_in.is_empty() {
+            parts.push(format!(
+                "caller IN ({})",
+                placeholders(self.caller_in.len())
+            ));
+            for v in &self.caller_in {
+                binds.push(FilterBind::Str(v.clone()));
+            }
+        }
+        if !self.called_in.is_empty() {
+            parts.push(format!(
+                "called IN ({})",
+                placeholders(self.called_in.len())
+            ));
+            for v in &self.called_in {
+                binds.push(FilterBind::Str(v.to_string()));
+            }
         }
         if !self.src_ips.is_empty() {
             parts.push(format!(

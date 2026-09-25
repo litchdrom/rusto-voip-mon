@@ -684,6 +684,12 @@ pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilter
         to: parse_dt(&q.to),
         caller: q.caller.clone().filter(|s| !s.is_empty()),
         called: q.called.clone().filter(|s| !s.is_empty()),
+        // `caller_in` / `called_in` are the multi-value exact-match fields.
+        // Repeated keys (`?caller_in=A&caller_in=B`) AND a comma-joined
+        // single key (`?caller_in=A,B`) both work — the SQL is a single
+        // `caller IN (?, ?, ?)` rather than a chain of `LIKE OR LIKE`.
+        caller_in: merge_str_list(params.all("caller_in")),
+        called_in: merge_u64_list(params.all("called_in")),
         // Merge repeated-key values + comma-separated values for each
         // multi-value field into a single canonical comma-joined string.
         src_ip: merge_csv(params.all("src_ip")).filter(|s| !s.is_empty()),
@@ -771,10 +777,19 @@ pub(crate) struct SingleParams {
 /// Take repeated query values (from checkboxes) and split each one on
 /// commas (from a text input). Return a single deduped, comma-joined string.
 fn merge_csv(values: Option<&[String]>) -> Option<String> {
-    let vals = values?;
-    if vals.is_empty() {
-        return None;
+    let parts = merge_str_list(values);
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(","))
     }
+}
+
+/// Take repeated query values (from repeated keys like `?caller_in=A&caller_in=B`)
+/// or comma-separated single keys (`?caller_in=A,B`), split, trim, dedupe.
+/// Returns the cleaned list (empty when no valid values).
+pub(crate) fn merge_str_list(values: Option<&[String]>) -> Vec<String> {
+    let Some(vals) = values else { return Vec::new() };
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for v in vals {
@@ -788,11 +803,17 @@ fn merge_csv(values: Option<&[String]>) -> Option<String> {
             }
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out.join(","))
-    }
+    out
+}
+
+/// Like `merge_str_list` but parses each value as `u64`. Non-numeric
+/// entries are silently dropped — the URL contract is "list of numbers",
+/// so `?called_in=abc` shouldn't blow up; it just contributes nothing.
+pub(crate) fn merge_u64_list(values: Option<&[String]>) -> Vec<u64> {
+    merge_str_list(values)
+        .into_iter()
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect()
 }
 
 /// Parse an optional form field. Empty / whitespace → None.

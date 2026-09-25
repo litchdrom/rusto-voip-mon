@@ -169,7 +169,9 @@ defaults give "today's CDRs, page 1, 50 per page".
 |---|---|---|
 | `from` | `YYYY-MM-DDTHH:MM` | local time (uses `APP_TZ_OFFSET_HOURS` or session TZ) |
 | `to` | same | exclusive |
-| `caller`, `called` | substring | case-insensitive `LIKE %…%` |
+| `caller`, `called` | substring | case-insensitive `LIKE %…%` (fuzzy; cheap on small filters, expensive on large) |
+| `caller_in` | exact (string) | repeated keys OR comma-separated — emits `caller IN (?, ?, ?)` (exact, index-friendly) |
+| `called_in` | exact (u64) | repeated keys OR comma-separated — parsed as `u64`, stringified on bind — emits `called IN (?, ?, ?)` |
 | `src_ip`, `dst_ip` | CSV | repeated keys OR comma-separated |
 | `sip_code` | CSV | e.g. `486,487,503` |
 | `mos_min`, `mos_max` | `0.0 .. 5.0` | |
@@ -183,6 +185,22 @@ defaults give "today's CDRs, page 1, 50 per page".
 # Today's failed calls (4xx/5xx) with bad MOS
 curl -fsS -b cookies.txt "$HOST/?from=2026-09-25T00:00&to=2026-09-25T23:59&sip_code=4,sip_code=5&mos_max=3.0" \
   | head -c 2000
+```
+
+Multi-value exact-match: when you know the specific caller/called
+numbers, prefer `caller_in` / `called_in` over the substring `caller`
+/ `called` fields. Repeated keys and a single comma-joined key both
+work; the SQL is a single `IN (…)` clause instead of a chain of
+`LIKE OR LIKE` — much cheaper on large tables.
+
+```bash
+# Find all calls from 3 specific callers to 2 specific callees
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "$HOST/?caller_in=alice&caller_in=bob&caller_in=carol&called_in=491234567&called_in=491234568"
+
+# Same, comma-separated form
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "$HOST/?caller_in=alice,bob,carol&called_in=491234567,491234568"
 ```
 
 The same query string also powers the CSV export, the new "all matching"
