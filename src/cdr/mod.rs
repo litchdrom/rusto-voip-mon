@@ -439,6 +439,70 @@ pub fn list_stream(
     ReceiverStream::new(rx)
 }
 
+/// Resolve a filter to just the matching CDR IDs, capped at `limit`.
+/// Cheaper than `list_stream` for the batch-pcap endpoint: we only need
+/// the IDs (the per-CDR work then runs in parallel from
+/// `build_pcap_bytes`). Sorted newest-first to match the on-page order
+/// so the resulting zip reads naturally.
+pub async fn list_ids_matching(
+    pool: &MySqlPool,
+    f: &NormalizedFilters,
+    limit: usize,
+) -> Result<Vec<u64>, sqlx::Error> {
+    let (where_sql, binds) = f.to_where();
+    let sql = format!(
+        "SELECT ID FROM cdr {where_sql} \
+         ORDER BY calldate DESC, ID DESC \
+         LIMIT ?"
+    );
+    let mut q = sqlx::query_scalar::<_, u64>(&sql);
+    for b in &binds {
+        q = match b {
+            FilterBind::DateTime(d) => q.bind(d),
+            FilterBind::Str(s) => q.bind(s),
+            FilterBind::U32(v) => q.bind(*v),
+            FilterBind::U16(v) => q.bind(*v),
+        };
+    }
+    q = q.bind(limit as i64);
+    q.fetch_all(pool).await
+}
+
+// Re-exports the per-request helper types from `routes::cdr` so other
+// modules can build a `NormalizedFilters` from a raw query string without
+// reaching across the route layer. We can't move them into `cdr::mod`
+// cleanly (they depend on askama view types) so we just re-export.
+
+/// Resolve a raw URL-encoded CDR-list query string to the matching IDs.
+/// Used by `/pcap/batch` when the caller sends `{"filter": "..."}` so
+/// the "Download all matching pcaps" button on the list page can ship
+/// the same query string the CSV button would.
+pub async fn ids_for_query_string(
+    pool: &MySqlPool,
+    raw_query: &str,
+    tz: chrono::FixedOffset,
+    limit: usize,
+) -> Result<Vec<u64>, crate::error::AppError> {
+    let params = crate::routes::cdr::parse_query_params(raw_query);
+    let q = crate::routes::cdr::SingleParams {
+        from: params.first("from"),
+        to: params.first("to"),
+        caller: params.first("caller"),
+        called: params.first("called"),
+        mos_min: params.first("mos_min"),
+        mos_max: params.first("mos_max"),
+        duration_min: params.first("duration_min"),
+        duration_max: params.first("duration_max"),
+        page: params.first("page"),
+        page_size: params.first("page_size"),
+    };
+    let filters = crate::routes::cdr::build_filters(&q, &params);
+    let normalized = filters.normalized(tz);
+    crate::error::with_query_timeout(0, list_ids_matching(pool, &normalized, limit))
+        .await
+        .map_err(crate::error::AppError::from)
+}
+
 /// `cdr_next` — 1:1 extension to `cdr` that holds per-call derived state.
 ///
 /// Static, known columns:

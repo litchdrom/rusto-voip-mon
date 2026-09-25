@@ -51,10 +51,22 @@
     <a class="button" href="{{ export_url }}">Export CSV</a>
     <button type="button" id="batch-pcap-btn" class="button" disabled
             title="Select rows below, then click to download a single zip of pcaps.">
-      Download zip of selected
+      Download zip of selected ({{ selected_count }})
     </button>
+    <button type="button" id="batch-pcap-all-btn" class="button"
+            title="Bundle every CDR matching the current filter into one zip — no need to tick rows.">
+      Download zip of all matching
+    </button>
+    <button type="button" id="batch-pcap-clear" class="link-btn"
+            title="Forget all ticked rows" hidden>Clear selection</button>
   </div>
 </section>
+
+{# Persist the operator's cross-page selection state to JS so the
+   checkbox toggles stay in sync with what the session cookie already
+   knows about rows from other pages. Capped at 100 by the server; the
+   button label always reflects the live JS Set so we don't lie. #}
+<script id="selected-cdr-ids" type="application/json">{{ selected_cdr_ids|json }}</script>
 
 <form method="get" action="/" class="filters" id="cdr-filter-form"
       onsubmit="var b=document.getElementById('apply-btn'); if(b){b.classList.add('loading'); setTimeout(function(){b.disabled=true;},0);}">
@@ -185,8 +197,7 @@
   <thead>
     <tr>
       <th class="select-col">
-        <input type="checkbox" id="cdr-select-all" title="Select all rows on this page"
-               onclick="toggleSelectAll(this); updateBatchBtn();">
+        <input type="checkbox" id="cdr-select-all" title="Select all rows on this page">
       </th>
       <th>calldate</th>
       <th>caller</th>
@@ -205,8 +216,13 @@
     {% for c in cdrs %}
     <tr>
       <td class="select-col">
+        {% if selected_flags[loop.index0] %}
+        <input type="checkbox" class="cdr-select" name="cdr_id" value="{{ c.id }}" checked
+               title="Select CDR {{ c.id }} for batch download">
+        {% else %}
         <input type="checkbox" class="cdr-select" name="cdr_id" value="{{ c.id }}"
-               onclick="updateBatchBtn();" title="Select CDR {{ c.id }} for batch download">
+               title="Select CDR {{ c.id }} for batch download">
+        {% endif %}
       </td>
       <td>{{ c.calldate.format("%Y-%m-%d %H:%M:%S") }}</td>
       <td>{{ c.caller.as_deref().unwrap_or("") }}</td>
@@ -264,27 +280,170 @@ function resetAllFilters() {
 }
 
 // --- Batch PCAP download (POST /pcap/batch) ---
+//
+// Selection model:
+//   * Server is the source of truth — every checkbox toggle POSTs the
+//     full current selection to /cdr/select, which updates the signed
+//     session cookie (capped at 100).
+//   * Client keeps an in-memory Set mirroring the cookie so the button
+//     label updates immediately, and to compute the next server-side
+//     state when the user toggles a box.
+//   * Page navigation re-reads `selected_cdr_ids` from the template
+//     (server-rendered from the cookie) so the boxes pre-check
+//     themselves — the JS only needs to initialize from that array.
+
+// Initial state from the server (rendered into a <script type=application/json>
+// tag at the top of the page so the rest of the page's CSS classes don't
+// interfere and we don't have to escape anything).
+const selectedIds = new Set((function () {
+  const tag = document.getElementById('selected-cdr-ids');
+  if (!tag) return [];
+  try {
+    const arr = JSON.parse(tag.textContent);
+    return Array.isArray(arr) ? arr : [];
+  } catch (e) {
+    return [];
+  }
+})());
+
+let persistTimer = null;
+function schedulePersist() {
+  if (persistTimer) clearTimeout(persistTimer);
+  persistTimer = setTimeout(persistSelection, 400);
+}
+
+async function persistSelection() {
+  persistTimer = null;
+  try {
+    const resp = await fetch('/cdr/select', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: Array.from(selectedIds) })
+    });
+    if (!resp.ok && resp.status !== 204) {
+      console.warn('cdr/select persist failed', resp.status);
+    }
+  } catch (e) {
+    console.warn('cdr/select persist error', e);
+  }
+}
+
+function onCdrToggle(cb, cdrId) {
+  if (cb.checked) selectedIds.add(cdrId);
+  else selectedIds.delete(cdrId);
+  // Mirror the master checkbox: if every visible row is checked, master
+  // is checked; if none are, it's unchecked; otherwise indeterminate.
+  updateMasterCheckbox();
+  updateBatchBtn();
+  schedulePersist();
+}
 
 function toggleSelectAll(master) {
-  document.querySelectorAll('input.cdr-select').forEach(cb => { cb.checked = master.checked; });
+  document.querySelectorAll('input.cdr-select').forEach(cb => {
+    cb.checked = master.checked;
+    const id = parseInt(cb.value, 10);
+    if (!Number.isFinite(id)) return;
+    if (master.checked) selectedIds.add(id);
+    else selectedIds.delete(id);
+  });
+  updateBatchBtn();
+  schedulePersist();
+}
+
+function updateMasterCheckbox() {
+  const master = document.getElementById('cdr-select-all');
+  if (!master) return;
+  const cbs = document.querySelectorAll('input.cdr-select');
+  if (cbs.length === 0) {
+    master.checked = false;
+    master.indeterminate = false;
+    return;
+  }
+  let all = true, none = true;
+  cbs.forEach(cb => {
+    if (cb.checked) none = false; else all = false;
+  });
+  master.checked = all;
+  master.indeterminate = !all && !none;
 }
 
 function updateBatchBtn() {
   const btn = document.getElementById('batch-pcap-btn');
+  const clearBtn = document.getElementById('batch-pcap-clear');
   if (!btn) return;
-  const n = document.querySelectorAll('input.cdr-select:checked').length;
+  const n = selectedIds.size;
   btn.disabled = n === 0;
   btn.textContent = n === 0
     ? 'Download zip of selected'
     : 'Download zip of selected (' + n + ')';
+  if (clearBtn) clearBtn.hidden = n === 0;
 }
 
-async function downloadBatchZip() {
-  const ids = Array.from(document.querySelectorAll('input.cdr-select:checked'))
-    .map(el => parseInt(el.value, 10))
-    .filter(n => Number.isFinite(n) && n > 0);
-  if (ids.length === 0) return;
+async function clearSelection() {
+  selectedIds.clear();
+  document.querySelectorAll('input.cdr-select').forEach(cb => { cb.checked = false; });
+  updateMasterCheckbox();
+  updateBatchBtn();
+  schedulePersist();
+}
+
+async function downloadBatchZipFromIds(ids) {
   const btn = document.getElementById('batch-pcap-btn');
+  const original = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = 'Building zip…'; }
+  try {
+    const resp = await fetch('/pcap/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: Array.from(ids) })
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      alert('Batch download failed (' + resp.status + '): ' + body);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'pcaps.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('Batch download error: ' + e);
+  } finally {
+    if (btn) {
+      btn.textContent = original || 'Download zip of selected';
+      updateBatchBtn();
+    }
+  }
+}
+
+async function downloadBatchZipFromFilter() {
+  const btn = document.getElementById('batch-pcap-all-btn');
+  const form = document.getElementById('cdr-filter-form');
+  if (!btn || !form) return;
+  // Build the same query string the CSV export would receive — every
+  // input in the filter form (text, checkbox, datetime) gets serialized
+  // via URLSearchParams, which handles repeated keys (e.g. multiple
+  // src_ip chips) correctly.
+  const params = new URLSearchParams();
+  for (const el of form.querySelectorAll('input')) {
+    if (el.name === 'next' || el.type === 'submit' || el.type === 'button') continue;
+    if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) continue;
+    if (el.type === 'checkbox' || el.type === 'radio') {
+      params.append(el.name, el.value);
+    } else if (el.value !== '') {
+      params.append(el.name, el.value);
+    }
+  }
+  const filter = params.toString();
+  if (!filter) {
+    alert('Apply some filters first — otherwise the zip would contain every CDR in the database.');
+    return;
+  }
   const original = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Building zip…';
@@ -292,7 +451,7 @@ async function downloadBatchZip() {
     const resp = await fetch('/pcap/batch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: ids })
+      body: JSON.stringify({ filter: filter })
     });
     if (!resp.ok) {
       const body = await resp.text();
@@ -312,12 +471,24 @@ async function downloadBatchZip() {
     alert('Batch download error: ' + e);
   } finally {
     btn.textContent = original;
-    updateBatchBtn();
+    btn.disabled = false;
   }
 }
 
-// Wire the batch button + per-row checkboxes on load.
-document.getElementById('batch-pcap-btn')?.addEventListener('click', downloadBatchZip);
+// Wire per-row checkboxes (server-rendered `checked` already reflects
+// the session's selected_cdr_ids — JS just needs to react to toggles).
+document.querySelectorAll('input.cdr-select').forEach(cb => {
+  cb.addEventListener('change', () => onCdrToggle(cb, parseInt(cb.value, 10)));
+});
+document.getElementById('cdr-select-all')?.addEventListener('change', e => {
+  toggleSelectAll(e.target);
+});
+document.getElementById('batch-pcap-btn')?.addEventListener('click', () => {
+  downloadBatchZipFromIds(selectedIds);
+});
+document.getElementById('batch-pcap-all-btn')?.addEventListener('click', downloadBatchZipFromFilter);
+document.getElementById('batch-pcap-clear')?.addEventListener('click', clearSelection);
+updateMasterCheckbox();
 updateBatchBtn();
 </script>
 {% endblock %}

@@ -42,6 +42,20 @@ pub struct CdrListTemplate {
     /// Server default TZ offset hours, so the dropdown can label
     /// "Server default (-3h)" distinctly from "user override".
     pub tz_default_hours: i8,
+    /// Full operator selection (every CDR ID ticked across all visited
+    /// pages). Serialised into a `<script type="application/json">` tag
+    /// in the template so the JS state mirrors the session without a
+    /// round-trip on every page load.
+    pub selected_cdr_ids: Vec<u64>,
+    /// Parallel to `cdrs` (same length, same order). `selected_flags[i]`
+    /// is true iff `cdrs[i].id` is in the operator's session-persisted
+    /// batch selection. Asked for as a Vec<bool> rather than a HashSet
+    /// because askama 0.12's expression parser can't call `contains`
+    /// on user types in an `{% if %}`; indexing into a Vec works fine.
+    pub selected_flags: Vec<bool>,
+    /// Total size of the operator's selection (across all visited
+    /// pages). Drives the "(N selected)" badge on the batch button.
+    pub selected_count: usize,
 }
 
 /// Stringified versions of the distinct values, ready for the template.
@@ -315,8 +329,10 @@ pub async fn cdr_list(
     };
 
     let tmpl = CdrListTemplate {
-        user: Some(user),
-        cdrs: page.rows,
+        user: Some(user.clone()),
+        cdrs: page.rows.clone(),
+        selected_cdr_ids: user.selected_cdr_ids.clone(),
+        selected_flags: page.rows.iter().map(|c| user.selected_cdr_ids.contains(&c.id)).collect(),
         page: normalized.page,
         page_size: normalized.page_size,
         has_more,
@@ -329,6 +345,7 @@ pub async fn cdr_list(
         day_label,
         tz_offset_hours: (tz.local_minus_utc() / 3600) as i8,
         tz_default_hours: (state.config.tz_offset_secs / 3600) as i8,
+        selected_count: user.selected_cdr_ids.len(),
     };
     let body = tmpl
         .render()
@@ -661,7 +678,7 @@ pub async fn cdr_export_csv(
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
 }
 
-fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilters {
+pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilters {
     CdrFilters {
         from: parse_dt(&q.from),
         to: parse_dt(&q.to),
@@ -738,7 +755,7 @@ pub fn parse_query_params(raw: &str) -> QueryParams {
 /// `QueryParams` because of the serde_urlencoded limitation described
 /// above.
 #[derive(Debug, Default)]
-pub struct SingleParams {
+pub(crate) struct SingleParams {
     pub from: Option<String>,
     pub to: Option<String>,
     pub caller: Option<String>,

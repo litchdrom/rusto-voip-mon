@@ -24,6 +24,12 @@ use sha2::Sha256;
 pub const COOKIE_NAME: &str = "rusto_session";
 pub const TTL_SECS: i64 = 24 * 60 * 60;
 
+/// Cap on CDR IDs persisted in the session cookie. Cookies are typically
+/// bounded at ~4 KB by browsers; 100 IDs at ~7 bytes each (decimal u64)
+/// stays well under that while still being a useful batch size. Mirrors
+/// the server-side `BATCH_MAX` cap on `/pcap/batch`.
+pub const SESSION_SELECTION_CAP: usize = 100;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionUser {
     pub user_id: u32,
@@ -39,6 +45,13 @@ pub struct SessionUser {
     /// existed keep working.
     #[serde(default)]
     pub tz_offset_hours: Option<i8>,
+    /// CDR IDs the operator has ticked for the upcoming batch download.
+    /// Cross-page selection state — toggling a checkbox on page 2 still
+    /// sees the ones you ticked on page 1. Always deduplicated + capped
+    /// at `SESSION_SELECTION_CAP`; older IDs are dropped when the cap is
+    /// reached. Old cookies default to an empty list.
+    #[serde(default)]
+    pub selected_cdr_ids: Vec<u64>,
 }
 
 impl SessionUser {
@@ -55,6 +68,7 @@ impl SessionUser {
             can_pcap,
             expires_at,
             tz_offset_hours: None,
+            selected_cdr_ids: Vec::new(),
         }
     }
 
@@ -64,6 +78,32 @@ impl SessionUser {
     pub fn with_tz(mut self, tz_offset_hours: Option<i8>) -> Self {
         self.tz_offset_hours = tz_offset_hours;
         // Re-stamp the TTL so a TZ change bumps the session lifetime.
+        self.expires_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64 + TTL_SECS)
+            .unwrap_or(self.expires_at);
+        self
+    }
+
+    /// Replace the operator's batch-download selection with `ids`. Dedupe
+    /// + cap at `SESSION_SELECTION_CAP`; the most recent N are kept if
+    /// the caller sends more than the cap. Re-stamps the session TTL so
+    /// an active selection list doesn't quietly expire.
+    pub fn with_selection(mut self, ids: Vec<u64>) -> Self {
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        let mut deduped: Vec<u64> = Vec::with_capacity(ids.len().min(SESSION_SELECTION_CAP));
+        // Preserve caller order so freshly-ticked IDs (which arrive last)
+        // win when the cap kicks in — that's the principle of least
+        // surprise: don't silently drop the rows the user just clicked.
+        for id in ids {
+            if seen.insert(id) {
+                if deduped.len() >= SESSION_SELECTION_CAP {
+                    deduped.remove(0);
+                }
+                deduped.push(id);
+            }
+        }
+        self.selected_cdr_ids = deduped;
         self.expires_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64 + TTL_SECS)
@@ -256,5 +296,24 @@ mod tests {
         let enc = base64_url_encode(&original);
         let dec = base64_url_decode(&enc).unwrap();
         assert_eq!(dec, original);
+    }
+
+    #[test]
+    fn selection_dedupes_and_caps() {
+        let mut u = SessionUser::new(1, "u".into(), false, true, true);
+        // 5 duplicates of the same ID — should collapse to one.
+        u = u.with_selection(vec![10, 10, 10, 10, 10]);
+        assert_eq!(u.selected_cdr_ids, vec![10]);
+        // Cap: SESSION_SELECTION_CAP is 100. Send 105 unique IDs (0..105)
+        // — the first 5 (0..5) are dropped from the front because the
+        // cap is reached at ID 99 and pushes the oldest off. Replacement
+        // semantics: the new list is exactly what we sent, capped.
+        u = u.with_selection((0..105u64).collect());
+        assert_eq!(u.selected_cdr_ids.len(), SESSION_SELECTION_CAP);
+        assert_eq!(u.selected_cdr_ids.first(), Some(&5));
+        assert_eq!(u.selected_cdr_ids.last(), Some(&104));
+        // A smaller replacement just stores the new list verbatim.
+        u = u.with_selection(vec![0, 1, 2, 3, 4]);
+        assert_eq!(u.selected_cdr_ids, vec![0, 1, 2, 3, 4]);
     }
 }

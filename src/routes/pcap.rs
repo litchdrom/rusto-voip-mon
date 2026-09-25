@@ -34,6 +34,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     auth::session::SessionUser,
+    cdr,
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -557,12 +558,26 @@ fn build_sources_from_fbasename(
 /// would consume worker threads for minutes.
 const BATCH_MAX: usize = 100;
 
-/// Request body for `POST /pcap/batch`. A plain JSON object with one
-/// field — the caller decides which IDs (filter-driven, manual paste,
-/// checkbox selection, …).
+/// Request body for `POST /pcap/batch`.
+///
+/// Exactly one of two modes:
+///
+///   * `ids`    — explicit list of CDR IDs (per-row selection in the UI).
+///   * `filter` — raw URL-encoded query string mirroring the CDR list
+///                page's filter form. The server resolves it to all
+///                matching CDR IDs (capped at `BATCH_MAX`) and bundles
+///                them. Used by the "Download all matching pcaps" button
+///                so the operator doesn't have to tick every row on
+///                every page.
+///
+/// Both fields are optional but at least one must produce a non-empty
+/// result, otherwise we 400.
 #[derive(serde::Deserialize)]
 pub struct BatchPcapRequest {
+    #[serde(default)]
     pub ids: Vec<u64>,
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 /// Batch download — produce a zip of N pcaps, one entry per CDR.
@@ -588,31 +603,51 @@ pub async fn download_batch(
         return Err(AppError::Forbidden);
     }
 
-    // Dedupe + drop zero + cap. Preserves the caller's order so the zip
-    // entries are deterministic for a given selection.
-    let mut seen = std::collections::HashSet::with_capacity(req.ids.len());
-    let mut cdr_ids: Vec<u64> = Vec::with_capacity(req.ids.len());
-    for id in req.ids {
-        if id > 0 && seen.insert(id) {
-            cdr_ids.push(id);
+    // Resolve the request to a concrete CDR ID list. Two modes:
+    //   - explicit `ids`     — dedupe + drop zero, cap at BATCH_MAX
+    //   - filter query string — parse it the same way the CDR list page
+    //                           does, resolve via cdr::list_ids_matching,
+    //                           cap at BATCH_MAX
+    // Exactly one path runs; `ids` wins if both are present (the JS
+    // filter button always sends one OR the other, never both).
+    let mut cdr_ids: Vec<u64> = if !req.ids.is_empty() {
+        let mut seen = std::collections::HashSet::with_capacity(req.ids.len());
+        let mut out = Vec::with_capacity(req.ids.len());
+        for id in req.ids {
+            if id > 0 && seen.insert(id) {
+                out.push(id);
+            }
         }
-    }
+        out
+    } else if let Some(filter) = req.filter.as_deref() {
+        // Use the server's default TZ for "today/yesterday" calculations
+        // inside the filter — same as the CDR list page does. The
+        // per-request ?tz_offset_hours=... can override; we read it from
+        // the filter string itself.
+        let query_tz: Option<i8> = parse_tz_from_filter(filter);
+        let (tz, _) = state.resolve_tz(&user, query_tz);
+        cdr::ids_for_query_string(&state.pool, filter, tz, BATCH_MAX).await?
+    } else {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "request must include either `ids` or `filter`",
+        )
+            .into_response());
+    };
     if cdr_ids.is_empty() {
         return Ok((
             StatusCode::BAD_REQUEST,
-            "no valid CDR IDs in request",
+            "filter resolved to zero CDRs",
         )
             .into_response());
     }
     if cdr_ids.len() > BATCH_MAX {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "batch too large: {} IDs (max {BATCH_MAX})",
-                cdr_ids.len()
-            ),
-        )
-            .into_response());
+        tracing::warn!(
+            requested = cdr_ids.len(),
+            cap = BATCH_MAX,
+            "filter matched more than BATCH_MAX; truncating"
+        );
+        cdr_ids.truncate(BATCH_MAX);
     }
 
     let total = cdr_ids.len();
@@ -714,6 +749,21 @@ pub async fn download_batch(
         )
         .body(body)
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
+/// Pull the optional `tz_offset_hours` out of a raw CDR-list query string.
+/// Returns `None` if absent, malformed, or set to `0` (which the list
+/// page treats as "use the server default").
+fn parse_tz_from_filter(raw_query: &str) -> Option<i8> {
+    let raw_query = raw_query.trim_start_matches('?');
+    for pair in raw_query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "tz_offset_hours" {
+                return v.parse().ok();
+            }
+        }
+    }
+    None
 }
 
 async fn fetch_parts(pool: &MySqlPool, cdr_id: u64) -> AppResult<Vec<TarPartRow>> {

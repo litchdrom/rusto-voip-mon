@@ -3,8 +3,9 @@ use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Redirect, Response},
-    Form,
+    Json,
 };
+use axum::Form;
 use serde::Deserialize;
 use sqlx::FromRow;
 
@@ -212,6 +213,34 @@ pub async fn set_tz(
 pub struct SetTzForm {
     pub tz_offset_hours: Option<String>,
     pub next: Option<String>,
+}
+
+/// Request body for `POST /cdr/select`. The JS on the CDR list page
+/// sends the full current selection (every checked row, across all
+/// pages the operator has visited) on each toggle; the server stores it
+/// verbatim, capped at `SESSION_SELECTION_CAP`.
+#[derive(Debug, Deserialize)]
+pub struct SelectCdrsRequest {
+    #[serde(default)]
+    pub ids: Vec<u64>,
+}
+
+/// Update the operator's batch-download selection. Returns 204 with a
+/// refreshed session cookie. The JS calls this on every checkbox toggle
+/// (debounced) so the selection survives page navigation.
+pub async fn select_cdrs(
+    State(state): State<crate::state::AppState>,
+    user: SessionUser,
+    Json(req): Json<SelectCdrsRequest>,
+) -> AppResult<Response> {
+    let new_session = user.with_selection(req.ids);
+    let value = encode_cookie(&new_session, state.config.cookie_secret.as_bytes());
+    let cookie_header = format_set_cookie(COOKIE_NAME, &value, "/", Some(TTL_SECS));
+    let mut resp = (StatusCode::NO_CONTENT, "").into_response();
+    if let Ok(hv) = HeaderValue::from_str(&cookie_header) {
+        resp.headers_mut().insert(header::SET_COOKIE, hv);
+    }
+    Ok(resp)
 }
 
 /// Build a Set-Cookie header value with HttpOnly + SameSite=Lax.

@@ -50,6 +50,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(routes::cdr::cdr_list))
         .route("/cdr/:id", get(routes::cdr::cdr_detail))
         .route("/cdr/export.csv", get(routes::cdr::cdr_export_csv))
+        .route("/cdr/select", post(routes::login::select_cdrs))
         .route("/pcap/:cdr_id", get(routes::pcap::download_single))
         .route("/pcap/batch", post(routes::pcap::download_batch))
         .route("/tz", post(routes::login::set_tz))

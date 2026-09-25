@@ -20,7 +20,7 @@ tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql", "chrono", "macros"] }
 
 # Templating
-askama = "0.12"
+askama = { version = "0.12", features = ["serde-json"] }
 askama_axum = "0.4"
 
 # axum-extra — we only need TypedHeader for cookie reading.
