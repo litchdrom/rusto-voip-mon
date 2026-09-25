@@ -289,10 +289,16 @@ async fn resolve_source_to_chunks(
             // warn), or raw concatenated pcap packet records (no header).
             let chunk_kinds: Vec<&'static str> = chunks
                 .iter()
-                .map(|c| match c.get(..4) {
-                    Some(b"\xd4\xc3\xb2\xa1") | Some(b"\xa1\xb2\xc3\xd4") => "pcap",
-                    Some(b"\x0a\x0d\x0d\x0a") => "pcapng",
-                    _ => "raw",
+                .map(|c| {
+                    if c.len() >= 4 && (&c[..4] == b"\xd4\xc3\xb2\xa1" || &c[..4] == b"\xa1\xb2\xc3\xd4") {
+                        "pcap"
+                    } else if c.len() >= 4 && &c[..4] == b"\x0a\x0d\x0d\x0a" {
+                        "pcapng"
+                    } else if c.len() >= 3 && &c[..3] == b"LZO" {
+                        "lzo"
+                    } else {
+                        "raw"
+                    }
                 })
                 .collect();
             let chunk_sizes: Vec<usize> = chunks.iter().map(|c| c.len()).collect();
@@ -842,36 +848,84 @@ fn is_pcap_magic(magic: &[u8]) -> bool {
     magic.len() >= 4 && (magic == b"\xd4\xc3\xb2\xa1" || magic == b"\xa1\xb2\xc3\xd4")
 }
 
-/// Detect VoIPmonitor's LZO-compressed pcap variant: first 4 bytes are
-/// the marker `LZO\x9a` followed by 8 bytes of metadata, then raw LZO1X
-/// compressed data (which decompresses to a standard pcap).
+/// Detect VoIPmonitor's LZO-compressed pcap variant: the first 3 bytes
+/// are the marker `LZO`. What follows is a sequence of chunks, each
+/// prefixed by an 8-byte header (LE u32 compressed_size, LE u32
+/// uncompressed size) followed by `compressed_size` bytes of LZO1X-1
+/// compressed data decompressing to `uncompressed size` bytes.
+///
+/// The format comes from `tools_dynamic_buffer.cpp::CompressStream` in
+/// voipmonitor/sniffer: when the writer constructs a `CompressStream`
+/// for `lzo` and calls both `enableAutoPrefixFile()` and
+/// `enableForceStream()`, it emits exactly this layout (the 3-byte
+/// "LZO" prefix is written once at the very start, not per chunk).
 fn is_voipmonitor_lzo(magic: &[u8]) -> bool {
-    magic.len() >= 4 && &magic[..4] == b"LZO\x9a"
+    magic.len() >= 3 && &magic[..3] == b"LZO"
 }
 
-/// Decompress a VoIPmonitor LZO-compressed pcap blob. The input has a
-/// 12-byte custom header ("LZO\x9a" + 8 bytes of metadata) followed by
-/// raw LZO1X-compressed data. Output is a regular pcap (header + packets).
+/// Decompress a VoIPmonitor LZO-compressed pcap blob. The on-disk layout
+/// (see `is_voipmonitor_lzo` for the spec) is a 3-byte `LZO` magic followed
+/// by zero or more chunks. Each chunk is:
 ///
-/// `Ok(None)` if the blob doesn't look LZO-compressed. `Err` only on
-/// malformed LZO data. The `lzo` crate needs the caller to provide an
-/// upper bound for the output; we use `2 * compressed.len()` which is
-/// well above LZO's worst-case expansion ratio (≈1.01× + a few bytes).
+///     [u32 LE compress_size][u32 LE size][compress_size bytes LZO1X-1]
+///
+/// We use the chunk's `size` field as the exact output-buffer bound for
+/// `lzo::decompress`, which avoids both the "buffer too small" failure
+/// (when compressed data expands) and the "back-reference before output
+/// start" failure (which is what a stray leading garbage byte from a bad
+/// strip produced — see commit history).
+///
+/// `Ok(None)` if the blob doesn't look LZO-compressed. We tolerate a
+/// trailing partial chunk (capture still in progress) by stopping the
+/// loop; only a chunk whose header lies past the buffer or whose LZO
+/// payload is short produces an error.
 fn decompress_voipmonitor_lzo(blob: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
     if !is_voipmonitor_lzo(blob) {
         return Ok(None);
     }
-    if blob.len() < 12 {
-        return Ok(Some(Vec::new()));
+    const CHUNK_HEADER_LEN: usize = 8;
+    let mut out = Vec::new();
+    let mut pos: usize = 3; // skip "LZO" prefix
+    while pos + CHUNK_HEADER_LEN <= blob.len() {
+        let compress_size = u32::from_le_bytes(
+            blob[pos..pos + 4].try_into().unwrap(),
+        ) as usize;
+        let size = u32::from_le_bytes(
+            blob[pos + 4..pos + 8].try_into().unwrap(),
+        ) as usize;
+        let payload_start = pos + CHUNK_HEADER_LEN;
+        let payload_end = payload_start.saturating_add(compress_size);
+        if payload_end > blob.len() {
+            // Chunk header says more data than we have. Either a truncated
+            // last chunk (capture still in progress) or a corrupt stream.
+            // Be lenient: stop here and return what we have.
+            break;
+        }
+        let compressed = &blob[payload_start..payload_end];
+        let decompressed = lzo::decompress(compressed, size).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "lzo (chunk @ {}, compress_size={}, size={}): {e}",
+                    pos, compress_size, size
+                ),
+            )
+        })?;
+        if decompressed.len() != size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "lzo decompressed length {} != expected size {} (chunk @ {})",
+                    decompressed.len(),
+                    size,
+                    pos
+                ),
+            ));
+        }
+        out.extend_from_slice(&decompressed);
+        pos = payload_end;
     }
-    let compressed = &blob[12..];
-    let upper = compressed.len().saturating_mul(2).max(64);
-    lzo::decompress(compressed, upper).map(Some).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("lzo: {e}"),
-        )
-    })
+    Ok(Some(out))
 }
 
 /// Parse a 12-byte tar size field. Handles:
