@@ -3,12 +3,16 @@ use std::sync::Arc;
 use sqlx::MySqlPool;
 
 use crate::auth::session::SessionUser;
+use crate::auth::token::TokenStore;
 use crate::config::Config;
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub pool: MySqlPool,
+    /// In-memory registry of API bearer tokens. See
+    /// [`crate::auth::token`] for the design + lifetime notes.
+    pub tokens: Arc<TokenStore>,
 }
 
 impl AppState {

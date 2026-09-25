@@ -217,7 +217,23 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>, ()> {
     Ok(out)
 }
 
-/// Extractor that pulls the session out of a `Cookie:` header.
+/// Extractor that pulls the session either from a `Cookie:` header or
+/// from a `Authorization: Bearer …` header.
+///
+/// **Bearer path** runs first: scripts / CI / `curl` clients usually
+/// can't manage a `Cookie:` jar, so they pass the token directly. The
+/// token format is `<id>.<hmac_sha256(id, secret)>` and is looked up in
+/// [`crate::auth::token::TokenStore`]. A successful lookup yields a
+/// `SessionUser` synthesised from the token's user-snapshot, with the
+/// `expires_at` field set so `is_expired()` returns false. The real
+/// expiry is enforced by the store at lookup time.
+///
+/// **Cookie path** is the original browser flow: read the signed
+/// session cookie, verify the HMAC, decode the JSON payload.
+///
+/// Either path can yield a session — we don't insist on both. The
+/// rejection type is `(StatusCode, &'static str)` so handlers can map
+/// it to a plain `text/plain` 401 body.
 #[axum::async_trait]
 impl<S> FromRequestParts<S> for SessionUser
 where
@@ -226,6 +242,38 @@ where
     type Rejection = (StatusCode, &'static str);
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // -- Bearer token path ------------------------------------------------
+        // Look for `Authorization: Bearer <token>`. We do the parse
+        // manually instead of via `TypedHeader<Authorization<Bearer>>`
+        // because the `headers` crate's `Bearer` newtype isn't re-exported
+        // from `axum::http::header` and the plumbing isn't worth the
+        // dependency shuffle. The format is standardised in RFC 6750 so
+        // this is safe to hand-roll.
+        if let Some(value) = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok())
+        {
+            if let Some(rest) = value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+            {
+                let tokens = parts
+                    .extensions
+                    .get::<std::sync::Arc<crate::auth::token::TokenStore>>()
+                    .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "token store missing"))?;
+                if let Some(entry) = tokens.lookup(rest) {
+                    return Ok(crate::auth::token::SessionUserSnapshot::into_session_user(
+                        entry.user,
+                    ));
+                }
+                // Unknown / revoked / expired token: fall through to
+                // the cookie path so a user with both an expired bearer
+                // AND a valid session cookie still gets in.
+            }
+        }
+
+        // -- Cookie path -----------------------------------------------------
         // Snapshot the secret up-front so the immutable borrow on
         // `parts.extensions` ends before we touch TypedHeader.
         let secret_bytes: Vec<u8> = {

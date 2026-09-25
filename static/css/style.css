@@ -55,12 +55,25 @@ h2 { font-size: 18px; margin: 16px 0 12px; }
   height: 28px;
   width: auto;
   display: block;
-  /* Subtle accent-coloured glow so the logo doesn't get lost against
-     the dark topbar background. drop-shadow (not box-shadow) follows
-     the actual SVG shape so the glow hugs the curves, not a rectangle. */
+  /* Two-layer accent glow with an explicit offset. The first layer is
+     a tight rim-light (lower-right) that hugs the curves; the second is
+     a wide ambient halo (upper-left) so the logo reads as raised against
+     the dark topbar rather than floating on a flat plane. drop-shadow
+     (not box-shadow) follows the actual SVG shape so the glow follows
+     the curves, not a rectangle. The non-zero offsets give the logo a
+     3D feel — same colour, two opposing directions — without changing
+     its silhouette. */
   filter:
+    drop-shadow(2px 1px 0 rgba(74, 158, 255, 0.45))
     drop-shadow(0 0 4px rgba(74, 158, 255, 0.55))
-    drop-shadow(0 0 10px rgba(74, 158, 255, 0.25));
+    drop-shadow(-2px -2px 12px rgba(74, 158, 255, 0.25));
+  transition: filter 0.15s ease-out;
+}
+.topbar .brand-logo:hover {
+  filter:
+    drop-shadow(2px 1px 0 rgba(74, 158, 255, 0.55))
+    drop-shadow(0 0 6px rgba(74, 158, 255, 0.70))
+    drop-shadow(-3px -3px 16px rgba(74, 158, 255, 0.35));
 }
 .topbar .brand-text { line-height: 1; }
 .topbar .user { color: var(--fg-muted); font-size: 13px; }

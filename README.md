@@ -18,6 +18,8 @@ An open-source web GUI for [VoIPmonitor](https://www.voipmonitor.org/), written 
 - CDR detail page (basic fields; full SIP flow deferred to v0.2)
 - CSV export
 - PCAP single + batch download — *stubs in v0.1, implemented in v0.2*
+- Long-lived bearer tokens (`POST /auth/tokens`) for `curl` / CI / scripts
+- Full HTTP API documented in [`docs/API.md`](docs/API.md) with one curl example per endpoint
 
 ## Quick start
 

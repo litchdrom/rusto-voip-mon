@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: config.clone(),
         pool,
+        tokens: std::sync::Arc::new(crate::auth::token::TokenStore::new()),
     };
 
     // Routes that require an authenticated session.
@@ -53,6 +54,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/cdr/select", post(routes::login::select_cdrs))
         .route("/pcap/:cdr_id", get(routes::pcap::download_single))
         .route("/pcap/batch", post(routes::pcap::download_batch))
+        .route("/auth/tokens", post(routes::auth::create_token).get(routes::auth::list_tokens))
+        .route("/auth/tokens/:id", axum::routing::delete(routes::auth::revoke_token))
         .route("/tz", post(routes::login::set_tz))
         .route_layer(axum_middleware::from_fn(require_login));
 
@@ -71,6 +74,11 @@ async fn main() -> anyhow::Result<()> {
         .layer(Extension(CookieSecret(
             config.cookie_secret.clone(),
         )))
+        // Expose the token store as a request extension so the
+        // SessionUser extractor (used by every protected handler) can
+        // resolve `Authorization: Bearer …` without needing AppState in
+        // its FromRequestParts bound.
+        .layer(Extension(state.tokens.clone()))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

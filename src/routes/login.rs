@@ -7,7 +7,6 @@ use axum::{
 };
 use axum::Form;
 use serde::Deserialize;
-use sqlx::FromRow;
 
 use crate::{
     auth::{
@@ -69,72 +68,41 @@ pub struct LoginQuery {
     pub next: Option<String>,
 }
 
-#[derive(Debug, FromRow)]
-struct UserRow {
-    id: i32,
-    username: String,
-    password: String,
-    is_admin: i8,
-    can_cdr: Option<i8>,
-    can_pcap: Option<i8>,
-    blocked: Option<i8>,
-    password_expired: Option<i8>,
-}
-
 pub async fn login_submit(
     State(state): State<AppState>,
     Form(form): Form<LoginForm>,
 ) -> AppResult<Response> {
-    let row: Option<UserRow> = sqlx::query_as(
-        "SELECT id, username, password, is_admin, can_cdr, can_pcap, \
-                blocked, password_expired \
-           FROM users WHERE username = ? LIMIT 1",
+    // Single source of truth for "is this (username, password) valid?".
+    // The token endpoint (`POST /auth/tokens`) uses the same helper so
+    // a future change to password rules / blocking applies to both
+    // paths at once. Returns Ok(None) for any failure — bad username,
+    // wrong password, blocked, expired — so the caller can show one
+    // "invalid credentials" message and not leak which check failed.
+    let verified = match password::verify_login(
+        &state.pool,
+        &form.username,
+        &form.password,
     )
-    .bind(&form.username)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    let Some(user) = row else {
-        return Ok(render_login_error(
-            "Invalid username or password",
-            form.next,
-            StatusCode::UNAUTHORIZED,
-        ));
+    .await?
+    {
+        Some(v) => v,
+        None => {
+            return Ok(render_login_error(
+                "Invalid username or password",
+                form.next,
+                StatusCode::UNAUTHORIZED,
+            ));
+        }
     };
 
-    if user.blocked.unwrap_or(0) != 0 {
-        return Ok(render_login_error("Account blocked", form.next, StatusCode::FORBIDDEN));
-    }
-    if user.password_expired.unwrap_or(0) != 0 {
-        return Ok(render_login_error(
-            "Password expired \u{2014} change it via the VoIPmonitor GUI",
-            form.next,
-            StatusCode::FORBIDDEN,
-        ));
-    }
-    if !password::verify(&user.password, &form.password) {
-        return Ok(render_login_error(
-            "Invalid username or password",
-            form.next,
-            StatusCode::UNAUTHORIZED,
-        ));
-    }
-
-    if password::detect(&user.password) == Some(password::HashFormat::Md5) {
+    if verified.hash_was_legacy_md5 {
         tracing::warn!(
-            user_id = user.id,
+            user_id = verified.user.user_id,
             "user is using legacy unsalted-MD5 password hash; consider rotating"
         );
     }
 
-    let session = SessionUser::new(
-        user.id as u32,
-        user.username,
-        user.is_admin != 0,
-        user.can_cdr.unwrap_or(1) != 0,
-        user.can_pcap.unwrap_or(1) != 0,
-    );
-
+    let session = verified.user;
     let value = encode_cookie(&session, state.config.cookie_secret.as_bytes());
     let cookie_header = format_set_cookie(
         COOKIE_NAME,

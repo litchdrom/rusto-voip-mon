@@ -72,6 +72,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 async-stream = "0.3"
 
+# API bearer tokens (used by /auth/token). The `getrandom`-backed
+# RNG pulls from the OS CSPRNG; no need to pull in `rand`'s heavier
+# distributions / Rng trait just to fill 32 bytes.
+rand = "0.8"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
