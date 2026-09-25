@@ -56,6 +56,16 @@ pub struct SessionUser {
 
 impl SessionUser {
     pub fn new(user_id: u32, username: String, is_admin: bool, can_cdr: bool, can_pcap: bool) -> Self {
+        // Admins are superusers: `is_admin` implies all per-feature
+        // permissions. We OR the admin bit in here (rather than at every
+        // route guard) so existing bearer tokens minted with stale
+        // `can_pcap=0` snapshots pick up the override automatically on
+        // next request — no re-mint needed after deploying.
+        let (can_cdr, can_pcap) = if is_admin {
+            (true, true)
+        } else {
+            (can_cdr, can_pcap)
+        };
         let expires_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64 + TTL_SECS)
@@ -303,6 +313,7 @@ pub struct CookieSecret(pub String);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::token::SessionUserSnapshot;
 
     #[test]
     fn roundtrip() {
@@ -344,6 +355,56 @@ mod tests {
         let enc = base64_url_encode(&original);
         let dec = base64_url_decode(&enc).unwrap();
         assert_eq!(dec, original);
+    }
+
+    /// `is_admin = true` must imply `can_cdr = true` and `can_pcap = true`
+    /// — regardless of what the stored columns say. Covers the real-world
+    /// case where the operator is an admin (`is_admin=1`) but the per-feature
+    /// columns are `NULL`/`0` because they were never explicitly granted.
+    #[test]
+    fn admin_implies_all_can_permissions() {
+        let u = SessionUser::new(1, "admin".into(), true, false, false);
+        assert!(u.can_cdr, "admin must get can_cdr");
+        assert!(u.can_pcap, "admin must get can_pcap");
+    }
+
+    /// Non-admin keeps whatever the DB said. The override must not leak
+    /// to operator-level accounts.
+    #[test]
+    fn non_admin_keeps_stored_permissions() {
+        let u_cdr_only = SessionUser::new(2, "cdr_only".into(), false, true, false);
+        assert!(u_cdr_only.can_cdr);
+        assert!(!u_cdr_only.can_pcap);
+        let u_pcap_only = SessionUser::new(3, "pcap_only".into(), false, false, true);
+        assert!(!u_pcap_only.can_cdr);
+        assert!(u_pcap_only.can_pcap);
+        let u_neither = SessionUser::new(4, "viewer".into(), false, false, false);
+        assert!(!u_neither.can_cdr);
+        assert!(!u_neither.can_pcap);
+    }
+
+    /// Admin override must apply on the snapshot→session round trip —
+    /// mirrors the token-restored path. Even if a stale snapshot says
+    /// `can_pcap = false`, rebuilding a fresh `SessionUser` from it (which
+    /// the bearer-token flow does on every request) must re-apply the
+    /// override from `is_admin`.
+    #[test]
+    fn admin_override_survives_snapshot_round_trip() {
+        // Construct a snapshot manually with is_admin=true but the perms
+        // turned off — simulates a snapshot that was somehow captured
+        // before the override was applied (e.g. a stale token snapshot
+        // written by an older binary).
+        let snap = SessionUserSnapshot {
+            user_id: 5,
+            username: "admin".into(),
+            is_admin: true,
+            can_cdr: false,
+            can_pcap: false,
+        };
+        let restored = snap.into_session_user();
+        assert!(restored.is_admin);
+        assert!(restored.can_cdr, "admin override must re-apply on restore");
+        assert!(restored.can_pcap, "admin override must re-apply on restore");
     }
 
     #[test]

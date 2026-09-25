@@ -336,7 +336,7 @@ unzip -l bad-mos.zip | head
 | `200 OK` | zip archive (even if some CDRs failed — failed entries are logged and skipped) |
 | `400 Bad Request` | neither `ids` nor `filter`, both empty, > 100 ids, or filter matched 0 CDRs |
 | `401 Unauthorized` | no valid session cookie or bearer token |
-| `403 Forbidden` | user has `can_pcap = 0` |
+| `403 Forbidden` | user has `can_pcap = 0` (admins always pass — `is_admin = 1` implies `can_pcap`) |
 
 ---
 
