@@ -10,8 +10,78 @@
    xml:space="preserve"
    xmlns="http://www.w3.org/2000/svg"
    xmlns:svg="http://www.w3.org/2000/svg"><defs
-     id="defs1" /><g
+     id="defs1">
+    <filter
+       id="brand-glow"
+       x="-25%"
+       y="-25%"
+       width="150%"
+       height="150%">
+      <!-- Rim light: sharp + slight offset, matches
+           `drop-shadow(2px 1px 0 rgba(74,158,255,0.45))` in style.css. -->
+      <feOffset
+         in="SourceAlpha"
+         dx="2"
+         dy="1"
+         result="rimOffset" />
+      <feGaussianBlur
+         in="rimOffset"
+         stdDeviation="0.5"
+         result="rimBlur" />
+      <feFlood
+         flood-color="#4a9eff"
+         flood-opacity="0.45"
+         result="rimColor" />
+      <feComposite
+         in="rimColor"
+         in2="rimBlur"
+         operator="in"
+         result="rim" />
+      <!-- Tight glow: medium blur, no offset.
+           Mirrors `drop-shadow(0 0 4px rgba(74,158,255,0.55))`. -->
+      <feGaussianBlur
+         in="SourceAlpha"
+         stdDeviation="2"
+         result="tightBlur" />
+      <feFlood
+         flood-color="#4a9eff"
+         flood-opacity="0.55"
+         result="tightColor" />
+      <feComposite
+         in="tightColor"
+         in2="tightBlur"
+         operator="in"
+         result="tight" />
+      <!-- Wide halo: large soft blur with slight up-left offset.
+           Mirrors `drop-shadow(-2px -2px 12px rgba(74,158,255,0.25))`. -->
+      <feOffset
+         in="SourceAlpha"
+         dx="-2"
+         dy="-2"
+         result="haloOffset" />
+      <feGaussianBlur
+         in="haloOffset"
+         stdDeviation="6"
+         result="haloBlur" />
+      <feFlood
+         flood-color="#4a9eff"
+         flood-opacity="0.25"
+         result="haloColor" />
+      <feComposite
+         in="haloColor"
+         in2="haloBlur"
+         operator="in"
+         result="halo" />
+      <feMerge>
+        <feMergeNode in="halo" />
+        <feMergeNode in="tight" />
+        <feMergeNode in="rim" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs><g
      id="layer1"
+     filter="url(#brand-glow)"
      transform="translate(-5.9157423,-55.763979)"><g
        id="g8"
        transform="translate(14.869795,7.8452827)"><path
