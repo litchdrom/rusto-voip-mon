@@ -27,6 +27,7 @@ use axum::{
 };
 use bytes::Bytes;
 use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike};
+use lzo;
 use sqlx::{MySqlPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -167,6 +168,37 @@ pub async fn download_single(
             tracing::warn!(cdr_id, "no pcap blobs collected");
             let _ = tx.blocking_send(Ok(Bytes::new()));
             return;
+        }
+        // Some VoIPmonitor archives store RTP chunks as LZO-compressed
+        // pcaps (prefixed with a 12-byte "LZO\x9a" + metadata header).
+        // Decompress those inline so merge_pcaps sees plain pcaps.
+        let mut lzo_decompressed = 0usize;
+        let blobs: Vec<Vec<u8>> = blobs
+            .into_iter()
+            .map(|mut blob| {
+                if is_voipmonitor_lzo(&blob) {
+                    match decompress_voipmonitor_lzo(&blob) {
+                        Ok(Some(dec)) => {
+                            lzo_decompressed += 1;
+                            blob = dec;
+                        }
+                        Ok(None) => {} // shouldn't happen, is_voipmonitor_lzo was true
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "LZO decompress failed; passing blob through"
+                            );
+                        }
+                    }
+                }
+                blob
+            })
+            .collect();
+        if lzo_decompressed > 0 {
+            tracing::info!(
+                lzo_decompressed,
+                "LZO-decompressed RTP chunks before pcap merge"
+            );
         }
         // Pick the first valid pcap header. Fall back to a synthetic
         // Ethernet/Little-Endian header if none of the blobs have one.
@@ -808,6 +840,38 @@ fn merge_pcaps(primary_header: &[u8; 24], blobs: &[&[u8]]) -> Vec<u8> {
 
 fn is_pcap_magic(magic: &[u8]) -> bool {
     magic.len() >= 4 && (magic == b"\xd4\xc3\xb2\xa1" || magic == b"\xa1\xb2\xc3\xd4")
+}
+
+/// Detect VoIPmonitor's LZO-compressed pcap variant: first 4 bytes are
+/// the marker `LZO\x9a` followed by 8 bytes of metadata, then raw LZO1X
+/// compressed data (which decompresses to a standard pcap).
+fn is_voipmonitor_lzo(magic: &[u8]) -> bool {
+    magic.len() >= 4 && &magic[..4] == b"LZO\x9a"
+}
+
+/// Decompress a VoIPmonitor LZO-compressed pcap blob. The input has a
+/// 12-byte custom header ("LZO\x9a" + 8 bytes of metadata) followed by
+/// raw LZO1X-compressed data. Output is a regular pcap (header + packets).
+///
+/// `Ok(None)` if the blob doesn't look LZO-compressed. `Err` only on
+/// malformed LZO data. The `lzo` crate needs the caller to provide an
+/// upper bound for the output; we use `2 * compressed.len()` which is
+/// well above LZO's worst-case expansion ratio (≈1.01× + a few bytes).
+fn decompress_voipmonitor_lzo(blob: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
+    if !is_voipmonitor_lzo(blob) {
+        return Ok(None);
+    }
+    if blob.len() < 12 {
+        return Ok(Some(Vec::new()));
+    }
+    let compressed = &blob[12..];
+    let upper = compressed.len().saturating_mul(2).max(64);
+    lzo::decompress(compressed, upper).map(Some).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("lzo: {e}"),
+        )
+    })
 }
 
 /// Parse a 12-byte tar size field. Handles:

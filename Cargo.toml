@@ -59,6 +59,9 @@ percent-encoding = "2"
 # PCAP streaming: zstd-decompress voipmonitor's tar.zst pcap archive.
 # (async-zip for batch download added in v0.2.1.)
 zstd = "0.13"
+# VoIPmonitor's RTP tar files store chunks as LZO-compressed pcap
+# (prefixed with a 12-byte custom header "LZO\x9a" + metadata).
+lzo = "0.1"
 
 # Streaming helpers for CSV / PCAP responses
 bytes = "1"
