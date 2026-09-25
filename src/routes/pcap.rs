@@ -887,10 +887,14 @@ fn decompress_voipmonitor_lzo(blob: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     let mut pos: usize = 3; // skip "LZO" prefix
     while pos + CHUNK_HEADER_LEN <= blob.len() {
-        let compress_size = u32::from_le_bytes(
+        // sChunkSizeInfo layout (from voipmonitor/sniffer
+        // tools_dynamic_buffer.h): { u32 size; u32 compress_size; }.
+        // So the FIRST u32 after the prefix is the uncompressed length
+        // and the SECOND u32 is how many compressed bytes follow.
+        let size = u32::from_le_bytes(
             blob[pos..pos + 4].try_into().unwrap(),
         ) as usize;
-        let size = u32::from_le_bytes(
+        let compress_size = u32::from_le_bytes(
             blob[pos + 4..pos + 8].try_into().unwrap(),
         ) as usize;
         let payload_start = pos + CHUNK_HEADER_LEN;
