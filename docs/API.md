@@ -273,27 +273,44 @@ curl -fsS -b cookies.txt $HOST/pcap/3407244 -o cdr-3407244.pcap
 wireshark cdr-3407244.pcap
 ```
 
-### `POST /pcap/batch`
+### `POST /pcap/batch` / `GET /pcap/batch`
 
 Zip up to 100 pcaps into one archive. Two modes — exactly one of
-`ids` or `filter` per request.
+`ids` or `filter` per request. Both POST (JSON body) and GET (query
+string) accept the same input shapes; POST is what the JS frontend
+uses, GET is what the no-JS `<noscript>` link and any `curl` /
+scripts / bookmarks hit.
 
 #### `ids` mode — per-row selection
 
-Request body:
+POST request body:
 
 ```json
 { "ids": [3407244, 3407245, 3407246] }
 ```
 
+GET query string (repeated `?ids=N` keys or comma-joined `?ids=1,2,3`
+both accepted):
+
+```
+?ids=3407244,3407245,3407246
+```
+
 Response: `application/zip`, one entry per CDR named `cdr-<id>.pcap`.
 
 ```bash
+# POST (JS frontend)
 curl -fsS -X POST $HOST/pcap/batch \
      -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' \
      -d '{"ids":[3407244,3407245,3407246]}' \
      -o pcaps.zip
+
+# GET (no-JS / curl / scripts) — same result
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+     "$HOST/pcap/batch?ids=3407244,3407245,3407246" \
+     -o pcaps.zip
+
 unzip -l pcaps.zip
 # → cdr-3407244.pcap
 # → cdr-3407245.pcap
@@ -310,22 +327,37 @@ Powers the **Download zip of all matching pcaps** button next to
 it parses the list-page query string and resolves it to all matching
 CDRs (capped at 100).
 
-Request body:
+POST request body:
 
 ```json
 { "filter": "from=2026-09-25T00:00&to=2026-09-25T23:59&mos_max=3.0&sip_code=4&sip_code=5" }
 ```
 
-`filter` is a raw `application/x-www-form-urlencoded` body without the
-leading `?`. The same field names accepted by `GET /` work here.
+GET query string (the value of `filter` itself needs to be URL-encoded):
+
+```
+?filter=from%3D2026-09-24T00%3A00%26to%3D2026-09-25T00%3A00%26mos_max%3D3.0
+```
+
+`filter` is a raw `application/x-www-form-urlencoded` body (or query
+value) without the leading `?`. The same field names accepted by
+`GET /` work here.
 
 ```bash
-# Every bad-MOS call in the last 24h, zipped
+# POST (JS frontend)
 curl -fsS -X POST $HOST/pcap/batch \
      -H "Authorization: Bearer $TOKEN" \
      -H 'Content-Type: application/json' \
      -d '{"filter":"from=2026-09-24T00:00&to=2026-09-25T00:00&mos_max=3.0"}' \
      -o bad-mos.zip
+
+# GET (no-JS / curl / scripts) — same result.
+# This is also exactly what the CDR list page's <noscript> fallback
+# link points at, so an operator can bookmark it.
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+     "$HOST/pcap/batch?filter=from%3D2026-09-24T00%3A00%26to%3D2026-09-25T00%3A00%26mos_max%3D3.0" \
+     -o bad-mos.zip
+
 unzip -l bad-mos.zip | head
 ```
 

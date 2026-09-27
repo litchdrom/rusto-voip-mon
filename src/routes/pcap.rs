@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use axum::{
     body::Body,
-    extract::{Path as AxPath, State},
+    extract::{Path as AxPath, RawQuery, State},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -582,18 +582,15 @@ pub struct BatchPcapRequest {
 
 /// Batch download — produce a zip of N pcaps, one entry per CDR.
 ///
-/// The flow:
-///   1. Validate `ids` (dedupe, drop zero, cap at `BATCH_MAX`).
-///   2. Spawn one async task per CDR. Each calls `build_pcap_bytes` and
-///      pushes `(cdr_id, Vec<u8>)` into a tokio mpsc.
-///   3. A `spawn_blocking` task pulls from that mpsc and writes a zip
-///      into a `Vec<u8>`. We use the sync `zip` crate inside the blocking
-///      worker because its std I/O API plays well with `tokio::sync::mpsc`'s
-///      `blocking_recv()`; async-zip's duplex-stream wiring is more code
-///      for no real win at this batch size.
-///   4. Once the zip is finalised, the buffer goes into the response body
-///      via another mpsc. Failures inside one CDR are logged and the
-///      entry is skipped — a single bad CDR doesn't fail the whole batch.
+/// Two routes share this code path:
+///   * `POST /pcap/batch` — JSON body, used by the JS frontend
+///   * `GET /pcap/batch`  — query-string, used by `<noscript>` links
+///     and the no-JS fallback in the CDR list template. Lets a no-JS
+///     user grab a zip of every CDR matching the current filter by
+///     just clicking a regular `<a href>`. Browser-friendly, bookmarkable.
+///
+/// Both routes call [`download_batch`] after parsing their respective
+/// inputs and run the same `can_pcap` gate.
 pub async fn download_batch(
     State(state): State<AppState>,
     user: SessionUser,
@@ -602,44 +599,100 @@ pub async fn download_batch(
     if !user.can_pcap {
         return Err(AppError::Forbidden);
     }
+    let cdr_ids = resolve_batch_ids(&state, &user, &req.ids, req.filter.as_deref()).await?;
+    build_batch_zip_response(state, cdr_ids).await
+}
 
-    // Resolve the request to a concrete CDR ID list. Two modes:
-    //   - explicit `ids`     — dedupe + drop zero, cap at BATCH_MAX
-    //   - filter query string — parse it the same way the CDR list page
-    //                           does, resolve via cdr::list_ids_matching,
-    //                           cap at BATCH_MAX
-    // Exactly one path runs; `ids` wins if both are present (the JS
-    // filter button always sends one OR the other, never both).
-    let mut cdr_ids: Vec<u64> = if !req.ids.is_empty() {
-        let mut seen = std::collections::HashSet::with_capacity(req.ids.len());
-        let mut out = Vec::with_capacity(req.ids.len());
-        for id in req.ids {
+/// GET variant — takes `?filter=<query string>` or `?ids=1,2,3` (repeated
+/// `?ids=N` keys also accepted) and produces the same zip as POST. Used by
+/// `<noscript>` links in the template so the "Download zip of all matching"
+/// feature still works without JS.
+pub async fn download_batch_get(
+    State(state): State<AppState>,
+    user: SessionUser,
+    raw_query: RawQuery,
+) -> AppResult<Response> {
+    if !user.can_pcap {
+        return Err(AppError::Forbidden);
+    }
+    let raw = raw_query.0.as_deref().unwrap_or("");
+    let (ids, filter) = parse_get_batch_params(raw);
+    let cdr_ids = resolve_batch_ids(&state, &user, &ids, filter.as_deref()).await?;
+    build_batch_zip_response(state, cdr_ids).await
+}
+
+/// Parse the GET-style query string into `(ids, filter)` for the batch
+/// endpoint. Accepts:
+///   * `?filter=<url-encoded CDR-list query string>` — same shape the
+///     filter form produces
+///   * `?ids=1,2,3` or repeated `?ids=1&ids=2&ids=3` — explicit CDR IDs
+/// Repeated `filter=` keys are joined with `&` (only the last one wins for
+/// the no-JS path; JS users always POST JSON with one of the two).
+fn parse_get_batch_params(raw: &str) -> (Vec<u64>, Option<String>) {
+    let raw = raw.trim_start_matches('?');
+    let mut ids: Vec<u64> = Vec::new();
+    let mut filter: Option<String> = None;
+    for pair in raw.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        let key = percent_encoding::percent_decode_str(k)
+            .decode_utf8_lossy()
+            .into_owned();
+        let value = percent_encoding::percent_decode_str(v)
+            .decode_utf8_lossy()
+            .into_owned();
+        match key.as_str() {
+            "filter" => filter = Some(value),
+            "ids" => {
+                // Accept both `ids=1,2,3` (single comma-joined key) and
+                // repeated `ids=1&ids=2` keys. Split on commas for the
+                // first form, parse each as u64.
+                for part in value.split(',') {
+                    if let Ok(n) = part.trim().parse::<u64>() {
+                        if n > 0 {
+                            ids.push(n);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    (ids, filter)
+}
+
+/// Resolve the request-level "what CDRs do you want?" question to a
+/// concrete, deduped, capped `Vec<u64>`. Shared between POST and GET.
+/// `ids` wins over `filter` if both are present.
+async fn resolve_batch_ids(
+    state: &AppState,
+    user: &SessionUser,
+    ids: &[u64],
+    filter: Option<&str>,
+) -> AppResult<Vec<u64>> {
+    let mut cdr_ids: Vec<u64> = if !ids.is_empty() {
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
             if id > 0 && seen.insert(id) {
                 out.push(id);
             }
         }
         out
-    } else if let Some(filter) = req.filter.as_deref() {
-        // Use the server's default TZ for "today/yesterday" calculations
-        // inside the filter — same as the CDR list page does. The
-        // per-request ?tz_offset_hours=... can override; we read it from
-        // the filter string itself.
+    } else if let Some(filter) = filter {
         let query_tz: Option<i8> = parse_tz_from_filter(filter);
-        let (tz, _) = state.resolve_tz(&user, query_tz);
+        let (tz, _) = state.resolve_tz(user, query_tz);
         cdr::ids_for_query_string(&state.pool, filter, tz, BATCH_MAX).await?
     } else {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            "request must include either `ids` or `filter`",
-        )
-            .into_response());
+        return Ok(Vec::new());
     };
     if cdr_ids.is_empty() {
-        return Ok((
-            StatusCode::BAD_REQUEST,
-            "filter resolved to zero CDRs",
-        )
-            .into_response());
+        return Ok(Vec::new());
     }
     if cdr_ids.len() > BATCH_MAX {
         tracing::warn!(
@@ -648,6 +701,32 @@ pub async fn download_batch(
             "filter matched more than BATCH_MAX; truncating"
         );
         cdr_ids.truncate(BATCH_MAX);
+    }
+    Ok(cdr_ids)
+}
+
+/// Shared zip builder: given a list of CDR IDs, produce the streaming
+/// zip response. The pipeline:
+///   1. Spawn one async task per CDR. Each calls `build_pcap_bytes` and
+///      pushes `(cdr_id, Vec<u8>)` into a tokio mpsc.
+///   2. A `spawn_blocking` task pulls from that mpsc and writes a zip
+///      into a `Vec<u8>`. We use the sync `zip` crate inside the blocking
+///      worker because its std I/O API plays well with `tokio::sync::mpsc`'s
+///      `blocking_recv()`; async-zip's duplex-stream wiring is more code
+///      for no real win at this batch size.
+///   3. Once the zip is finalised, the buffer goes into the response body
+///      via another mpsc. Failures inside one CDR are logged and the
+///      entry is skipped — a single bad CDR doesn't fail the whole batch.
+async fn build_batch_zip_response(
+    state: AppState,
+    cdr_ids: Vec<u64>,
+) -> AppResult<Response> {
+    if cdr_ids.is_empty() {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            "request must include either `ids` or `filter`",
+        )
+            .into_response());
     }
 
     let total = cdr_ids.len();
@@ -743,6 +822,9 @@ pub async fn download_batch(
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/zip")
+        // `private, no-store` so the browser doesn't cache the zip or
+        // any intermediate proxy try to share it across users.
+        .header(header::CACHE_CONTROL, "private, no-store")
         .header(
             header::CONTENT_DISPOSITION,
             "attachment; filename=\"pcaps.zip\"",
@@ -1249,6 +1331,49 @@ mod tests {
             let s = p.to_string_lossy().replace('\\', "/");
             assert!(s.ends_with(&format!("{variant}/{variant}_2026-09-21-14-35.tar.zst")), "got {s}");
         }
+    }
+
+    #[test]
+    fn parse_get_batch_ids_comma_joined() {
+        let (ids, filter) = parse_get_batch_params("ids=1,2,3");
+        assert_eq!(ids, vec![1, 2, 3]);
+        assert_eq!(filter, None);
+    }
+
+    #[test]
+    fn parse_get_batch_ids_repeated_keys() {
+        // Repeated ?ids=N&ids=M is the way the no-JS per-row form
+        // serialises checkbox values. Both forms should parse.
+        let (ids, _) = parse_get_batch_params("ids=10&ids=20&ids=30");
+        assert_eq!(ids, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn parse_get_batch_filter_only() {
+        let (ids, filter) = parse_get_batch_params(
+            "filter=from%3D2026-09-25T00%3A00%26to%3D2026-09-25T23%3A59",
+        );
+        assert!(ids.is_empty());
+        assert_eq!(
+            filter.as_deref(),
+            Some("from=2026-09-25T00:00&to=2026-09-25T23:59")
+        );
+    }
+
+    #[test]
+    fn parse_get_batch_drops_zero_and_invalid() {
+        // `ids=0` and `ids=abc` should be silently dropped (the URL
+        // contract is "list of positive integers"). Bad values must
+        // not crash the handler.
+        let (ids, _) = parse_get_batch_params("ids=0,1,abc,2,0");
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn parse_get_batch_empty_string() {
+        let (ids, filter) = parse_get_batch_params("");
+        assert!(ids.is_empty());
+        assert_eq!(filter, None);
     }
 
     /// Build a synthetic tar in memory containing one .pcap entry and

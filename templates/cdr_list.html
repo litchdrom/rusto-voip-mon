@@ -45,6 +45,22 @@
 {% endblock %}
 {% block content %}
 
+{# When JS is disabled the cross-page batch-selection machinery doesn't
+   run, so two of the action buttons are useless. A noscript banner +
+   noscript-only fallback link cover the same use cases (filter + zip the
+   result) without faking the per-row selection. The CSS hides it by
+   default and a `:has(noscript)` selector could re-show it, but that's
+   unreliable — the cleanest no-JS UX is just a plain <a href> wrapped
+   in <noscript>. #}
+<noscript>
+  <p class="muted small noscript-notice">
+    JavaScript is disabled. The per-row batch-selection and cross-page
+    selection won't work, but you can still filter, export CSV, and
+    download a zip of every CDR matching the current filter via the link
+    below.
+  </p>
+</noscript>
+
 <section class="page-header">
   <h1>Call Detail Records <span class="muted day-label">— {{ day_label }}</span></h1>
   <div class="actions">
@@ -53,11 +69,23 @@
             title="Select rows below, then click to download a single zip of pcaps.">
       Download zip of selected ({{ selected_count }})
     </button>
-    <button type="button" id="batch-pcap-all-btn" class="button"
+    {# JS path: serialises the form to a query string and POSTs JSON.
+       no-JS path: a plain <a href> to GET /pcap/batch?filter=...
+       (server accepts both shapes). Rendered as two siblings so the JS
+       button gets the click handler and the noscript one stays a link.
+       The no-JS URL is pre-built server-side as `pcap_zip_all_url` so we
+       don't need a url-encode + trim dance in askama. #}
+    <button type="button" id="batch-pcap-all-btn" class="button js-only"
             title="Bundle every CDR matching the current filter into one zip — no need to tick rows.">
       Download zip of all matching
     </button>
-    <button type="button" id="batch-pcap-clear" class="link-btn"
+    <noscript>
+      <a class="button" href="{{ pcap_zip_all_url }}"
+         title="Bundle every CDR matching the current filter into one zip — no need to tick rows.">
+        Download zip of all matching
+      </a>
+    </noscript>
+    <button type="button" id="batch-pcap-clear" class="link-btn js-only"
             title="Forget all ticked rows" hidden>Clear selection</button>
   </div>
 </section>

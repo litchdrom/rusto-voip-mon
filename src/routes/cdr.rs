@@ -33,6 +33,11 @@ pub struct CdrListTemplate {
     pub filters: FiltersView,
     pub distinct: DistinctView,
     pub export_url: String,
+    /// Same filter as `export_url`, aimed at GET /pcap/batch — used by
+    /// the <noscript> fallback link for "Download zip of all matching".
+    /// When no filter is set, this is just `/pcap/batch` (which the
+    /// server will 400 on, but the link is harmless and honest).
+    pub pcap_zip_all_url: String,
     pub next_url: String,
     pub prev_url: String,
     pub day_label: String,
@@ -307,6 +312,19 @@ pub async fn cdr_list(
 
     let view = FiltersView::from(&filters, tz);
     let export_url = format!("/cdr/export.csv{}", view.export_query());
+    // Same filter, different endpoint — the <noscript> fallback "Download
+    // zip of all matching" link. Built server-side so the template can
+    // emit a plain <a href="/pcap/batch?filter=..."> without trying to
+    // strip the leading `?` or url-encode in askama.
+    let pcap_zip_all_url = {
+        let qs = view.export_query();
+        let inner = qs.trim_start_matches('?');
+        if inner.is_empty() {
+            "/pcap/batch".to_string()
+        } else {
+            format!("/pcap/batch?filter={}", url_encode(inner))
+        }
+    };
 
     let has_prev = normalized.page > 1;
     let has_more = page.has_more;
@@ -340,6 +358,7 @@ pub async fn cdr_list(
         filters: view,
         distinct,
         export_url,
+        pcap_zip_all_url,
         next_url,
         prev_url,
         day_label,

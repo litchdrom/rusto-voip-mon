@@ -53,7 +53,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/cdr/export.csv", get(routes::cdr::cdr_export_csv))
         .route("/cdr/select", post(routes::login::select_cdrs))
         .route("/pcap/:cdr_id", get(routes::pcap::download_single))
-        .route("/pcap/batch", post(routes::pcap::download_batch))
+        // POST /pcap/batch  — JSON body, used by the JS frontend
+        // GET  /pcap/batch  — query string, used by <noscript> links and
+        //                     any no-JS client (curl, scripts, bookmarks)
+        .route(
+            "/pcap/batch",
+            post(routes::pcap::download_batch).get(routes::pcap::download_batch_get),
+        )
         .route("/auth/tokens", post(routes::auth::create_token).get(routes::auth::list_tokens))
         .route("/auth/tokens/:id", axum::routing::delete(routes::auth::revoke_token))
         .route("/tz", post(routes::login::set_tz))
