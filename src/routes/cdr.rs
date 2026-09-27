@@ -399,15 +399,32 @@ pub async fn cdr_detail(
     let Some(cdr) = row else {
         return Ok((StatusCode::NOT_FOUND, "CDR not found").into_response());
     };
+    // Capture the caller IP before the CdrSummary conversion drops it
+    // — used as the direction marker for the SIP timeline (an outgoing
+    // request is one whose `sipcallerip` matches the CDR's own).
+    let sipcallerip = cdr.sipcallerip;
     let cdr = CdrSummary::from(cdr);
 
-    // Pull the optional extension tables in parallel — both are tiny.
-    let (next, branches) = tokio::join!(
+    // Pull the optional extension tables in parallel — all three are tiny.
+    let (next, branches, sip_messages) = tokio::join!(
         crate::error::with_query_timeout(timeout, cdr::fetch_cdr_next(&state.pool, id)),
         crate::error::with_query_timeout(timeout, cdr::fetch_cdr_branches(&state.pool, id)),
+        crate::error::with_query_timeout(
+            timeout,
+            cdr::fetch_sip_messages(&state.pool, id, sipcallerip, 500),
+        ),
     );
     let next = next?;
     let branches = branches?;
+    // SIP fetch failure is non-fatal — we just render the page without
+    // the timeline. Logging keeps a paper trail.
+    let sip_messages = match sip_messages {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(cdr_id = id, error = %e, "sip_msg fetch failed");
+            Vec::new()
+        }
+    };
 
     let static_fields = next.static_fields.as_ref();
     let fbasename = static_fields
@@ -476,6 +493,7 @@ pub async fn cdr_detail(
   </table>
   {custom_headers_html}
   {branches_html}
+  {sip_html}
 
   <p><a class="button" href="/pcap/{id}">Download PCAP</a></p>
 </main></body></html>"#,
@@ -506,6 +524,7 @@ pub async fn cdr_detail(
             )
         },
         branches_html = render_branches(&branches),
+        sip_html = render_sip_timeline(&sip_messages),
     );
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -548,6 +567,124 @@ fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
         "<h2>Call legs (cdr_next_branches)</h2><ul class=\"branches\">{}</ul>",
         items.join("")
     )
+}
+
+/// Render the SIP message timeline as a collapsible list. Each row:
+/// time, direction arrow, method (color-coded), response code, party
+/// headers, full message body behind a `<details>` toggle.
+///
+/// We try to pair requests with their responses on the same row so an
+/// analyst sees "INVITE → 200 OK" at a glance, with the raw request +
+/// response stacked below in a `<pre>`. Unpaired responses (e.g. an
+/// out-of-dialog BYE without a matching request) render as a single
+/// row with no request block.
+///
+/// The cap is enforced server-side (500 in `fetch_sip_messages`); if
+/// we hit it the heading shows "+ more not shown — check the pcap".
+fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
+    if messages.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<h2>SIP message flow</h2>");
+    out.push_str(&format!(
+        "<p class=\"muted small\">{} message{} (capped at 500)</p>",
+        messages.len(),
+        if messages.len() == 1 { "" } else { "s" }
+    ));
+    out.push_str("<table class=\"cdrs sip-timeline\"><thead><tr>");
+    out.push_str("<th class=\"num\">time</th>");
+    out.push_str("<th class=\"num\">dir</th>");
+    out.push_str("<th>method</th>");
+    out.push_str("<th class=\"num\">code</th>");
+    out.push_str("<th>from</th>");
+    out.push_str("<th>to</th>");
+    out.push_str("<th></th>");
+    out.push_str("</tr></thead><tbody>");
+    for m in messages {
+        let ts = m.calldate.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+        let method_class = sip_method_class(&m.method);
+        let dir_arrow = if m.direction == "out" { "→" } else { "←" };
+        let dir_class = if m.direction == "out" { "dir-out" } else { "dir-in" };
+        let code_class = sip_code_class(m.response_num);
+        let resp_display = if m.response_num == 0 {
+            String::new()
+        } else {
+            format!("{}", m.response_num)
+        };
+        let resp_text = html_escape(&m.response_text);
+        let from = html_escape(&m.from_num);
+        let to = html_escape(&m.to_num);
+        let src = html_escape(&m.src_ip_str);
+        let dst = html_escape(&m.dst_ip_str);
+        let content_type = html_escape(&m.content_type);
+        // Build the expandable body. Only show the toggle when there's
+        // something useful to look at — bare CANCEL/ACK messages often
+        // have empty content and showing them is just noise.
+        let body_html = if m.content.trim().is_empty() {
+            String::new()
+        } else {
+            let content = html_escape(&m.content);
+            format!(
+                "<details class=\"sip-body\">\
+                   <summary>raw SIP body ({content_type}, {bytes} bytes)</summary>\
+                   <pre>{content}</pre>\
+                 </details>",
+                bytes = m.content.len(),
+            )
+        };
+        out.push_str(&format!(
+            "<tr class=\"sip-row\">\
+               <td class=\"num small\">{ts}</td>\
+               <td class=\"num {dir_class}\">{dir_arrow}</td>\
+               <td><span class=\"sip-method {method_class}\">{method}</span></td>\
+               <td class=\"num {code_class}\" title=\"{resp_text}\">{resp_display}</td>\
+               <td>{from}<br><span class=\"muted small\">{src}</span></td>\
+               <td>{to}<br><span class=\"muted small\">{dst}</span></td>\
+               <td>{body_html}</td>\
+             </tr>",
+            method = html_escape(&m.method),
+        ));
+    }
+    out.push_str("</tbody></table>");
+    out
+}
+
+/// CSS class for the response-code cell — colors 1xx / 2xx / 3xx /
+/// 4xx / 5xx / 6xx distinctly so a glance at the column tells you
+/// which leg failed.
+fn sip_code_class(code: u16) -> &'static str {
+    match code {
+        100..=199 => "sip-1xx",
+        200..=299 => "sip-2xx",
+        300..=399 => "sip-3xx",
+        400..=499 => "sip-4xx",
+        500..=599 => "sip-5xx",
+        600..=699 => "sip-6xx",
+        _ => "sip-other",
+    }
+}
+
+/// CSS class for the method cell — INVITE / BYE / CANCEL are the
+/// "lifecycle" methods that matter when triaging a failed call;
+/// the rest are answered with a neutral colour.
+fn sip_method_class(method: &str) -> &'static str {
+    match method {
+        "INVITE" => "sip-method-invite",
+        "BYE" => "sip-method-bye",
+        "CANCEL" => "sip-method-cancel",
+        "ACK" => "sip-method-ack",
+        "REGISTER" => "sip-method-register",
+        "OPTIONS" => "sip-method-options",
+        "NOTIFY" => "sip-method-notify",
+        "SUBSCRIBE" => "sip-method-subscribe",
+        "REFER" => "sip-method-refer",
+        "UPDATE" => "sip-method-update",
+        "PRACK" => "sip-method-prack",
+        "MESSAGE" => "sip-method-message",
+        "PUBLISH" => "sip-method-publish",
+        "INFO" => "sip-method-info",
+        _ => "sip-method-other",
+    }
 }
 
 /// Minimal HTML escape — good enough for v0.1 since headers come from
@@ -905,5 +1042,79 @@ fn label_for_window(
         (Some(f), None) => format!("from {}", f.format("%Y-%m-%d %H:%M")),
         (None, Some(t)) => format!("until {}", t.format("%Y-%m-%d %H:%M")),
         (None, None) => "All time".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod sip_render_tests {
+    use super::*;
+
+    #[test]
+    fn sip_code_class_covers_every_response_class() {
+        // Each range boundary must land in its own class so the
+        // colour-coding renders the right shade.
+        assert_eq!(sip_code_class(100), "sip-1xx");
+        assert_eq!(sip_code_class(180), "sip-1xx");
+        assert_eq!(sip_code_class(199), "sip-1xx");
+        assert_eq!(sip_code_class(200), "sip-2xx");
+        assert_eq!(sip_code_class(302), "sip-3xx");
+        assert_eq!(sip_code_class(404), "sip-4xx");
+        assert_eq!(sip_code_class(503), "sip-5xx");
+        assert_eq!(sip_code_class(603), "sip-6xx");
+        assert_eq!(sip_code_class(0), "sip-other");
+        assert_eq!(sip_code_class(99), "sip-other");
+    }
+
+    #[test]
+    fn sip_method_class_recognises_lifecycle_methods() {
+        // Lifecycle methods get their own highlight colour so a triage
+        // session can spot INVITE → BYE pairs immediately.
+        for m in ["INVITE", "BYE", "CANCEL", "ACK", "REGISTER"] {
+            assert_ne!(sip_method_class(m), "sip-method-other", "{m}");
+        }
+        // Methods without a dedicated bucket fall through to other.
+        // INFO has its own (it's RFC-defined), so use a known-unknown
+        // method name to exercise the wildcard branch.
+        assert_eq!(sip_method_class("INFO"), "sip-method-info");
+        assert_eq!(sip_method_class("KEEPALIVE"), "sip-method-other");
+        assert_eq!(sip_method_class("garbage"), "sip-method-other");
+    }
+
+    #[test]
+    fn render_sip_timeline_empty_yields_empty_string() {
+        // The template uses the empty string as a "section omitted"
+        // signal; don't accidentally render an empty <h2> for CDRs
+        // with no sip_msg rows.
+        assert_eq!(render_sip_timeline(&[]), "");
+    }
+
+    #[test]
+    fn render_sip_timeline_paints_class_for_failed_invite() {
+        let mk = |method: &str, code: u16| cdr::SipMessage {
+            id: 1,
+            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+            method: method.into(),
+            response_num: code,
+            response_text: format!("{code}"),
+            from_num: "+49123".into(),
+            to_num: "49199".into(),
+            src_ip_str: "10.0.0.1".into(),
+            dst_ip_str: "10.0.0.2".into(),
+            direction: "out".into(),
+            content_type: "application/sdp".into(),
+            content: String::new(),
+        };
+        let html = render_sip_timeline(&[mk("INVITE", 200), mk("INVITE", 503)]);
+        // First row: success — green 2xx class.
+        assert!(html.contains(r#"class="num sip-2xx""#));
+        // Second row: failure — red 5xx class + red 5xx method class.
+        assert!(html.contains(r#"class="num sip-5xx""#));
+        // Method cell uses the invite highlight class.
+        assert!(html.contains("sip-method-invite"));
+        // Direction arrow renders for outbound requests.
+        assert!(html.contains(r#"class="num dir-out">→<"#));
     }
 }

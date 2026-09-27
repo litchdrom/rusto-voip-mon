@@ -424,3 +424,66 @@ button.loading::after {
   to   { opacity: 1; transform: none; }
 }
 main.content { animation: fade-in 200ms ease-out; }
+
+/* SIP message timeline (CDR detail page).
+   Direction arrow + colour-coded method + colour-coded response code
+   lets an analyst scan a long call's messages at a glance: any red
+   4xx/5xx in the code column is the failing leg. */
+table.sip-timeline {
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+  font-size: 12px;
+}
+table.sip-timeline td {
+  vertical-align: top;
+  padding: 6px 8px;
+}
+table.sip-timeline .sip-row:hover {
+  background: var(--bg-elev-2);
+}
+.dir-out { color: var(--accent); }
+.dir-in  { color: var(--fg-muted); }
+.sip-method {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  background: var(--bg-elev-2);
+  color: var(--fg);
+}
+.sip-method-invite,
+.sip-method-bye,
+.sip-method-cancel,
+.sip-method-ack,
+.sip-method-register { background: rgba(74, 158, 255, 0.18); color: var(--accent); }
+.sip-method-1xx { color: var(--fg-muted); }
+.sip-1xx { color: var(--fg-muted); }
+.sip-2xx { color: #4ade80; font-weight: 600; }
+.sip-3xx { color: #fbbf24; }
+.sip-4xx { color: #fb923c; font-weight: 600; }
+.sip-5xx,
+.sip-6xx { color: #f87171; font-weight: 600; }
+.sip-other { color: var(--fg-muted); }
+.sip-body {
+  margin-top: 4px;
+}
+.sip-body summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 11px;
+  user-select: none;
+}
+.sip-body pre {
+  margin: 4px 0 0;
+  padding: 8px 10px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.4;
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

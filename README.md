@@ -26,7 +26,8 @@ An open-source web GUI for [VoIPmonitor](https://www.voipmonitor.org/), written 
   - Multi-page selection ("tick CDRs on pages 1–3, then download all in
     one zip"), per-operator TZ override, CSV export, distinct-value dropdowns
 - **CDR detail** (`GET /cdr/:id`) — basic fields, `cdr_next` extension,
-  call-leg table; SIP message flow deferred to a later version
+  call-leg table, SIP message timeline (colour-coded method + response
+  code, direction arrow, raw SIP body behind a per-row toggle)
 - **PCAP download**
   - `GET /pcap/:cdr_id` — single merged SIP + RTP pcap, streamed
     byte-for-byte from the minute's `tar.zst` (no full-archive load),
@@ -167,7 +168,6 @@ docker-compose.yml  # example wiring against existing voipmonitor host
   - Brand-glow logo baked into the SVG for dark-theme legibility
   - Admin override (`is_admin` implies all per-feature permissions)
 - **Next**
-  - SIP message flow on the CDR detail page (deferred from v0.2)
   - MOS timeline + RTP stats chart on CDR detail
   - Optional `<noscript>` apply-button polish
 - **Later**

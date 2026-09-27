@@ -805,6 +805,125 @@ pub async fn fetch_cdr_branches(
     .await
 }
 
+/// One row in the SIP message timeline.
+///
+/// VoIPmonitor's `sip_msg` table holds every SIP request + response
+/// that traversed the sensor during a call. For a normal successful
+/// INVITE you'd see ~7-10 rows: INVITE → 100 → 180 → 200 → ACK → (media
+/// pass) → BYE → 200. A failed call typically adds more (487, 503,
+/// re-INVITEs). We fetch the columns needed for the timeline; the
+/// full SIP body lives in `content` and is rendered on demand
+/// (collapsed by default — a typical call generates ~10 KB of raw SIP).
+///
+/// `src_ip_str` / `dst_ip_str` are the dotted-IPv4 forms of the
+/// `sipcallerip` / `sipcalledip` numeric columns; pre-formatted here
+/// so the template doesn't need to call into the integer-to-IP helper.
+#[derive(Debug, Clone, Serialize)]
+pub struct SipMessage {
+    pub id: u64,
+    pub calldate: NaiveDateTime,
+    pub method: String,
+    pub response_num: u16,
+    pub response_text: String,
+    pub from_num: String,
+    pub to_num: String,
+    pub src_ip_str: String,
+    pub dst_ip_str: String,
+    /// Direction: "out" if this sensor initiated the request, "in" if it
+    /// received it. Computed by comparing `sipcallerip` against the CDR's
+    /// own `sipcallerip` — same direction as the CDR's primary leg.
+    pub direction: String,
+    pub content_type: String,
+    /// Raw SIP message body. Can be empty for some messages (e.g. an
+    /// ACK with no body). The template decides whether to inline-show
+    /// it or keep it behind a toggle.
+    pub content: String,
+}
+
+/// Fetch all SIP messages for one CDR, oldest first.
+///
+/// `sip_msg.cdr_ID` is the join column. The schema has an index on it
+/// (VoIPmonitor creates one during install) so this is a cheap
+/// range-scan + sort-by-calldate. We cap the row count at 500 — beyond
+/// that the page becomes a wall of SIP and the operator is usually
+/// staring at a SIP loop attack; the cap keeps the page responsive and
+/// the log line flags when we hit it.
+pub async fn fetch_sip_messages(
+    pool: &MySqlPool,
+    cdr_id: u64,
+    direction_marker_ip: Option<u32>,
+    limit: u32,
+) -> Result<Vec<SipMessage>, sqlx::Error> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT ID AS id, calldate, method, \
+                sip_response_num AS response_num, \
+                sip_response AS response_text, \
+                from_num, to_num, sipcallerip, sipcalledip, \
+                content_type, content \
+           FROM sip_msg \
+          WHERE cdr_ID = ? \
+          ORDER BY calldate ASC, ID ASC \
+          LIMIT ?",
+    )
+    .bind(cdr_id)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let src_ip_int: Option<u32> = row.try_get("sipcallerip").ok().flatten();
+        let dst_ip_int: Option<u32> = row.try_get("sipcalledip").ok().flatten();
+        let src_ip_str = src_ip_int
+            .map(int_to_ipv4)
+            .unwrap_or_default();
+        let dst_ip_str = dst_ip_int
+            .map(int_to_ipv4)
+            .unwrap_or_default();
+        // Direction heuristic: a request is "out" if the sensor's
+        // known direction-marker IP (the CDR's `sipcallerip`) is the
+        // source of THIS message. Falls back to "in" if we have no
+        // marker — better than guessing wrong with empty data.
+        let direction = match (direction_marker_ip, src_ip_int) {
+            (Some(marker), Some(src)) if src == marker => "out".to_string(),
+            _ => "in".to_string(),
+        };
+        // Older VoIPmonitor installs store the numeric response code
+        // in `sip_response` (e.g. "200") and leave `sip_response_num`
+        // NULL; newer installs split them. Fall back gracefully.
+        let response_num: u16 = row
+            .try_get::<Option<i32>, _>("response_num")
+            .ok()
+            .flatten()
+            .and_then(|n| u16::try_from(n).ok())
+            .or_else(|| {
+                row.try_get::<Option<String>, _>("response_text")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
+            })
+            .unwrap_or(0);
+        out.push(SipMessage {
+            id: row.try_get::<i64, _>("id").map(|n| n as u64).unwrap_or(0),
+            calldate: row
+                .try_get::<NaiveDateTime, _>("calldate")
+                .unwrap_or_else(|_| Utc::now().naive_utc()),
+            method: row.try_get::<String, _>("method").unwrap_or_default(),
+            response_num,
+            response_text: row.try_get::<String, _>("response_text").unwrap_or_default(),
+            from_num: row.try_get::<String, _>("from_num").unwrap_or_default(),
+            to_num: row.try_get::<String, _>("to_num").unwrap_or_default(),
+            src_ip_str,
+            dst_ip_str,
+            direction,
+            content_type: row.try_get::<String, _>("content_type").unwrap_or_default(),
+            content: row.try_get::<String, _>("content").unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
 /// Distinct values from the last N days, used to populate the filter
 /// `<datalist>` pickers so users can choose from observed values OR type
 /// custom ones (the text input + datalist combo).
