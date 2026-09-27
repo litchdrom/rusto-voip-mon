@@ -81,11 +81,22 @@ pub type AppResult<T> = Result<T, AppError>;
 /// dropped, which releases any pool slot it was holding. Generic over
 /// the future's error so it composes with both raw `sqlx::Error` futures
 /// and helpers that already wrap them in `AppError`.
+///
+/// **A timeout of `0` disables the cap.** Without this branch,
+/// `tokio::time::timeout(Duration::from_secs(0), …)` returns `Elapsed`
+/// on the first poll, so `with_query_timeout(0, fut)` would *always*
+/// 504 regardless of `fut`'s actual progress. The two places that pass
+/// `0` deliberately (`cdr::ids_for_query_string`) want unbounded
+/// execution so a user can fire a "download every matching CDR" job
+/// without being raced by a 30s cap.
 pub async fn with_query_timeout<F, T, E>(secs: u64, fut: F) -> AppResult<T>
 where
     F: std::future::Future<Output = Result<T, E>>,
     AppError: From<E>,
 {
+    if secs == 0 {
+        return fut.await.map_err(AppError::from);
+    }
     match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
         Ok(r) => Ok(r?),
         Err(_) => Err(AppError::QueryTimeout(secs)),

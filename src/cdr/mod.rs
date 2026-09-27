@@ -594,6 +594,52 @@ pub async fn list_ids_matching(
     q.fetch_all(pool).await
 }
 
+/// Fetch CDR summary rows by explicit ID list, returning a map keyed by
+/// ID so the caller can look up each row in any order. Used by the batch
+/// pcap endpoint to build the `cdrs.csv` metadata sidecar that goes into
+/// the same zip as the `cdr-<id>.pcap` files.
+///
+/// Empty / duplicate / zero IDs in `ids` are silently dropped (matching
+/// the rest of the batch pipeline). IDs that don't exist in the DB
+/// simply don't appear in the returned map.
+pub async fn fetch_by_ids(
+    pool: &MySqlPool,
+    ids: &[u64],
+) -> Result<std::collections::HashMap<u64, CdrSummary>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    let mut clean: Vec<u64> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if id > 0 && seen.insert(id) {
+            clean.push(id);
+        }
+    }
+    if clean.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let sql = format!(
+        "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
+                caller, callername, called, sipcallerip, sipcalledip, \
+                lastSIPresponseNum AS `last_sip_response_num`, \
+                mos_min_mult10, a_lost, b_lost, id_sensor \
+           FROM cdr WHERE ID IN ({})",
+        placeholders(clean.len())
+    );
+    let mut q = sqlx::query_as::<_, CdrRow>(&sql);
+    for id in &clean {
+        q = q.bind(*id);
+    }
+    let rows = q.fetch_all(pool).await?;
+    let mut out = std::collections::HashMap::with_capacity(rows.len());
+    for row in rows {
+        let s = CdrSummary::from(row);
+        out.insert(s.id, s);
+    }
+    Ok(out)
+}
+
 // Re-exports the per-request helper types from `routes::cdr` so other
 // modules can build a `NormalizedFilters` from a raw query string without
 // reaching across the route layer. We can't move them into `cdr::mod`

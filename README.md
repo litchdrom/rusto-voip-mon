@@ -31,9 +31,11 @@ An open-source web GUI for [VoIPmonitor](https://www.voipmonitor.org/), written 
   - `GET /pcap/:cdr_id` — single merged SIP + RTP pcap, streamed
     byte-for-byte from the minute's `tar.zst` (no full-archive load),
     VoIPmonitor's per-call LZO format decoded inline
-  - `POST /pcap/batch` — up to 100 pcaps zipped in one request; either
-    `{"ids": […]}` or `{"filter": "<query-string>"}` to grab every CDR
-    matching the on-page filter
+  - `POST /pcap/batch` + `GET /pcap/batch?filter=...` — up to 100 pcaps
+    zipped in one request; the zip carries a `cdrs.csv` sidecar with
+    per-CDR metadata + a timezone note so the archive is self-
+    documenting. GET form is the no-JS / `curl` / bookmark path; POST
+    form is what the JS frontend uses.
 - **Full HTTP API** documented in [`docs/API.md`](docs/API.md) — one curl
   example per endpoint, status-code table, "zero to API call" quickstart
 

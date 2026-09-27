@@ -296,7 +296,15 @@ both accepted):
 ?ids=3407244,3407245,3407246
 ```
 
-Response: `application/zip`, one entry per CDR named `cdr-<id>.pcap`.
+Response: `application/zip`. Contents:
+
+- `cdrs.csv` — one row per CDR (id, calldate, callend, duration, caller,
+  called, src_ip, dst_ip, last_sip, mos, id_sensor) with a two-line
+  `# rusto-voip-mon` header explaining the timezone the timestamps are
+  rendered in (the operator's resolved TZ — session override → server
+  default). Lets a downstream analyst correlate each `cdr-<id>.pcap`
+  back to who-called-whom without trawling the GUI.
+- One `cdr-<id>.pcap` per CDR.
 
 ```bash
 # POST (JS frontend)

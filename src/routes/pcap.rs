@@ -599,8 +599,9 @@ pub async fn download_batch(
     if !user.can_pcap {
         return Err(AppError::Forbidden);
     }
-    let cdr_ids = resolve_batch_ids(&state, &user, &req.ids, req.filter.as_deref()).await?;
-    build_batch_zip_response(state, cdr_ids).await
+    let (cdr_ids, tz) =
+        resolve_batch_ids(&state, &user, &req.ids, req.filter.as_deref()).await?;
+    build_batch_zip_response(state, cdr_ids, tz).await
 }
 
 /// GET variant — takes `?filter=<query string>` or `?ids=1,2,3` (repeated
@@ -617,8 +618,9 @@ pub async fn download_batch_get(
     }
     let raw = raw_query.0.as_deref().unwrap_or("");
     let (ids, filter) = parse_get_batch_params(raw);
-    let cdr_ids = resolve_batch_ids(&state, &user, &ids, filter.as_deref()).await?;
-    build_batch_zip_response(state, cdr_ids).await
+    let (cdr_ids, tz) =
+        resolve_batch_ids(&state, &user, &ids, filter.as_deref()).await?;
+    build_batch_zip_response(state, cdr_ids, tz).await
 }
 
 /// Parse the GET-style query string into `(ids, filter)` for the batch
@@ -667,14 +669,17 @@ fn parse_get_batch_params(raw: &str) -> (Vec<u64>, Option<String>) {
 }
 
 /// Resolve the request-level "what CDRs do you want?" question to a
-/// concrete, deduped, capped `Vec<u64>`. Shared between POST and GET.
-/// `ids` wins over `filter` if both are present.
+/// concrete, deduped, capped `Vec<u64>` + the operator's resolved
+/// timezone. Shared between POST and GET. `ids` wins over `filter` if
+/// both are present. The returned `(cdr_ids, tz)` tuple is what the
+/// zip builder needs to (a) fetch the right CDR rows for the metadata
+/// CSV and (b) format their `calldate` in the operator's wall clock.
 async fn resolve_batch_ids(
     state: &AppState,
     user: &SessionUser,
     ids: &[u64],
     filter: Option<&str>,
-) -> AppResult<Vec<u64>> {
+) -> AppResult<(Vec<u64>, chrono::FixedOffset)> {
     let mut cdr_ids: Vec<u64> = if !ids.is_empty() {
         let mut seen = std::collections::HashSet::with_capacity(ids.len());
         let mut out = Vec::with_capacity(ids.len());
@@ -689,10 +694,10 @@ async fn resolve_batch_ids(
         let (tz, _) = state.resolve_tz(user, query_tz);
         cdr::ids_for_query_string(&state.pool, filter, tz, BATCH_MAX).await?
     } else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), state.config.tz()));
     };
     if cdr_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), state.config.tz()));
     }
     if cdr_ids.len() > BATCH_MAX {
         tracing::warn!(
@@ -702,24 +707,36 @@ async fn resolve_batch_ids(
         );
         cdr_ids.truncate(BATCH_MAX);
     }
-    Ok(cdr_ids)
+    // For the `ids` path we didn't go through resolve_tz; default to
+    // the user's session TZ (or server default). Per-request overrides
+    // don't apply when the caller sent explicit IDs.
+    let tz = if filter.is_some() {
+        let query_tz = filter.and_then(parse_tz_from_filter);
+        state.resolve_tz(user, query_tz).0
+    } else {
+        state.resolve_tz(user, None).0
+    };
+    Ok((cdr_ids, tz))
 }
 
 /// Shared zip builder: given a list of CDR IDs, produce the streaming
 /// zip response. The pipeline:
-///   1. Spawn one async task per CDR. Each calls `build_pcap_bytes` and
+///   1. Fetch CDR metadata for the IDs (one SQL roundtrip) so we can
+///      embed a `cdrs.csv` sidecar inside the zip alongside the pcaps.
+///   2. Spawn one async task per CDR. Each calls `build_pcap_bytes` and
 ///      pushes `(cdr_id, Vec<u8>)` into a tokio mpsc.
-///   2. A `spawn_blocking` task pulls from that mpsc and writes a zip
+///   3. A `spawn_blocking` task pulls from that mpsc and writes a zip
 ///      into a `Vec<u8>`. We use the sync `zip` crate inside the blocking
 ///      worker because its std I/O API plays well with `tokio::sync::mpsc`'s
 ///      `blocking_recv()`; async-zip's duplex-stream wiring is more code
 ///      for no real win at this batch size.
-///   3. Once the zip is finalised, the buffer goes into the response body
+///   4. Once the zip is finalised, the buffer goes into the response body
 ///      via another mpsc. Failures inside one CDR are logged and the
 ///      entry is skipped — a single bad CDR doesn't fail the whole batch.
 async fn build_batch_zip_response(
     state: AppState,
     cdr_ids: Vec<u64>,
+    tz: chrono::FixedOffset,
 ) -> AppResult<Response> {
     if cdr_ids.is_empty() {
         return Ok((
@@ -731,6 +748,19 @@ async fn build_batch_zip_response(
 
     let total = cdr_ids.len();
     tracing::info!(count = total, "batch pcap download requested");
+
+    // One roundtrip for the metadata sidecar. Failure here is non-fatal
+    // (we'd rather ship the pcaps without the CSV than 500 the whole
+    // batch) — log + continue with an empty map.
+    let metadata: std::collections::HashMap<u64, cdr::CdrSummary> =
+        match cdr::fetch_by_ids(&state.pool, &cdr_ids).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(error = %e, "batch zip: metadata fetch failed; continuing without cdrs.csv");
+                std::collections::HashMap::new()
+            }
+        };
+    let csv_bytes = build_cdrs_csv(&metadata, &cdr_ids, tz);
 
     // Async pipeline: each CDR builds its bytes concurrently.
     let (pcap_tx, mut pcap_rx) =
@@ -767,6 +797,19 @@ async fn build_batch_zip_response(
             let options = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
                 .compression_level(Some(1));
+
+            // Write the metadata sidecar first so it sorts to the top
+            // in every zip viewer. Without the sidecar the archive is a
+            // bag of opaque filenames — the CSV lets a Wireshark user
+            // jump from a captured packet's SIP/RTP call-id back to
+            // who-called-whom without trawling the GUI.
+            if !csv_bytes.is_empty() {
+                if let Err(e) = zip.start_file("cdrs.csv", options) {
+                    tracing::error!(error = %e, "batch zip: cdrs.csv start_file failed");
+                } else if let Err(e) = zip.write_all(&csv_bytes) {
+                    tracing::error!(error = %e, "batch zip: cdrs.csv write_all failed");
+                }
+            }
 
             while let Some((cdr_id, result)) = pcap_rx.blocking_recv() {
                 match result {
@@ -831,6 +874,97 @@ async fn build_batch_zip_response(
         )
         .body(body)
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
+/// Build the `cdrs.csv` sidecar that lives next to the per-CDR pcaps
+/// inside the batch zip. Output order matches `cdr_ids` so each CSV
+/// row lines up with the corresponding `cdr-<id>.pcap`. Rows whose ID
+/// wasn't found in the metadata fetch (DB row deleted between the ID
+/// resolve and this fetch, for example) are rendered with empty fields
+/// and a `(metadata missing)` marker.
+///
+/// The TZ note at the top is the load-bearing piece for downstream
+/// consumers: without it, an analyst opening the CSV in a different
+/// timezone has no way to know whether `2026-09-25 14:30:00` is local
+/// wall clock or UTC. We render timestamps in the operator's resolved
+/// TZ (their session override, or the server default) and call it out
+/// explicitly.
+fn build_cdrs_csv(
+    metadata: &std::collections::HashMap<u64, cdr::CdrSummary>,
+    cdr_ids: &[u64],
+    tz: chrono::FixedOffset,
+) -> Vec<u8> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let offset_secs = tz.local_minus_utc();
+    let tz_label = if offset_secs == 0 {
+        "UTC".to_string()
+    } else {
+        let h = offset_secs / 3600;
+        let m = (offset_secs.abs() % 3600) / 60;
+        if m == 0 {
+            format!("UTC{h:+}")
+        } else {
+            format!("UTC{h:+}:{m:02}")
+        }
+    };
+    // Two leading comment lines so Excel / LibreOffice / pandas / shell
+    // all treat the file as a regular CSV after `tail -n +3`.
+    let _ = writeln!(
+        out,
+        "# rusto-voip-mon batch export — timestamps in {tz_label} (operator TZ)"
+    );
+    let _ = writeln!(
+        out,
+        "# original UTC = local - {:+}; to convert: SUBTRACT the offset",
+        offset_secs / 3600
+    );
+    let _ = writeln!(
+        out,
+        "id,calldate,callend,duration_sec,caller,called,src_ip,dst_ip,last_sip,mos,id_sensor"
+    );
+    for &cdr_id in cdr_ids {
+        let row = match metadata.get(&cdr_id) {
+            Some(s) => s,
+            None => {
+                let _ = writeln!(
+                    out,
+                    "{cdr_id},,,,,,,,,(metadata missing)"
+                );
+                continue;
+            }
+        };
+        let calldate = row.calldate.format("%Y-%m-%d %H:%M:%S").to_string();
+        let callend = row.callend.format("%Y-%m-%d %H:%M:%S").to_string();
+        let _ = writeln!(
+            out,
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            row.id,
+            calldate,
+            callend,
+            row.duration.unwrap_or(0),
+            csv_escape(&row.caller),
+            csv_escape(&row.called),
+            row.src_ip_str,
+            row.dst_ip_str,
+            row.last_sip_response_num.unwrap_or(0),
+            if row.mos_str.is_empty() { String::new() } else { row.mos_str.clone() },
+            row.id_sensor.unwrap_or(0),
+        );
+    }
+    out.into_bytes()
+}
+
+/// RFC-4180-ish escape: wrap in double-quotes if the field contains a
+/// comma / quote / newline; double-up any embedded quotes. Same shape
+/// as the CSV exporter's `csv_field` helper.
+fn csv_escape(s: &Option<String>) -> String {
+    let Some(v) = s else { return String::new() };
+    if v.contains(',') || v.contains('"') || v.contains('\n') {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.clone()
+    }
 }
 
 /// Pull the optional `tz_offset_hours` out of a raw CDR-list query string.
@@ -1374,6 +1508,138 @@ mod tests {
         let (ids, filter) = parse_get_batch_params("");
         assert!(ids.is_empty());
         assert_eq!(filter, None);
+    }
+
+    #[test]
+    fn cdrs_csv_renders_header_with_tz_note() {
+        use std::collections::HashMap;
+        let mut metadata: HashMap<u64, cdr::CdrSummary> = HashMap::new();
+        // Synthetic metadata — none of the database fields are required
+        // to be real here, we're just exercising the CSV rendering path.
+        let utc = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
+        let row = cdr::CdrSummary {
+            id: 42,
+            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+            callend: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                .unwrap()
+                .and_hms_opt(14, 31, 5)
+                .unwrap(),
+            duration: Some(65),
+            connect_duration: Some(60),
+            caller: Some("+49123".into()),
+            callername: None,
+            called: Some("49199".into()),
+            src_ip_str: "10.0.0.1".into(),
+            dst_ip_str: "10.0.0.2".into(),
+            last_sip_response_num: Some(200),
+            mos_str: "4.2".into(),
+            a_lost: Some(0),
+            b_lost: Some(0),
+            id_sensor: Some(1),
+        };
+        metadata.insert(42, row);
+        let csv = build_cdrs_csv(&metadata, &[42], utc);
+        let text = std::str::from_utf8(&csv).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // First two lines are the TZ note, third is the column header.
+        assert!(lines[0].starts_with("# rusto-voip-mon batch export"));
+        assert!(lines[0].contains("UTC+7"));
+        assert!(lines[1].contains("UTC"));
+        assert_eq!(
+            lines[2],
+            "id,calldate,callend,duration_sec,caller,called,src_ip,dst_ip,last_sip,mos,id_sensor"
+        );
+        // The data row uses the operator's TZ for timestamps.
+        assert!(text.contains("42,2026-09-25 14:30:00,2026-09-25 14:31:05,65,+49123,49199,10.0.0.1,10.0.0.2,200,4.2,1"));
+    }
+
+    #[test]
+    fn cdrs_csv_preserves_input_order() {
+        use std::collections::HashMap;
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let mk = |id: u64| cdr::CdrSummary {
+            id,
+            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            callend: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                .unwrap()
+                .and_hms_opt(0, 1, 0)
+                .unwrap(),
+            duration: None,
+            connect_duration: None,
+            caller: None,
+            callername: None,
+            called: None,
+            src_ip_str: String::new(),
+            dst_ip_str: String::new(),
+            last_sip_response_num: None,
+            mos_str: String::new(),
+            a_lost: None,
+            b_lost: None,
+            id_sensor: None,
+        };
+        let mut metadata = HashMap::new();
+        metadata.insert(1, mk(1));
+        metadata.insert(2, mk(2));
+        metadata.insert(3, mk(3));
+        // Order in the output must match the input cdr_ids, not the
+        // HashMap iteration order (HashMap is non-deterministic).
+        let csv = build_cdrs_csv(&metadata, &[3, 1, 2], utc);
+        let text = std::str::from_utf8(&csv).unwrap();
+        let data_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.starts_with("id,"))
+            .collect();
+        assert_eq!(
+            data_lines,
+            vec![
+                "3,2026-09-25 00:00:00,2026-09-25 00:01:00,0,,,,,0,,0",
+                "1,2026-09-25 00:00:00,2026-09-25 00:01:00,0,,,,,0,,0",
+                "2,2026-09-25 00:00:00,2026-09-25 00:01:00,0,,,,,0,,0",
+            ]
+        );
+    }
+
+    #[test]
+    fn cdrs_csv_marker_for_missing_metadata() {
+        // If a CDR ID was resolved by the batch pipeline but the row
+        // disappeared from the DB between resolve and metadata-fetch,
+        // the sidecar should still have a row for it (so the count
+        // matches the zip's pcap count) but flag it as missing.
+        use std::collections::HashMap;
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
+        let metadata: HashMap<u64, cdr::CdrSummary> = HashMap::new();
+        let csv = build_cdrs_csv(&metadata, &[99], utc);
+        let text = std::str::from_utf8(&csv).unwrap();
+        assert!(text.contains("99,,,,,,,,,(metadata missing)"));
+    }
+
+    #[test]
+    fn csv_escape_quotes_commas_and_newlines() {
+        // Field with a comma needs quoting.
+        assert_eq!(
+            csv_escape(&Some("a,b".into())),
+            "\"a,b\""
+        );
+        // Embedded quote is doubled.
+        assert_eq!(
+            csv_escape(&Some("she said \"hi\"".into())),
+            "\"she said \"\"hi\"\"\""
+        );
+        // Newline → quoted.
+        assert_eq!(
+            csv_escape(&Some("line1\nline2".into())),
+            "\"line1\nline2\""
+        );
+        // Plain text passes through.
+        assert_eq!(csv_escape(&Some("plain".into())), "plain");
+        // None → empty.
+        assert_eq!(csv_escape(&None), "");
     }
 
     /// Build a synthetic tar in memory containing one .pcap entry and
