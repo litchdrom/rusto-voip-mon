@@ -417,11 +417,14 @@ pub async fn cdr_detail(
     let next = next?;
     let branches = branches?;
     // SIP fetch failure is non-fatal — we just render the page without
-    // the timeline. Logging keeps a paper trail.
+    // the timeline. Logging uses Debug (not Display) so the underlying
+    // sqlx DatabaseError message + column name show up in the log line;
+    // Display on `sqlx::Error` collapses to the generic "database error"
+    // and gives the operator nothing to debug against.
     let sip_messages = match sip_messages {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(cdr_id = id, error = %e, "sip_msg fetch failed");
+            tracing::warn!(cdr_id = id, error = ?e, "sip_msg fetch failed");
             Vec::new()
         }
     };
