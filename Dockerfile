@@ -24,7 +24,7 @@ RUN touch src/main.rs && cargo build --release
 # ----- runtime -----
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates libssl3 zstd \
+    ca-certificates libssl3 zstd wget \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home /app --shell /usr/sbin/nologin rusto
 

@@ -1,15 +1,22 @@
-version: "3.8"
-
 # Example: run rusto-voip-mon against an EXISTING VoIPmonitor MySQL/MariaDB
 # and the existing /var/spool/voipmonitor pcap directory. Adjust the bind
 # paths and DATABASE_URL for your environment.
 #
 # This compose does NOT run VoIPmonitor — it only reads from its database
 # and serves pcaps from its spool.
+#
+# Quick start:
+#   cp .env.example .env   # then edit DATABASE_URL + APP_COOKIE_SECRET
+#   docker compose build   # multi-stage build, ~3 min on a clean cache
+#   docker compose up -d
+#   docker compose logs -f rusto-voip-mon
 
 services:
   rusto-voip-mon:
-    image: ghcr.io/litchdrom/rusto-voip-mon:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rusto-voip-mon:local
     container_name: rusto-voip-mon
     restart: unless-stopped
     ports:
@@ -30,7 +37,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/rusto-voip-mon", "--healthcheck-only"]
+      # /healthz is the liveness endpoint — returns "ok" without touching
+      # the DB. wget --spider just HEADs the URL without writing the body
+      # to disk (the binary doesn't ship curl in the slim image).
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8080/healthz || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
