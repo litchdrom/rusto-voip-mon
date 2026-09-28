@@ -842,12 +842,19 @@ pub struct SipMessage {
 
 /// Fetch all SIP messages for one CDR, oldest first.
 ///
-/// VoIPmonitor doesn't link `sip_msg` directly to `cdr` — it links
-/// via `callid`:
-///     `sip_msg.callid`  ──┐
-///                         ├──► join
-///     `cdr_siphistory`  ──┘
-///                         └──► `cdr_siphistory.cdr_ID`
+/// Schema bridge (VoIPmonitor ≥ ~8.x):
+///     `cdr`  ──(cdr_ID)──►  `cdr_siphistory`
+///                              │
+///                              ├──(SIPrequest_id)──►  `sip_msg.ID`
+///                              └──(SIPresponse_id)──► `sip_msg.ID`
+///
+/// One row in `cdr_siphistory` represents one SIP transaction (a
+/// request + its response), and stores the sip_msg IDs of both the
+/// request and the response. The two IDs may resolve to the SAME
+/// sip_msg row (in paired-row installs) or DIFFERENT rows (in
+/// split-row installs). To get every sip_msg row for a CDR without
+/// double-counting paired rows, we use an IN-subquery over both
+/// columns and let `sip_msg.ID` dedupe.
 ///
 /// The `sip_msg` schema has no `method` or `sip_response` columns —
 /// those live inside `request_content` / `response_content` as part
@@ -871,12 +878,21 @@ pub async fn fetch_sip_messages(
                 sip_msg.request_content, sip_msg.response_content, \
                 sip_msg.response_number \
            FROM sip_msg \
-           JOIN cdr_siphistory \
-             ON cdr_siphistory.callid = sip_msg.callid \
-          WHERE cdr_siphistory.cdr_ID = ? \
+          WHERE sip_msg.ID IN ( \
+                SELECT cdr_siphistory.SIPrequest_id \
+                  FROM cdr_siphistory \
+                 WHERE cdr_siphistory.cdr_ID = ? \
+                   AND cdr_siphistory.SIPrequest_id IS NOT NULL \
+                UNION \
+                SELECT cdr_siphistory.SIPresponse_id \
+                  FROM cdr_siphistory \
+                 WHERE cdr_siphistory.cdr_ID = ? \
+                   AND cdr_siphistory.SIPresponse_id IS NOT NULL \
+          ) \
           ORDER BY sip_msg.time ASC, sip_msg.time_us ASC, sip_msg.ID ASC \
           LIMIT ?",
     )
+    .bind(cdr_id)
     .bind(cdr_id)
     .bind(limit as i64)
     .fetch_all(pool)
