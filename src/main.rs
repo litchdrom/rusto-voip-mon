@@ -24,8 +24,40 @@ use crate::config::Config;
 use crate::middleware::require_login;
 use crate::state::AppState;
 
+/// Build identity baked into the binary at compile time via vergen.
+/// `VERGEN_GIT_SHA` is "true" in a dirty worktree (the cargo metadata
+/// won't have a clean SHA) and "unknown" if git isn't reachable —
+/// both surface in --version output so a broken build is obvious
+/// at a glance.
+fn build_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (commit ",
+        env!("VERGEN_GIT_SHA"),
+        ", built ",
+        env!("VERGEN_BUILD_TIMESTAMP"),
+        ")",
+    )
+}
+
+/// One-line self-identification for `--version` / `-V`. Useful when
+/// debugging a deployed server: compare against `git rev-parse HEAD`
+/// on the build host to confirm the running binary matches source.
+fn print_version_and_exit() -> ! {
+    println!("rusto-voip-mon {}", build_version());
+    std::process::exit(0);
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Handle `--version` / `-V` before any heavy init (DB pool, env
+    // loading). Cheap operation, never touches the network.
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "--version" || arg == "-V" {
+            print_version_and_exit();
+        }
+    }
+
     // .env is optional; ignore if missing
     let _ = dotenvy::dotenv();
 
@@ -34,8 +66,15 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // First log line of every process — answers "what code is
+    // actually running on this server?" without needing ssh + ps.
+    tracing::info!(
+        version = build_version(),
+        "rusto-voip-mon starting"
+    );
+
     let config = Arc::new(Config::from_env()?);
-    tracing::info!(listen = %config.listen, "rusto-voip-mon starting");
+    tracing::info!(listen = %config.listen, "config loaded");
 
     let pool = db::create_pool(&config.database_url).await?;
     tracing::info!("connected to MySQL");
