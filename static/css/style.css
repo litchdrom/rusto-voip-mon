@@ -514,3 +514,74 @@ table.sip-timeline .sip-row:hover {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* Call flow diagram (above the SIP timeline).
+   Horizontal flex row of phase boxes — each box's `flex: N 0 0`
+   makes its width proportional to the phase's duration, so an
+   instant CANCEL renders as a thin sliver and a 10-minute call
+   has a wide Established box. Colour comes from the phase's
+   worst response code (same scale as .sip-1xx..sip-6xx used
+   in the SIP timeline so the two panels agree visually). */
+.call-flow {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  margin: 12px 0;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+}
+.cf-phase {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 4px;
+  padding: 8px 10px;
+  min-width: 0;        /* allow flex shrink below content size */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+}
+.cf-phase .cf-name {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cf-phase .cf-meta {
+  font-size: 11px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cf-phase .cf-code {
+  display: inline-block;
+  font-weight: 600;
+  margin-right: 4px;
+}
+.cf-phase .cf-outcome {
+  color: var(--fg-muted);
+  font-style: italic;
+}
+/* Each phase's left border takes the same colour as its worst
+   response — connects visually with the SIP timeline's
+   colour-coded method + code columns. */
+.cf-phase.sip-1xx { border-left-color: var(--fg-muted); }
+.cf-phase.sip-2xx { border-left-color: #4ade80; }
+.cf-phase.sip-3xx { border-left-color: #fbbf24; }
+.cf-phase.sip-4xx { border-left-color: #fb923c; }
+.cf-phase.sip-5xx,
+.cf-phase.sip-6xx { border-left-color: #f87171; }
+.cf-phase.sip-other { border-left-color: var(--accent); }
+.cf-arrow {
+  align-self: center;
+  color: var(--fg-muted);
+  font-size: 16px;
+  flex: 0 0 auto;
+}

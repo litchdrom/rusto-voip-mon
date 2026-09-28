@@ -585,6 +585,7 @@ pub async fn cdr_detail(
   {custom_headers_html}
   {branches_html}
   {rtp_html}
+  {flow_html}
   {sip_html}
 
   <p><a class="button" href="/pcap/{id}">Download PCAP</a></p>
@@ -616,6 +617,11 @@ pub async fn cdr_detail(
             )
         },
         branches_html = render_branches(&branches),
+        // Call flow diagram sits between the call-leg / RTP panels
+        // and the SIP message timeline — the eye reads it as "what
+        // shape did the call have?" before drilling into the
+        // per-message details below.
+        flow_html = render_call_flow_diagram(&compute_call_phases(&sip_messages)),
         sip_html = render_sip_timeline(&sip_messages),
         rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
     );
@@ -624,6 +630,316 @@ pub async fn cdr_detail(
         body,
     )
         .into_response())
+}
+
+/// One slice of the call's lifecycle for the flow diagram. Each
+/// phase has a name, an offset/duration relative to the call's
+/// first SIP message, the worst response code seen during it, and
+/// a short outcome label so the diagram stays scannable.
+#[derive(Debug)]
+struct CallPhase {
+    name: &'static str,
+    /// Offset from the first message's timestamp, in milliseconds.
+    start_ms: i64,
+    /// Duration in milliseconds. `end_ms = start_ms + duration_ms`.
+    duration_ms: i64,
+    /// Worst response code seen during the phase (highest value in
+    /// the 100..699 range). 0 if the phase contains no responses
+    /// (e.g. pure request phase). Drives the box's colour.
+    worst_code: u16,
+    /// Short label for the box: "answered", "busy", "cancelled",
+    /// "ringing", "ok", "abnormal". Empty string when N/A.
+    outcome: &'static str,
+}
+
+/// Walk the SIP message timeline once and bucket each message into
+/// a phase. The boundaries are derived from SIP transaction shapes
+/// (INVITE → 200 = Setup, 200 OK → BYE = Established, BYE → 200 =
+/// Termination) — not hard-coded timestamps, so they survive odd
+/// message orders and missing messages gracefully.
+///
+/// Returns an empty Vec if `messages` is empty (the panel omits
+/// itself in that case).
+///
+/// Time math uses millisecond offsets relative to the first message
+/// so the diagram's axis stays stable across DB vs pcap sources
+/// (different absolute timestamps, identical relative shape).
+fn compute_call_phases(messages: &[cdr::SipMessage]) -> Vec<CallPhase> {
+    if messages.is_empty() {
+        return Vec::new();
+    }
+    let t0 = messages[0].calldate;
+    let offset_ms = |m: &cdr::SipMessage| -> i64 {
+        (m.calldate - t0).num_milliseconds().max(0)
+    };
+    let max_code = |a: u16, b: u16| a.max(b);
+
+    let mut phases: Vec<CallPhase> = Vec::new();
+    let mut i = 0usize;
+
+    // ---- Setup phase: from first message until the call is
+    // "settled" (200-class answered, 4xx/5xx rejected, or CANCEL).
+    let setup_start = i;
+    let mut setup_worst: u16 = 0;
+    let mut setup_outcome: &'static str = "answered";
+    while i < messages.len() {
+        let m = &messages[i];
+        if m.method == "CANCEL" {
+            setup_outcome = "cancelled";
+            // CANCEL belongs to Setup — don't increment i.
+            break;
+        }
+        if (400..600).contains(&m.response_num) {
+            setup_worst = max_code(setup_worst, m.response_num);
+            setup_outcome = match m.response_num {
+                486 => "busy",
+                487 => "cancelled",
+                404 | 410 => "not found",
+                401 | 407 => "auth required",
+                480 => "unavailable",
+                408 => "timeout",
+                503 => "service unavailable",
+                _ if m.response_num >= 500 => "server error",
+                _ => "rejected",
+            };
+            // The 4xx/5xx response belongs to Setup — don't increment i.
+            break;
+        }
+        if (200..300).contains(&m.response_num) {
+            // First 2xx — call is answered. Setup ends here. We
+            // intentionally do NOT increment `i` so the 200 OK stays
+            // as the boundary: it's the last message of Setup AND the
+            // first message of Established. The Established scan below
+            // picks it up and uses it as the phase start timestamp.
+            setup_worst = max_code(setup_worst, m.response_num);
+            break;
+        }
+        if m.response_num > 0 {
+            setup_worst = max_code(setup_worst, m.response_num);
+        }
+        i += 1;
+    }
+    let setup_end = i;
+    if setup_end > setup_start {
+        // The 200 OK / CANCEL / 4xx-5xx is the LAST message of Setup
+        // (because we `break` without incrementing `i`), so use
+        // `messages[setup_end]` directly for the end timestamp.
+        let s = offset_ms(&messages[setup_start]);
+        let e = offset_ms(&messages[setup_end]);
+        phases.push(CallPhase {
+            name: "Setup",
+            start_ms: s,
+            duration_ms: (e - s).max(0),
+            worst_code: setup_worst,
+            outcome: setup_outcome,
+        });
+    }
+
+    // ---- Early media phase: 183 Session Progress before the final
+    // 200 OK (RFC 3960). Only meaningful if the call actually
+    // went through early media — many successful calls don't.
+    if setup_outcome == "answered" && setup_end < messages.len() {
+        // Scan ahead for a 183 followed eventually by a 200.
+        let mut saw_183 = false;
+        let mut early_start = usize::MAX;
+        let mut early_end = usize::MAX;
+        for j in setup_end..messages.len().min(setup_end + 12) {
+            let m = &messages[j];
+            if m.response_num == 183 {
+                if !saw_183 {
+                    early_start = j;
+                    saw_183 = true;
+                }
+            } else if (200..300).contains(&m.response_num) && saw_183 {
+                early_end = j + 1;
+                break;
+            } else if m.method == "BYE" || m.method == "CANCEL" {
+                break;
+            }
+        }
+        if saw_183 && early_end != usize::MAX {
+            let s = offset_ms(&messages[early_start]);
+            let e = offset_ms(&messages[early_end - 1]);
+            phases.push(CallPhase {
+                name: "Early media",
+                start_ms: s,
+                duration_ms: (e - s).max(0),
+                worst_code: 183,
+                outcome: "ringing",
+            });
+            // Skip past early-media messages for the next phase scan.
+            i = early_end;
+        } else {
+            i = setup_end;
+        }
+    }
+
+    // ---- Established phase: only when the call was answered. A
+    // rejected (4xx/5xx) or cancelled (CANCEL) call ends at Setup —
+    // there's no media interval to show.
+    if setup_outcome == "answered" {
+        let established_start = i;
+        let mut est_end = messages.len();
+        for j in i..messages.len() {
+            let m = &messages[j];
+            if m.method == "BYE" || m.method == "CANCEL" {
+                est_end = j;
+                break;
+            }
+        }
+        let s = offset_ms(&messages[established_start]);
+        let e = if est_end < messages.len() {
+            offset_ms(&messages[est_end])
+        } else {
+            offset_ms(&messages[messages.len() - 1])
+        };
+        phases.push(CallPhase {
+            name: "Established",
+            start_ms: s,
+            duration_ms: (e - s).max(0),
+            worst_code: 0, // no SIP responses during established media
+            outcome: "",
+        });
+        i = est_end;
+    }
+
+    // ---- Termination phase: BYE/CANCEL → final response. Only
+    // present when the call was actually answered — a rejected or
+    // cancelled call ends at Setup.
+    if setup_outcome == "answered" && i < messages.len() {
+        let term_start = i;
+        let mut term_worst: u16 = 0;
+        let mut term_outcome: &'static str = "ok";
+        while i < messages.len() {
+            let m = &messages[i];
+            if m.response_num > 0 {
+                term_worst = max_code(term_worst, m.response_num);
+                if (400..600).contains(&m.response_num) {
+                    term_outcome = "abnormal";
+                }
+            }
+            i += 1;
+        }
+        let term_end = i;
+        if term_end > term_start {
+            let s = offset_ms(&messages[term_start]);
+            let e = offset_ms(&messages[term_end - 1]);
+            phases.push(CallPhase {
+                name: "Termination",
+                start_ms: s,
+                duration_ms: (e - s).max(0),
+                worst_code: term_worst,
+                outcome: term_outcome,
+            });
+        }
+    }
+
+    // Stitch relative offsets into a continuous timeline so the CSS
+    // can render boxes side-by-side proportionally.
+    let mut cursor_ms = 0i64;
+    for p in &mut phases {
+        if p.start_ms < cursor_ms {
+            p.start_ms = cursor_ms;
+        }
+        cursor_ms = p.start_ms + p.duration_ms;
+    }
+    phases
+}
+
+/// Render the call flow as a horizontal series of phase boxes
+/// connected by `→` arrows. Colour of each box comes from the
+/// phase's worst response code (same colour scale as the SIP
+/// timeline so the two panels visually agree).
+///
+/// Width of each box is proportional to its duration so an
+/// instant CANCEL renders as a thin sliver and a 10-minute call
+/// has a wide Established box. Returns "" when there are no
+/// phases (e.g. empty message list).
+fn render_call_flow_diagram(phases: &[CallPhase]) -> String {
+    if phases.is_empty() {
+        return String::new();
+    }
+    let total_ms: i64 = phases
+        .iter()
+        .map(|p| p.start_ms + p.duration_ms)
+        .max()
+        .unwrap_or(0);
+    if total_ms <= 0 {
+        return String::new();
+    }
+    let mut out = String::from("<h2>Call flow</h2>");
+    out.push_str("<div class=\"call-flow\">");
+    for (idx, p) in phases.iter().enumerate() {
+        if idx > 0 {
+            out.push_str("<span class=\"cf-arrow\">→</span>");
+        }
+        let width_pct = ((p.duration_ms as f64 / total_ms as f64) * 100.0)
+            .max(4.0)  // never collapse a phase below ~4% so labels fit
+            .min(100.0);
+        let code_class = sip_code_class(p.worst_code);
+        let outcome_class = if p.outcome.is_empty() {
+            ""
+        } else {
+            " has-outcome"
+        };
+        let duration_str = format_duration_ms(p.duration_ms);
+        let outcome = if p.outcome.is_empty() {
+            String::new()
+        } else {
+            format!(" · <span class=\"cf-outcome\">{}</span>", p.outcome)
+        };
+        // Box shows: phase name (big) + duration + outcome + (worst
+        // code, only if non-zero). The worst_code drives the bg
+        // colour via `sip-2xx/4xx/5xx` classes already defined for
+        // the SIP timeline.
+        let worst_label = if p.worst_code == 0 {
+            String::new()
+        } else {
+            format!("<span class=\"cf-code {code_class}\">{}</span> ", p.worst_code)
+        };
+        out.push_str(&format!(
+            "<div class=\"cf-phase {code_class}{outcome_class}\" \
+                  style=\"flex: {width_pct:.2} 0 0;\" \
+                  title=\"{name} · {duration_str}{outcome_text}\">\
+               <div class=\"cf-name\">{name}</div>\
+               <div class=\"cf-meta\">{worst_label}{duration_str}{outcome}</div>\
+             </div>",
+            name = p.name,
+            duration_str = duration_str,
+            outcome_text = if p.outcome.is_empty() { String::new() } else { format!(" · {}", p.outcome) },
+        ));
+    }
+    out.push_str("</div>");
+    // Footnote: total duration so the analyst doesn't have to add
+    // the phases up by hand.
+    out.push_str(&format!(
+        "<p class=\"muted small\">Total: {} (across {} phase{})</p>",
+        format_duration_ms(total_ms),
+        phases.len(),
+        if phases.len() == 1 { "" } else { "s" },
+    ));
+    out
+}
+
+/// Render milliseconds as a compact human duration:
+///   500      → "500 ms"
+///   2500     → "2.5 s"
+///   65000    → "1 m 5 s"
+///   3700000  → "1 h 1 m"
+fn format_duration_ms(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{} ms", ms)
+    } else if ms < 60_000 {
+        format!("{:.1} s", ms as f64 / 1000.0)
+    } else if ms < 3_600_000 {
+        let m = ms / 60_000;
+        let s = (ms % 60_000) / 1000;
+        format!("{m} m {s} s")
+    } else {
+        let h = ms / 3_600_000;
+        let m = (ms % 3_600_000) / 60_000;
+        format!("{h} h {m} m")
+    }
 }
 
 /// Render the per-leg RTP statistics panel — a two-column "A leg /
@@ -1288,5 +1604,128 @@ mod sip_render_tests {
         assert!(html.contains("sip-method-invite"));
         // Direction arrow renders for outbound requests.
         assert!(html.contains(r#"class="num dir-out">→<"#));
+    }
+
+    /// Helper for the call-flow tests below — makes a synthetic SIP
+    /// message at `seconds_offset` after the call start.
+    fn mk_msg(method: &str, code: u16, seconds_offset: f64) -> cdr::SipMessage {
+        let t0 = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let delta_ms = (seconds_offset * 1000.0) as i64;
+        cdr::SipMessage {
+            id: 0,
+            calldate: t0 + chrono::Duration::milliseconds(delta_ms),
+            method: method.into(),
+            response_num: code,
+            response_text: format!("{code}"),
+            from_num: String::new(),
+            to_num: String::new(),
+            src_ip_str: String::new(),
+            dst_ip_str: String::new(),
+            direction: String::new(),
+            content_type: String::new(),
+            content: String::new(),
+        }
+    }
+
+    #[test]
+    fn call_flow_happy_path_has_three_phases() {
+        // Normal successful call: INVITE -> 100 -> 180 -> 200,
+        // media, BYE -> 200.
+        let msgs = vec![
+            mk_msg("INVITE", 0,   0.0),
+            mk_msg("",       100, 0.1),
+            mk_msg("",       180, 0.2),
+            mk_msg("",       200, 0.3),
+            mk_msg("BYE",    0,   5.0),
+            mk_msg("",       200, 5.0),
+        ];
+        let phases = compute_call_phases(&msgs);
+        assert_eq!(phases.len(), 3, "expected Setup + Established + Termination");
+        assert_eq!(phases[0].name, "Setup");
+        assert_eq!(phases[0].outcome, "answered");
+        assert_eq!(phases[0].worst_code, 200);
+        assert_eq!(phases[1].name, "Established");
+        assert_eq!(phases[2].name, "Termination");
+        assert_eq!(phases[2].outcome, "ok");
+        assert_eq!(phases[2].worst_code, 200);
+    }
+
+    #[test]
+    fn call_flow_busy_call_short_circuits_at_486() {
+        // Failed call: INVITE -> 486 Busy Here. No Established phase.
+        let msgs = vec![
+            mk_msg("INVITE", 0,   0.0),
+            mk_msg("",       100, 0.1),
+            mk_msg("",       486, 0.2),
+        ];
+        let phases = compute_call_phases(&msgs);
+        assert_eq!(phases.len(), 1, "no Established phase when call rejected");
+        assert_eq!(phases[0].name, "Setup");
+        assert_eq!(phases[0].outcome, "busy");
+        assert_eq!(phases[0].worst_code, 486);
+    }
+
+    #[test]
+    fn call_flow_cancel_during_setup() {
+        // Operator cancels before any final response.
+        let msgs = vec![
+            mk_msg("INVITE", 0,   0.0),
+            mk_msg("",       100, 0.1),
+            mk_msg("CANCEL", 0,   0.5),
+        ];
+        let phases = compute_call_phases(&msgs);
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0].name, "Setup");
+        assert_eq!(phases[0].outcome, "cancelled");
+    }
+
+    #[test]
+    fn call_flow_empty_messages_returns_no_phases() {
+        assert!(compute_call_phases(&[]).is_empty());
+    }
+
+    #[test]
+    fn call_flow_diagram_renders_arrows_between_phases() {
+        let phases = vec![
+            CallPhase {
+                name: "Setup",
+                start_ms: 0,
+                duration_ms: 1000,
+                worst_code: 200,
+                outcome: "answered",
+            },
+            CallPhase {
+                name: "Established",
+                start_ms: 1000,
+                duration_ms: 60_000,
+                worst_code: 0,
+                outcome: "",
+            },
+        ];
+        let html = render_call_flow_diagram(&phases);
+        // One arrow between two boxes.
+        assert_eq!(html.matches("cf-arrow").count(), 1);
+        assert!(html.contains("Setup"));
+        assert!(html.contains("Established"));
+        assert!(html.contains("answered"));
+        // Total duration note at the bottom.
+        assert!(html.contains("1 m 0 s"));
+    }
+
+    #[test]
+    fn call_flow_diagram_omitted_for_empty_phases() {
+        assert_eq!(render_call_flow_diagram(&[]), "");
+    }
+
+    #[test]
+    fn format_duration_ms_compact_formats() {
+        assert_eq!(format_duration_ms(500), "500 ms");
+        assert_eq!(format_duration_ms(999), "999 ms");
+        assert_eq!(format_duration_ms(2500), "2.5 s");
+        assert_eq!(format_duration_ms(65_000), "1 m 5 s");
+        assert_eq!(format_duration_ms(3_700_000), "1 h 1 m");
     }
 }
