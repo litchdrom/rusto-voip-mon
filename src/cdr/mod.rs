@@ -842,12 +842,21 @@ pub struct SipMessage {
 
 /// Fetch all SIP messages for one CDR, oldest first.
 ///
-/// `sip_msg.cdr_ID` is the join column. The schema has an index on it
-/// (VoIPmonitor creates one during install) so this is a cheap
-/// range-scan + sort-by-calldate. We cap the row count at 500 — beyond
-/// that the page becomes a wall of SIP and the operator is usually
-/// staring at a SIP loop attack; the cap keeps the page responsive and
-/// the log line flags when we hit it.
+/// VoIPmonitor doesn't link `sip_msg` directly to `cdr` — it links
+/// via `callid`:
+///     `sip_msg.callid`  ──┐
+///                         ├──► join
+///     `cdr_siphistory`  ──┘
+///                         └──► `cdr_siphistory.cdr_ID`
+///
+/// The `sip_msg` schema has no `method` or `sip_response` columns —
+/// those live inside `request_content` / `response_content` as part
+/// of the raw SIP wire format. We parse the first line of each body
+/// to extract the method (e.g. `INVITE sip:user@host SIP/2.0` →
+/// `INVITE`) and the response status (e.g. `SIP/2.0 200 OK` →
+/// `(200, "OK")`).
+///
+/// Cap at 500 rows so a SIP loop storm doesn't render a 10 MB page.
 pub async fn fetch_sip_messages(
     pool: &MySqlPool,
     cdr_id: u64,
@@ -856,14 +865,16 @@ pub async fn fetch_sip_messages(
 ) -> Result<Vec<SipMessage>, sqlx::Error> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT ID AS id, calldate, method, \
-                sip_response_num AS response_num, \
-                sip_response AS response_text, \
-                from_num, to_num, sipcallerip, sipcalledip, \
-                content_type, content \
+        "SELECT sip_msg.ID AS id, sip_msg.time, \
+                sip_msg.ip_src, sip_msg.ip_dst, \
+                sip_msg.number_src, sip_msg.number_dst, \
+                sip_msg.request_content, sip_msg.response_content, \
+                sip_msg.response_number \
            FROM sip_msg \
-          WHERE cdr_ID = ? \
-          ORDER BY calldate ASC, ID ASC \
+           JOIN cdr_siphistory \
+             ON cdr_siphistory.callid = sip_msg.callid \
+          WHERE cdr_siphistory.cdr_ID = ? \
+          ORDER BY sip_msg.time ASC, sip_msg.time_us ASC, sip_msg.ID ASC \
           LIMIT ?",
     )
     .bind(cdr_id)
@@ -873,8 +884,8 @@ pub async fn fetch_sip_messages(
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let src_ip_int: Option<u32> = row.try_get("sipcallerip").ok().flatten();
-        let dst_ip_int: Option<u32> = row.try_get("sipcalledip").ok().flatten();
+        let src_ip_int: Option<u32> = row.try_get("ip_src").ok().flatten();
+        let dst_ip_int: Option<u32> = row.try_get("ip_dst").ok().flatten();
         let src_ip_str = src_ip_int
             .map(int_to_ipv4)
             .unwrap_or_default();
@@ -889,39 +900,128 @@ pub async fn fetch_sip_messages(
             (Some(marker), Some(src)) if src == marker => "out".to_string(),
             _ => "in".to_string(),
         };
-        // Older VoIPmonitor installs store the numeric response code
-        // in `sip_response` (e.g. "200") and leave `sip_response_num`
-        // NULL; newer installs split them. Fall back gracefully.
-        let response_num: u16 = row
-            .try_get::<Option<i32>, _>("response_num")
-            .ok()
-            .flatten()
-            .and_then(|n| u16::try_from(n).ok())
-            .or_else(|| {
-                row.try_get::<Option<String>, _>("response_text")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| s.split_whitespace().next().and_then(|n| n.parse().ok()))
-            })
-            .unwrap_or(0);
+        let request_content: String =
+            row.try_get("request_content").unwrap_or_default();
+        let response_content: String =
+            row.try_get("response_content").unwrap_or_default();
+        let response_number: Option<u16> =
+            row.try_get("response_number").ok().flatten();
+        // A row is a request if `request_content` is non-empty, a
+        // response if `response_content` is non-empty. Both can be
+        // populated for paired request/response rows.
+        let method = parse_sip_method(&request_content);
+        let (response_num, response_text) = parse_sip_response(
+            &response_content,
+            response_number.unwrap_or(0),
+        );
+        // The toggle body shows whichever side is non-empty. If both
+        // are populated (paired row), show the request — analysts
+        // care more about "what did we send" than "what came back".
+        let content = if !request_content.is_empty() {
+            request_content
+        } else {
+            response_content
+        };
         out.push(SipMessage {
             id: row.try_get::<i64, _>("id").map(|n| n as u64).unwrap_or(0),
             calldate: row
-                .try_get::<NaiveDateTime, _>("calldate")
+                .try_get::<NaiveDateTime, _>("time")
                 .unwrap_or_else(|_| Utc::now().naive_utc()),
-            method: row.try_get::<String, _>("method").unwrap_or_default(),
+            method,
             response_num,
-            response_text: row.try_get::<String, _>("response_text").unwrap_or_default(),
-            from_num: row.try_get::<String, _>("from_num").unwrap_or_default(),
-            to_num: row.try_get::<String, _>("to_num").unwrap_or_default(),
+            response_text,
+            from_num: row.try_get::<String, _>("number_src").unwrap_or_default(),
+            to_num: row.try_get::<String, _>("number_dst").unwrap_or_default(),
             src_ip_str,
             dst_ip_str,
             direction,
-            content_type: row.try_get::<String, _>("content_type").unwrap_or_default(),
-            content: row.try_get::<String, _>("content").unwrap_or_default(),
+            content_type: String::new(), // schema has no per-message CT column
+            content,
         });
     }
     Ok(out)
+}
+
+/// Parse the first whitespace-separated token of a SIP request line.
+/// `"INVITE sip:user@example.com SIP/2.0\r\n..."` → `"INVITE"`.
+/// Returns `""` for an empty body.
+fn parse_sip_method(request_content: &str) -> String {
+    if request_content.is_empty() {
+        return String::new();
+    }
+    request_content
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Parse a SIP response status line into `(code, reason)`:
+/// `"SIP/2.0 200 OK\r\n..."` → `(200, "OK")`.
+/// Falls back to the `response_number` column (smallint in the schema)
+/// when the body is missing or unparseable.
+fn parse_sip_response(response_content: &str, fallback_code: u16) -> (u16, String) {
+    if response_content.is_empty() {
+        return (fallback_code, String::new());
+    }
+    let first_line = response_content.lines().next().unwrap_or("");
+    let mut parts = first_line.splitn(3, char::is_whitespace);
+    let _sip_version = parts.next(); // "SIP/2.0"
+    let code_str = parts.next().unwrap_or("");
+    let reason = parts.next().unwrap_or("").to_string();
+    let code = code_str.parse::<u16>().unwrap_or(fallback_code);
+    (code, reason)
+}
+
+#[cfg(test)]
+mod sip_parse_tests {
+    use super::*;
+
+    #[test]
+    fn parse_method_extracts_first_token() {
+        assert_eq!(
+            parse_sip_method("INVITE sip:user@example.com SIP/2.0\r\nVia: ..."),
+            "INVITE"
+        );
+        assert_eq!(parse_sip_method("BYE sip:user@example.com SIP/2.0"), "BYE");
+        assert_eq!(parse_sip_method("REGISTER sip:registrar SIP/2.0"), "REGISTER");
+    }
+
+    #[test]
+    fn parse_method_empty_body_returns_empty_string() {
+        assert_eq!(parse_sip_method(""), "");
+        assert_eq!(parse_sip_method("   "), "");
+    }
+
+    #[test]
+    fn parse_response_extracts_code_and_reason() {
+        assert_eq!(
+            parse_sip_response("SIP/2.0 200 OK\r\n...", 0),
+            (200, "OK".to_string())
+        );
+        assert_eq!(
+            parse_sip_response("SIP/2.0 486 Busy Here\r\n...", 0),
+            (486, "Busy Here".to_string())
+        );
+        // Multi-word reason phrase preserved verbatim.
+        assert_eq!(
+            parse_sip_response("SIP/2.0 503 Service Unavailable\r\n...", 0),
+            (503, "Service Unavailable".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_response_falls_back_to_column_when_body_missing() {
+        // Empty body → fall back to the column-provided code, empty reason.
+        assert_eq!(parse_sip_response("", 404), (404, String::new()));
+        // Malformed body: parser grabs whatever's in the 2nd/3rd slots as
+        // (code_str, reason) — code_str fails to parse so the column's
+        // fallback wins, but the reason field captures the rest of the
+        // first line. This is fine for triage: a row with garbage in
+        // these slots is already a sign something's wrong upstream.
+        let (code, _reason) = parse_sip_response("not a sip response", 500);
+        assert_eq!(code, 500);
+    }
 }
 
 /// Distinct values from the last N days, used to populate the filter
