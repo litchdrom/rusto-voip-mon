@@ -153,6 +153,30 @@ pub struct CdrRow {
     pub b_rtp_ptime: Option<u8>,
 }
 
+/// All `cdr` columns that `CdrRow` expects via `FromRow`. Every
+/// `query_as::<CdrRow>` SQL must include exactly this list (in any
+/// order) — sqlx's `FromRow` derive requires the result set to
+/// contain every struct field's column; missing columns surface as
+/// `Error::ColumnNotFound` at execute time, not at prepare time.
+///
+/// Keeping the list in one place means `cdr::list`, `cdr_detail`,
+/// and `fetch_by_ids` all pull the same columns — no chance of one
+/// going stale when CdrRow gains a field.
+pub const CDR_FULL_SELECT_COLUMNS: &str = "ID AS `id`, calldate, callend, duration, connect_duration, \
+        caller, callername, called, sipcallerip, sipcalledip, \
+        lastSIPresponseNum AS `last_sip_response_num`, \
+        mos_min_mult10, a_lost, b_lost, id_sensor, \
+        a_mos_lqo_mult10, b_mos_lqo_mult10, \
+        a_received, b_received, \
+        a_avgjitter_mult10, b_avgjitter_mult10, \
+        a_maxjitter, b_maxjitter, \
+        a_packet_loss_perc_mult1000, b_packet_loss_perc_mult1000, \
+        a_delay_avg_mult100, b_delay_avg_mult100, \
+        a_rtcp_loss, b_rtcp_loss, \
+        a_rtcp_maxjitter, b_rtcp_maxjitter, \
+        a_payload, b_payload, \
+        a_rtp_ptime, b_rtp_ptime";
+
 /// View struct used by templates and the CSV exporter.
 #[derive(Debug, Clone, Serialize)]
 pub struct CdrSummary {
@@ -692,15 +716,13 @@ pub struct CdrPage {
 pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<CdrPage, sqlx::Error> {
     let (where_sql, binds) = f.to_where();
     let limit = f.page_size + 1;
+    // Use the shared `CDR_FULL_SELECT_COLUMNS` so `query_as::<CdrRow>`
+    // never trips `ColumnNotFound` when the struct gains a field.
     let sql = format!(
-        "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
-                caller, callername, called, sipcallerip, sipcalledip, \
-                lastSIPresponseNum AS `last_sip_response_num`, \
-                mos_min_mult10, a_lost, b_lost, id_sensor \
-           FROM cdr \
-           {where_sql} \
+        "SELECT {} FROM cdr {where_sql} \
           ORDER BY calldate DESC, ID DESC \
           LIMIT ? OFFSET ?",
+        CDR_FULL_SELECT_COLUMNS,
     );
     let mut q = sqlx::query_as::<_, CdrRow>(&sql);
     for b in &binds {
@@ -735,15 +757,13 @@ pub fn list_stream(
     limit: usize,
 ) -> ReceiverStream<Result<CdrRow, sqlx::Error>> {
     let (where_sql, binds) = f.to_where();
+    // Shared with `list` — keeps `query_as::<CdrRow>` satisfied even
+    // after the struct gains columns.
     let sql = format!(
-        "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
-                caller, callername, called, sipcallerip, sipcalledip, \
-                lastSIPresponseNum AS `last_sip_response_num`, \
-                mos_min_mult10, a_lost, b_lost, id_sensor \
-           FROM cdr \
-           {where_sql} \
+        "SELECT {} FROM cdr {where_sql} \
           ORDER BY calldate DESC, ID DESC \
           LIMIT ?",
+        CDR_FULL_SELECT_COLUMNS,
     );
     let (tx, rx) = mpsc::channel(64);
     let pool = pool.clone();
@@ -823,11 +843,8 @@ pub async fn fetch_by_ids(
         return Ok(std::collections::HashMap::new());
     }
     let sql = format!(
-        "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
-                caller, callername, called, sipcallerip, sipcalledip, \
-                lastSIPresponseNum AS `last_sip_response_num`, \
-                mos_min_mult10, a_lost, b_lost, id_sensor \
-           FROM cdr WHERE ID IN ({})",
+        "SELECT {} FROM cdr WHERE ID IN ({})",
+        CDR_FULL_SELECT_COLUMNS,
         placeholders(clean.len())
     );
     let mut q = sqlx::query_as::<_, CdrRow>(&sql);

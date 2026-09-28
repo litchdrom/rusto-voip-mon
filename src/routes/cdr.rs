@@ -388,29 +388,28 @@ pub async fn cdr_detail(
     // so the page still renders — the RTP panel is omitted (it hides
     // itself when every leg is unpopulated). One warning per process is
     // plenty; we don't want to spam the log every page load.
-    let full_select = "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
-                       caller, callername, called, sipcallerip, sipcalledip, \
-                       lastSIPresponseNum AS `last_sip_response_num`, \
-                       mos_min_mult10, a_lost, b_lost, id_sensor, \
-                       a_mos_lqo_mult10, b_mos_lqo_mult10, \
-                       a_received, b_received, \
-                       a_avgjitter_mult10, b_avgjitter_mult10, \
-                       a_maxjitter, b_maxjitter, \
-                       a_packet_loss_perc_mult1000, b_packet_loss_perc_mult1000, \
-                       a_delay_avg_mult100, b_delay_avg_mult100, \
-                       a_rtcp_loss, b_rtcp_loss, \
-                       a_rtcp_maxjitter, b_rtcp_maxjitter, \
-                       a_payload, b_payload, \
-                       a_rtp_ptime, b_rtp_ptime \
-                  FROM cdr WHERE ID = ? LIMIT 1";
+    let full_select = format!(
+        "SELECT {} FROM cdr WHERE ID = ? LIMIT 1",
+        cdr::CDR_FULL_SELECT_COLUMNS,
+    );
+    // Fallback for installs where some RTP columns are missing —
+    // pre-`a_mos_lqo_mult10` schema. The minimal SELECT still satisfies
+    // sqlx's `FromRow` derive because every remaining column on
+    // CdrRow is Option<_> — sqlx fills missing columns with None.
+    //
+    // NOTE: this assumes the live cdr table at minimum has all the
+    // pre-RTP columns. If a column in that minimal set is also
+    // missing, we hit ColumnNotFound again — at which point the
+    // operator needs to fall back to a much older binary or patch
+    // their schema.
     let minimal_select = "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
-                                caller, callername, called, sipcallerip, sipcalledip, \
-                                lastSIPresponseNum AS `last_sip_response_num`, \
-                                mos_min_mult10, a_lost, b_lost, id_sensor \
-                           FROM cdr WHERE ID = ? LIMIT 1";
+                           caller, callername, called, sipcallerip, sipcalledip, \
+                           lastSIPresponseNum AS `last_sip_response_num`, \
+                           mos_min_mult10, a_lost, b_lost, id_sensor \
+                      FROM cdr WHERE ID = ? LIMIT 1";
     let row_result = crate::error::with_query_timeout(
         timeout,
-        sqlx::query_as::<_, CdrRow>(full_select)
+        sqlx::query_as::<_, CdrRow>(&full_select)
             .bind(id)
             .fetch_optional(&state.pool),
     )
