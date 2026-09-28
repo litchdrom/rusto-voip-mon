@@ -1539,6 +1539,8 @@ mod tests {
             a_lost: Some(0),
             b_lost: Some(0),
             id_sensor: Some(1),
+            rtp_a: cdr::RtpLeg::default(),
+            rtp_b: cdr::RtpLeg::default(),
         };
         metadata.insert(42, row);
         let csv = build_cdrs_csv(&metadata, &[42], utc);
@@ -1582,6 +1584,8 @@ mod tests {
             a_lost: None,
             b_lost: None,
             id_sensor: None,
+            rtp_a: cdr::RtpLeg::default(),
+            rtp_b: cdr::RtpLeg::default(),
         };
         let mut metadata = HashMap::new();
         metadata.insert(1, mk(1));

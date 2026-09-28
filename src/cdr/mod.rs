@@ -19,6 +19,94 @@ use tokio_stream::wrappers::ReceiverStream;
 
 pub mod sip_pcap;
 
+/// Per-leg RTP stats from the `cdr` table. A leg = "caller side"
+/// (`a_*` columns) or "callee side" (`b_*` columns).
+///
+/// VoIPmonitor populates these per-direction from RTCP reports it
+/// sniffs off the wire — they're already computed aggregates stored
+/// in cdr, not live counters. So they're a snapshot of the call's
+/// call-quality, not a windowed time series (the latter would
+/// require reading the pcap).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RtpLeg {
+    pub mos_lqo_mult10: Option<u8>,
+    pub lost: Option<u32>,
+    pub received: Option<u32>,
+    pub avg_jitter_mult10: Option<u32>,
+    pub max_jitter: Option<u16>,
+    pub loss_perc_mult1000: Option<u32>,
+    pub delay_avg_mult100: Option<u32>,
+    pub rtcp_loss: Option<i32>,
+    pub rtcp_maxjitter: Option<u16>,
+    pub payload: Option<i32>,
+    pub ptime: Option<u8>,
+    /// Codec name derived from the RTP payload type (e.g. "G.711 µ-law"
+    /// for PT=0). Empty string when PT is unknown.
+    pub codec_name: String,
+}
+
+impl RtpLeg {
+    /// True if any field is populated — used by the template to
+    /// hide the RTP panel for calls where VoIPmonitor didn't capture
+    /// any RTP stats (e.g. failed calls, early hangups).
+    pub fn is_populated(&self) -> bool {
+        self.mos_lqo_mult10.is_some()
+            || self.lost.is_some()
+            || self.received.is_some()
+            || self.avg_jitter_mult10.is_some()
+            || self.max_jitter.is_some()
+            || self.loss_perc_mult1000.is_some()
+            || self.delay_avg_mult100.is_some()
+            || self.rtcp_loss.is_some()
+            || self.rtcp_maxjitter.is_some()
+            || self.payload.is_some()
+            || self.ptime.is_some()
+    }
+}
+
+/// Map a small set of well-known RTP payload types to human-readable
+/// codec names. Returns empty string for unknown / dynamic PTs (the
+/// 96-127 range where the codec is signaled out-of-band via SDP).
+fn codec_name_from_pt(pt: i32) -> &'static str {
+    match pt {
+        0 => "PCMU (G.711 µ-law)",
+        3 => "GSM 06.10",
+        4 => "G.723.1",
+        5 => "DVI4 8 kHz",
+        6 => "DVI4 16 kHz",
+        7 => "LPC",
+        8 => "PCMA (G.711 A-law)",
+        9 => "G.722",
+        10 => "L16 (linear 16-bit, 2 channels)",
+        11 => "L16 (linear 16-bit, 1 channel)",
+        12 => "QCELP",
+        13 => "CN",
+        14 => "MPA",
+        15 => "G.728",
+        16 => "DVI4 11 kHz",
+        17 => "DVI4 22 kHz",
+        18 => "G.729",
+        25 => "CelB",
+        26 => "JPEG",
+        28 => "nv",
+        31 => "H.261",
+        32 => "MPV",
+        34 => "H.263",
+        101 => "telephone-event (DTMF)",
+        103 => "H.263-1998",
+        104 => "H.263-2000",
+        105 => "H.264",
+        106 => "MP4V-ES",
+        108 => "H.264-2000",
+        111 => "Opus",
+        116 => "red",
+        117 => "telephone-event (RFC 2833)",
+        // 96..=127 is the dynamic PT range; codec is signaled via SDP
+        // and there's no way to map without the SDP body.
+        _ => "",
+    }
+}
+
 /// Raw row straight from the `cdr` table.
 #[derive(Debug, Clone, FromRow)]
 pub struct CdrRow {
@@ -37,6 +125,32 @@ pub struct CdrRow {
     pub a_lost: Option<u32>,
     pub b_lost: Option<u32>,
     pub id_sensor: Option<u16>,
+    // Per-leg RTP aggregates (the cdr table has every one of these in
+    // a_* / b_* pairs — see VoIPmonitor schema). Pulled in CdrRow
+    // because the SQL SELECT in cdr_detail wants them all in one
+    // roundtrip; copied into CdrSummary as the `rtp_a` / `rtp_b`
+    // bundles so the template doesn't have to know about mult-10
+    // scaling or codec lookup.
+    pub a_mos_lqo_mult10: Option<u8>,
+    pub b_mos_lqo_mult10: Option<u8>,
+    pub a_received: Option<u32>,
+    pub b_received: Option<u32>,
+    pub a_avgjitter_mult10: Option<u32>,
+    pub b_avgjitter_mult10: Option<u32>,
+    pub a_maxjitter: Option<u16>,
+    pub b_maxjitter: Option<u16>,
+    pub a_packet_loss_perc_mult1000: Option<u32>,
+    pub b_packet_loss_perc_mult1000: Option<u32>,
+    pub a_delay_avg_mult100: Option<u32>,
+    pub b_delay_avg_mult100: Option<u32>,
+    pub a_rtcp_loss: Option<i32>,
+    pub b_rtcp_loss: Option<i32>,
+    pub a_rtcp_maxjitter: Option<u16>,
+    pub b_rtcp_maxjitter: Option<u16>,
+    pub a_payload: Option<i32>,
+    pub b_payload: Option<i32>,
+    pub a_rtp_ptime: Option<u8>,
+    pub b_rtp_ptime: Option<u8>,
 }
 
 /// View struct used by templates and the CSV exporter.
@@ -57,6 +171,63 @@ pub struct CdrSummary {
     pub a_lost: Option<u32>,
     pub b_lost: Option<u32>,
     pub id_sensor: Option<u16>,
+    /// Per-leg RTP stats, codec names pre-resolved. The template
+    /// walks these as `{{ cdr.rtp_a.mos_str }}` etc; the raw mult-10
+    /// fields stay internal to the cdr module.
+    pub rtp_a: RtpLeg,
+    pub rtp_b: RtpLeg,
+}
+
+/// Display strings for a per-leg bundle. Built lazily in the
+/// `From<CdrRow>` so the template doesn't have to know about the
+/// underlying mult-10 / mult-1000 scaling.
+impl RtpLeg {
+    /// MOS LQO rendered as a one-decimal string ("4.2") or "" when
+    /// unset. Distinct from `CdrSummary.mos_str` (which uses the
+    /// call-level `mos_min_mult10`); per-leg MOS LQO is VoIPmonitor's
+    /// own narrow-band listening-quality estimate per direction.
+    pub fn mos_str(&self) -> String {
+        self.mos_lqo_mult10
+            .map(|m| format!("{:.1}", m as f32 / 10.0))
+            .unwrap_or_default()
+    }
+
+    /// Loss rendered as "N (P.P%)" — count first, percent in parens.
+    /// Returns "" if both fields are unset.
+    pub fn loss_str(&self) -> String {
+        match (self.lost, self.loss_perc_mult1000) {
+            (None, None) => String::new(),
+            (Some(n), Some(perc)) => {
+                format!("{} ({:.1}%)", n, perc as f32 / 10.0)
+            }
+            (Some(n), None) => n.to_string(),
+            (None, Some(perc)) => format!("({:.1}%)", perc as f32 / 10.0),
+        }
+    }
+
+    /// Avg jitter rendered in ms (the mult-10 scaling makes the int
+    /// a tenth-of-millisecond — we divide by 10 to land on real ms).
+    /// Returns "" if unset.
+    pub fn avg_jitter_ms(&self) -> String {
+        self.avg_jitter_mult10
+            .map(|j| format!("{:.1}", j as f32 / 10.0))
+            .unwrap_or_default()
+    }
+
+    /// Max jitter rendered in ms (raw column is already ms).
+    pub fn max_jitter_ms(&self) -> String {
+        self.max_jitter
+            .map(|j| j.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Delay rendered in ms (the mult-100 scaling makes the int a
+    /// hundredth-of-millisecond — we divide by 100 to land on real ms).
+    pub fn delay_ms(&self) -> String {
+        self.delay_avg_mult100
+            .map(|d| format!("{:.0}", d as f32 / 100.0))
+            .unwrap_or_default()
+    }
 }
 
 impl From<CdrRow> for CdrSummary {
@@ -67,6 +238,34 @@ impl From<CdrRow> for CdrSummary {
             .unwrap_or_default();
         let src_ip_str = row.sipcallerip.map(int_to_ipv4).unwrap_or_default();
         let dst_ip_str = row.sipcalledip.map(int_to_ipv4).unwrap_or_default();
+        let rtp_a = RtpLeg {
+            mos_lqo_mult10: row.a_mos_lqo_mult10,
+            lost: row.a_lost,
+            received: row.a_received,
+            avg_jitter_mult10: row.a_avgjitter_mult10,
+            max_jitter: row.a_maxjitter,
+            loss_perc_mult1000: row.a_packet_loss_perc_mult1000,
+            delay_avg_mult100: row.a_delay_avg_mult100,
+            rtcp_loss: row.a_rtcp_loss,
+            rtcp_maxjitter: row.a_rtcp_maxjitter,
+            payload: row.a_payload,
+            ptime: row.a_rtp_ptime,
+            codec_name: row.a_payload.map(codec_name_from_pt).unwrap_or("").to_string(),
+        };
+        let rtp_b = RtpLeg {
+            mos_lqo_mult10: row.b_mos_lqo_mult10,
+            lost: row.b_lost,
+            received: row.b_received,
+            avg_jitter_mult10: row.b_avgjitter_mult10,
+            max_jitter: row.b_maxjitter,
+            loss_perc_mult1000: row.b_packet_loss_perc_mult1000,
+            delay_avg_mult100: row.b_delay_avg_mult100,
+            rtcp_loss: row.b_rtcp_loss,
+            rtcp_maxjitter: row.b_rtcp_maxjitter,
+            payload: row.b_payload,
+            ptime: row.b_rtp_ptime,
+            codec_name: row.b_payload.map(codec_name_from_pt).unwrap_or("").to_string(),
+        };
         Self {
             id: row.id,
             calldate: row.calldate,
@@ -83,6 +282,8 @@ impl From<CdrRow> for CdrSummary {
             a_lost: row.a_lost,
             b_lost: row.b_lost,
             id_sensor: row.id_sensor,
+            rtp_a,
+            rtp_b,
         }
     }
 }
@@ -1164,4 +1365,99 @@ pub fn int_to_ipv4(n: u32) -> String {
         (n >> 8) & 0xff,
         n & 0xff
     )
+}
+
+#[cfg(test)]
+mod rtp_leg_tests {
+    use super::*;
+
+    #[test]
+    fn rtp_leg_default_is_unpopulated() {
+        // Default constructor — every field is None / empty.
+        let leg = RtpLeg::default();
+        assert!(!leg.is_populated(), "default RtpLeg must report empty");
+        assert_eq!(leg.mos_str(), "");
+        assert_eq!(leg.loss_str(), "");
+        assert_eq!(leg.avg_jitter_ms(), "");
+        assert_eq!(leg.max_jitter_ms(), "");
+        assert_eq!(leg.delay_ms(), "");
+        assert_eq!(leg.codec_name, "");
+    }
+
+    #[test]
+    fn rtp_leg_mos_str_scales_mult10() {
+        // 42 = 4.2 MOS (mult-10 storage in cdr).
+        let leg = RtpLeg { mos_lqo_mult10: Some(42), ..Default::default() };
+        assert_eq!(leg.mos_str(), "4.2");
+        assert!(leg.is_populated());
+    }
+
+    #[test]
+    fn rtp_leg_loss_str_combines_count_and_percent() {
+        // Both present → "N (P.P%)".
+        let leg = RtpLeg {
+            lost: Some(150),
+            loss_perc_mult1000: Some(250), // 25.0%
+            ..Default::default()
+        };
+        assert_eq!(leg.loss_str(), "150 (25.0%)");
+        // Count only.
+        let leg = RtpLeg { lost: Some(42), ..Default::default() };
+        assert_eq!(leg.loss_str(), "42");
+        // Percent only.
+        let leg = RtpLeg { loss_perc_mult1000: Some(50), ..Default::default() };
+        assert_eq!(leg.loss_str(), "(5.0%)");
+        // Neither.
+        let leg = RtpLeg::default();
+        assert_eq!(leg.loss_str(), "");
+    }
+
+    #[test]
+    fn rtp_leg_jitter_and_delay_scale_correctly() {
+        // avg jitter mult-10: 35 → 3.5 ms.
+        let leg = RtpLeg {
+            avg_jitter_mult10: Some(35),
+            ..Default::default()
+        };
+        assert_eq!(leg.avg_jitter_ms(), "3.5");
+        // max jitter raw ms: 80 → "80".
+        let leg = RtpLeg {
+            max_jitter: Some(80),
+            ..Default::default()
+        };
+        assert_eq!(leg.max_jitter_ms(), "80");
+        // delay avg mult-100: 12345 → 123 ms (12345 / 100 = 123.45, formatted as {:.0} = "123").
+        let leg = RtpLeg {
+            delay_avg_mult100: Some(12345),
+            ..Default::default()
+        };
+        assert_eq!(leg.delay_ms(), "123");
+    }
+
+    #[test]
+    fn codec_name_resolves_well_known_payload_types() {
+        // The most common PSTN codec PTs.
+        assert_eq!(codec_name_from_pt(0), "PCMU (G.711 µ-law)");
+        assert_eq!(codec_name_from_pt(8), "PCMA (G.711 A-law)");
+        assert_eq!(codec_name_from_pt(9), "G.722");
+        assert_eq!(codec_name_from_pt(18), "G.729");
+        // DTMF.
+        assert_eq!(codec_name_from_pt(101), "telephone-event (DTMF)");
+        assert_eq!(codec_name_from_pt(117), "telephone-event (RFC 2833)");
+        // Modern.
+        assert_eq!(codec_name_from_pt(111), "Opus");
+    }
+
+    #[test]
+    fn codec_name_returns_empty_for_dynamic_or_unknown_pts() {
+        // 96..=127 is the dynamic PT range — codec is signaled out-of-band
+        // via SDP, and we have no way to map without the SDP body.
+        assert_eq!(codec_name_from_pt(96), "");
+        assert_eq!(codec_name_from_pt(100), "");
+        assert_eq!(codec_name_from_pt(127), "");
+        // Anything outside the IANA registry.
+        assert_eq!(codec_name_from_pt(255), "");
+        assert_eq!(codec_name_from_pt(-1), "");
+        assert_eq!(codec_name_from_pt(200), "");
+    }
 }

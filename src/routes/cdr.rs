@@ -388,7 +388,17 @@ pub async fn cdr_detail(
             "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
                     caller, callername, called, sipcallerip, sipcalledip, \
                     lastSIPresponseNum AS `last_sip_response_num`, \
-                    mos_min_mult10, a_lost, b_lost, id_sensor \
+                    mos_min_mult10, a_lost, b_lost, id_sensor, \
+                    a_mos_lqo_mult10, b_mos_lqo_mult10, \
+                    a_received, b_received, \
+                    a_avgjitter_mult10, b_avgjitter_mult10, \
+                    a_maxjitter, b_maxjitter, \
+                    a_packet_loss_perc_mult1000, b_packet_loss_perc_mult1000, \
+                    a_delay_avg_mult100, b_delay_avg_mult100, \
+                    a_rtcp_loss, b_rtcp_loss, \
+                    a_rtcp_maxjitter, b_rtcp_maxjitter, \
+                    a_payload, b_payload, \
+                    a_rtp_ptime, b_rtp_ptime \
                FROM cdr WHERE ID = ? LIMIT 1",
         )
         .bind(id)
@@ -543,6 +553,7 @@ pub async fn cdr_detail(
   </table>
   {custom_headers_html}
   {branches_html}
+  {rtp_html}
   {sip_html}
 
   <p><a class="button" href="/pcap/{id}">Download PCAP</a></p>
@@ -575,12 +586,92 @@ pub async fn cdr_detail(
         },
         branches_html = render_branches(&branches),
         sip_html = render_sip_timeline(&sip_messages),
+        rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
     );
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         body,
     )
         .into_response())
+}
+
+/// Render the per-leg RTP statistics panel — a two-column "A leg /
+/// B leg" table with the most useful VoIPmonitor-derived quality
+/// metrics. Returns "" when neither leg has any data (failed calls,
+/// early hangups) so the section is omitted entirely.
+fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
+    fn dim_or_dash(v: &str) -> &str {
+        if v.is_empty() { "<span class=\"muted\">—</span>" } else { v }
+    }
+    if !rtp_a.is_populated() && !rtp_b.is_populated() {
+        return String::new();
+    }
+    let mut out = String::from("<h2>RTP statistics</h2>");
+    out.push_str(
+        "<table class=\"cdrs rtp-stats\"><thead><tr>\
+         <th>metric</th><th>A leg (caller)</th><th>B leg (callee)</th>\
+         </tr></thead><tbody>",
+    );
+    let row = |label: &str, a: &str, b: &str| -> String {
+        format!(
+            "<tr><th>{label}</th><td>{}</td><td>{}</td></tr>",
+            dim_or_dash(a),
+            dim_or_dash(b),
+        )
+    };
+    out.push_str(&row(
+        "MOS LQO",
+        &rtp_a.mos_str(),
+        &rtp_b.mos_str(),
+    ));
+    out.push_str(&row(
+        "Codec",
+        if rtp_a.codec_name.is_empty() { "" } else { &rtp_a.codec_name },
+        if rtp_b.codec_name.is_empty() { "" } else { &rtp_b.codec_name },
+    ));
+    out.push_str(&row(
+        "Packetisation (ptime)",
+        &rtp_a.ptime.map(|p| format!("{p} ms")).unwrap_or_default(),
+        &rtp_b.ptime.map(|p| format!("{p} ms")).unwrap_or_default(),
+    ));
+    out.push_str(&row("Loss", &rtp_a.loss_str(), &rtp_b.loss_str()));
+    out.push_str(&row(
+        "Avg jitter",
+        &format!("{} ms", rtp_a.avg_jitter_ms()),
+        &format!("{} ms", rtp_b.avg_jitter_ms()),
+    ));
+    out.push_str(&row(
+        "Max jitter",
+        &format!("{} ms", rtp_a.max_jitter_ms()),
+        &format!("{} ms", rtp_b.max_jitter_ms()),
+    ));
+    out.push_str(&row(
+        "Avg one-way delay",
+        &format!("{} ms", rtp_a.delay_ms()),
+        &format!("{} ms", rtp_b.delay_ms()),
+    ));
+    out.push_str(&row(
+        "RTCP cumulative loss",
+        &rtp_a.rtcp_loss.map(|n| n.to_string()).unwrap_or_default(),
+        &rtp_b.rtcp_loss.map(|n| n.to_string()).unwrap_or_default(),
+    ));
+    out.push_str(&row(
+        "RTCP max jitter",
+        &rtp_a.rtcp_maxjitter.map(|j| format!("{j} ms")).unwrap_or_default(),
+        &rtp_b.rtcp_maxjitter.map(|j| format!("{j} ms")).unwrap_or_default(),
+    ));
+    out.push_str("</tbody></table>");
+    // Footnote: explain where these come from. Analysts often want
+    // to know "is this real-time or stored?" before trusting the
+    // numbers — they ARE real-time (VoIPmonitor stores them when the
+    // call ends) but they are aggregates, not per-second.
+    out.push_str(
+        "<p class=\"muted small\">RTP stats come from VoIPmonitor's \
+         RTCP reports captured during the call. They are per-call \
+         aggregates, not time-series — for a per-second view, pull \
+         the pcap.</p>",
+    );
+    out
 }
 
 fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
