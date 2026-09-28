@@ -77,6 +77,13 @@ async-stream = "0.3"
 # distributions / Rng trait just to fill 32 bytes.
 rand = "0.8"
 
+# Pcap packet-parser — used by the SIP message timeline feature to
+# extract SIP messages from the on-disk pcap archive (the wire-format
+# source of truth) when the `sip_msg` table is empty or has a
+# non-matching schema. Handles Ethernet / IPv4 / IPv6 / UDP / TCP
+# headers and gives us a clean &[u8] view of the SIP payload.
+etherparse = "0.21"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

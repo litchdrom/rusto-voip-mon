@@ -17,6 +17,8 @@ use sqlx::{FromRow, MySqlPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+pub mod sip_pcap;
+
 /// Raw row straight from the `cdr` table.
 #[derive(Debug, Clone, FromRow)]
 pub struct CdrRow {

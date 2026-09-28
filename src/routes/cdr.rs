@@ -421,13 +421,60 @@ pub async fn cdr_detail(
     // sqlx DatabaseError message + column name show up in the log line;
     // Display on `sqlx::Error` collapses to the generic "database error"
     // and gives the operator nothing to debug against.
-    let sip_messages = match sip_messages {
+    let mut sip_messages = match sip_messages {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(cdr_id = id, error = ?e, "sip_msg fetch failed");
             Vec::new()
         }
     };
+
+    // Fallback: if the sip_msg table didn't yield anything (install
+    // doesn't populate it, schema doesn't match, or the rows were
+    // purged), parse the SIP messages straight out of the merged
+    // pcap archive. VoIPmonitor always writes the SIP wire format
+    // there — it's the source of truth. Cost: one pcap extraction
+    // per page load, bounded by the user's existing pcap_dir I/O.
+    if sip_messages.is_empty() {
+        match crate::routes::pcap::build_pcap_bytes(&state, id).await {
+            Ok(pcap_bytes) => {
+                let parsed = cdr::sip_pcap::parse_sip_messages_from_pcap(
+                    &pcap_bytes, 500,
+                );
+                if !parsed.is_empty() {
+                    tracing::info!(
+                        cdr_id = id,
+                        count = parsed.len(),
+                        "sip timeline sourced from pcap (sip_msg table empty)"
+                    );
+                    sip_messages = parsed;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    cdr_id = id, error = ?e,
+                    "pcap fallback also failed; timeline stays empty"
+                );
+            }
+        }
+    }
+
+    // Apply direction marker now that we have the final message list.
+    // `parse_sip_messages_from_pcap` doesn't know the CDR's caller IP
+    // (it's outside the cdr module), so we set direction here based
+    // on the message's source IP matching the CDR's sipcallerip.
+    if let Some(marker) = sipcallerip {
+        for m in sip_messages.iter_mut() {
+            if m.direction.is_empty() {
+                let src_int = cdr::ipv4_to_int(&m.src_ip_str);
+                m.direction = if src_int == Some(marker) {
+                    "out".to_string()
+                } else {
+                    "in".to_string()
+                };
+            }
+        }
+    }
 
     let static_fields = next.static_fields.as_ref();
     let fbasename = static_fields

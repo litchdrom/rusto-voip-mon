@@ -124,7 +124,7 @@ pub async fn download_single(
 /// Returns the full merged pcap bytes (header + every packet from SIP
 /// and RTP sources for the call, sorted by timestamp). The caller decides
 /// how to ship those bytes back to the client.
-async fn build_pcap_bytes(state: &AppState, cdr_id: u64) -> AppResult<Vec<u8>> {
+pub(crate) async fn build_pcap_bytes(state: &AppState, cdr_id: u64) -> AppResult<Vec<u8>> {
     let parts = crate::error::with_query_timeout(
         state.config.query_timeout_secs,
         fetch_parts(&state.pool, cdr_id),

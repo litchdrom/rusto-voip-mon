@@ -27,7 +27,10 @@ An open-source web GUI for [VoIPmonitor](https://www.voipmonitor.org/), written 
     one zip"), per-operator TZ override, CSV export, distinct-value dropdowns
 - **CDR detail** (`GET /cdr/:id`) — basic fields, `cdr_next` extension,
   call-leg table, SIP message timeline (colour-coded method + response
-  code, direction arrow, raw SIP body behind a per-row toggle)
+  code, direction arrow, raw SIP body behind a per-row toggle).
+  Tries the `sip_msg` table first; falls back to parsing the SIP
+  messages out of the merged pcap archive (with `etherparse`) when
+  the table is empty or schema-mismatched.
 - **PCAP download**
   - `GET /pcap/:cdr_id` — single merged SIP + RTP pcap, streamed
     byte-for-byte from the minute's `tar.zst` (no full-archive load),
