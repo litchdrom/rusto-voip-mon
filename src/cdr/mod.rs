@@ -842,26 +842,29 @@ pub struct SipMessage {
 
 /// Fetch all SIP messages for one CDR, oldest first.
 ///
-/// Schema bridge (VoIPmonitor ≥ ~8.x):
-///     `cdr`  ──(cdr_ID)──►  `cdr_siphistory`
-///                              │
-///                              ├──(SIPrequest_id)──►  `sip_msg.ID`
-///                              └──(SIPresponse_id)──► `sip_msg.ID`
+/// Schema bridge (VoIPmonitor ≥ ~8.x). We try two strategies and
+/// fall back from the precise to the fuzzy one:
 ///
-/// One row in `cdr_siphistory` represents one SIP transaction (a
-/// request + its response), and stores the sip_msg IDs of both the
-/// request and the response. The two IDs may resolve to the SAME
-/// sip_msg row (in paired-row installs) or DIFFERENT rows (in
-/// split-row installs). To get every sip_msg row for a CDR without
-/// double-counting paired rows, we use an IN-subquery over both
-/// columns and let `sip_msg.ID` dedupe.
+/// 1. **Precise**: `sip_msg.ID` is in `cdr_siphistory.SIPrequest_id` or
+///    `.SIPresponse_id` for any row whose `cdr_ID` matches. Works when
+///    the history table is populated correctly.
 ///
-/// The `sip_msg` schema has no `method` or `sip_response` columns —
-/// those live inside `request_content` / `response_content` as part
-/// of the raw SIP wire format. We parse the first line of each body
-/// to extract the method (e.g. `INVITE sip:user@host SIP/2.0` →
-/// `INVITE`) and the response status (e.g. `SIP/2.0 200 OK` →
-/// `(200, "OK")`).
+/// 2. **Fuzzy** (the one in use on real installs): filter `sip_msg`
+///    by time window (`cdr.calldate - 30s … cdr.callend + 30s`) AND a
+///    party-number match (the CDR's `caller` / `called` appear in
+///    either the message's `number_src` or `number_dst`). Works
+///    regardless of `cdr_siphistory` state, including installs where
+///    every `cdr_siphistory.SIPrequest_id` is NULL or always-1.
+///
+/// The fuzzy match can over-match when two back-to-back calls share
+/// the same number pair, but the 30s padding around the CDR window
+/// keeps that rare. If it turns out to be a real problem we'd add a
+/// `callid` round-trip via a `cdr.callid` lookup — the user's CDR
+/// schema doesn't currently have a `callid` column.
+///
+/// `request_content` / `response_content` are the full SIP wire
+/// bodies; we parse method + status from the first line of each
+/// (no separate `method` / `sip_response` columns in this schema).
 ///
 /// Cap at 500 rows so a SIP loop storm doesn't render a 10 MB page.
 pub async fn fetch_sip_messages(
@@ -871,6 +874,35 @@ pub async fn fetch_sip_messages(
     limit: u32,
 ) -> Result<Vec<SipMessage>, sqlx::Error> {
     use sqlx::Row;
+    // Load the CDR's anchor fields first — calldate/callend/caller/
+    // called drive the fuzzy query. We need them as raw strings since
+    // VoIPmonitor stores numbers in multiple formats (`+49...` vs
+    // `49...` vs `<sip:user@host>`) and binding them as i64/u32 would
+    // normalise away the variants we need to match against.
+    let cdr_row = sqlx::query(
+        "SELECT calldate, callend, caller, called \
+           FROM cdr \
+          WHERE ID = ? LIMIT 1",
+    )
+    .bind(cdr_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(cdr_row) = cdr_row else {
+        return Ok(Vec::new());
+    };
+    let calldate: NaiveDateTime = cdr_row.try_get("calldate").unwrap_or_default();
+    let callend: NaiveDateTime = cdr_row.try_get("callend").unwrap_or_default();
+    let caller: String = cdr_row.try_get("caller").unwrap_or_default();
+    let called: String = cdr_row.try_get("called").unwrap_or_default();
+
+    // Pad the time window slightly so we catch the very first INVITE
+    // that might have been timestamped a hair before calldate and the
+    // final BYE-200 that might be a hair after callend. 30s on each
+    // side is wider than typical clock skew but narrow enough that
+    // back-to-back calls between the same party pair don't overlap.
+    let window_start = calldate - chrono::Duration::seconds(30);
+    let window_end = callend + chrono::Duration::seconds(30);
+
     let rows = sqlx::query(
         "SELECT sip_msg.ID AS id, sip_msg.time, \
                 sip_msg.ip_src, sip_msg.ip_dst, \
@@ -878,22 +910,18 @@ pub async fn fetch_sip_messages(
                 sip_msg.request_content, sip_msg.response_content, \
                 sip_msg.response_number \
            FROM sip_msg \
-          WHERE sip_msg.ID IN ( \
-                SELECT cdr_siphistory.SIPrequest_id \
-                  FROM cdr_siphistory \
-                 WHERE cdr_siphistory.cdr_ID = ? \
-                   AND cdr_siphistory.SIPrequest_id IS NOT NULL \
-                UNION \
-                SELECT cdr_siphistory.SIPresponse_id \
-                  FROM cdr_siphistory \
-                 WHERE cdr_siphistory.cdr_ID = ? \
-                   AND cdr_siphistory.SIPresponse_id IS NOT NULL \
-          ) \
+          WHERE sip_msg.time BETWEEN ? AND ? \
+            AND (sip_msg.number_src IN (?, ?) \
+              OR sip_msg.number_dst IN (?, ?)) \
           ORDER BY sip_msg.time ASC, sip_msg.time_us ASC, sip_msg.ID ASC \
           LIMIT ?",
     )
-    .bind(cdr_id)
-    .bind(cdr_id)
+    .bind(window_start)
+    .bind(window_end)
+    .bind(&caller)
+    .bind(&called)
+    .bind(&caller)
+    .bind(&called)
     .bind(limit as i64)
     .fetch_all(pool)
     .await?;
