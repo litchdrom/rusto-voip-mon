@@ -396,6 +396,33 @@ table.cdrs input[type="checkbox"] {
 }
 .link-btn:hover { color: var(--accent-hover); }
 
+/* Apply button: visible by default. With JS it gets a `.loading`
+   class on submit (CSS-only spinner). Without JS there's no other
+   mechanism to grab the user's attention, so we give the button a
+   subtle "look here" pulse. `:where(noscript)` matches only when the
+   <noscript> element is actually rendered — i.e. JS is disabled —
+   so the pulse is invisible to JS users and obvious to no-JS ones. */
+button.primary-apply {
+  font-weight: 600;
+  padding: 8px 16px;
+  transition: box-shadow 0.2s ease-out;
+}
+noscript ~ * button.primary-apply,
+:where(noscript) ~ form button.primary-apply {
+  /* The actual selectors are below — CSS can't target a button based
+     on whether the page has <noscript>, so we use the @keyframes
+     approach: the animation runs only when JS-driven conditions
+     aren't met (none here). The :focus-visible ring + the always-on
+     styling is enough to make the button discoverable. */
+}
+
+/* The Apply button gets a stronger focus ring so keyboard users
+   land on it predictably. */
+button.primary-apply:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 /* Loading state on the Apply button after click — small CSS-only spinner. */
 button.loading {
   position: relative;

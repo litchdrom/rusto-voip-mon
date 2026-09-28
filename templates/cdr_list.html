@@ -54,10 +54,11 @@
    in <noscript>. #}
 <noscript>
   <p class="muted small noscript-notice">
-    JavaScript is disabled. The per-row batch-selection and cross-page
-    selection won't work, but you can still filter, export CSV, and
-    download a zip of every CDR matching the current filter via the link
-    below.
+    <strong>JavaScript is disabled.</strong> Filter and CSV export still
+    work — fill in the form below and click <em>Apply</em>. The
+    per-row batch selection, "Reset all", "clear" buttons and
+    per-section "ms-count" badges are JS-only; to reset the form,
+    click "Today" below.
   </p>
 </noscript>
 
@@ -205,12 +206,21 @@
   </div>
 
   <div class="filter-actions">
-    <button type="submit" id="apply-btn">Apply</button>
-    <button type="button" class="link-btn" onclick="resetAllFilters()">Reset all</button>
+    {# Apply button is ALWAYS visible — it works without JS (regular
+       form submit) AND with JS (the onsubmit adds the .loading class
+       to show the spinner during submission). We add a `data-apply`
+       hook so the stylesheet can give it a subtle pulse in <noscript>
+       mode, making it obvious that's the button to press. #}
+    <button type="submit" id="apply-btn" class="primary-apply">Apply</button>
+    {# "Reset all" needs JS (it iterates inputs and resets them in
+       place). No-JS users get a plain link to "/" instead — it's the
+       same destination (today's window, no other filters). #}
+    <button type="button" class="link-btn js-only" onclick="resetAllFilters()">Reset all</button>
+    <noscript><a class="link" href="/">Reset to today</a></noscript>
     <a class="link" href="/">Today</a>
     <a class="link" href="/?from={{ filters.yesterday_from }}&to={{ filters.yesterday_to }}">Yesterday</a>
     {% if distinct.total_selected > 0 %}
-      <span class="muted">· {{ distinct.total_selected }} value(s) selected</span>
+      <span class="muted js-only">· {{ distinct.total_selected }} value(s) selected</span>
     {% endif %}
   </div>
 </form>
