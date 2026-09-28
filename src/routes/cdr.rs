@@ -382,29 +382,61 @@ pub async fn cdr_detail(
     axum::extract::Path(id): axum::extract::Path<u64>,
 ) -> AppResult<Response> {
     let timeout = state.config.query_timeout_secs;
-    let row: Option<CdrRow> = crate::error::with_query_timeout(
+    // Try the full SELECT first (with per-leg RTP stats). If the live
+    // install is missing any of the new columns (older VoIPmonitor
+    // version, custom cdr table, etc.) fall back to a minimal SELECT
+    // so the page still renders — the RTP panel is omitted (it hides
+    // itself when every leg is unpopulated). One warning per process is
+    // plenty; we don't want to spam the log every page load.
+    let full_select = "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
+                       caller, callername, called, sipcallerip, sipcalledip, \
+                       lastSIPresponseNum AS `last_sip_response_num`, \
+                       mos_min_mult10, a_lost, b_lost, id_sensor, \
+                       a_mos_lqo_mult10, b_mos_lqo_mult10, \
+                       a_received, b_received, \
+                       a_avgjitter_mult10, b_avgjitter_mult10, \
+                       a_maxjitter, b_maxjitter, \
+                       a_packet_loss_perc_mult1000, b_packet_loss_perc_mult1000, \
+                       a_delay_avg_mult100, b_delay_avg_mult100, \
+                       a_rtcp_loss, b_rtcp_loss, \
+                       a_rtcp_maxjitter, b_rtcp_maxjitter, \
+                       a_payload, b_payload, \
+                       a_rtp_ptime, b_rtp_ptime \
+                  FROM cdr WHERE ID = ? LIMIT 1";
+    let minimal_select = "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
+                                caller, callername, called, sipcallerip, sipcalledip, \
+                                lastSIPresponseNum AS `last_sip_response_num`, \
+                                mos_min_mult10, a_lost, b_lost, id_sensor \
+                           FROM cdr WHERE ID = ? LIMIT 1";
+    let row_result = crate::error::with_query_timeout(
         timeout,
-        sqlx::query_as(
-            "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
-                    caller, callername, called, sipcallerip, sipcalledip, \
-                    lastSIPresponseNum AS `last_sip_response_num`, \
-                    mos_min_mult10, a_lost, b_lost, id_sensor, \
-                    a_mos_lqo_mult10, b_mos_lqo_mult10, \
-                    a_received, b_received, \
-                    a_avgjitter_mult10, b_avgjitter_mult10, \
-                    a_maxjitter, b_maxjitter, \
-                    a_packet_loss_perc_mult1000, b_packet_loss_perc_mult1000, \
-                    a_delay_avg_mult100, b_delay_avg_mult100, \
-                    a_rtcp_loss, b_rtcp_loss, \
-                    a_rtcp_maxjitter, b_rtcp_maxjitter, \
-                    a_payload, b_payload, \
-                    a_rtp_ptime, b_rtp_ptime \
-               FROM cdr WHERE ID = ? LIMIT 1",
-        )
-        .bind(id)
-        .fetch_optional(&state.pool),
+        sqlx::query_as::<_, CdrRow>(full_select)
+            .bind(id)
+            .fetch_optional(&state.pool),
     )
-    .await?;
+    .await;
+    let row: Option<CdrRow> = match row_result {
+        Ok(r) => r,
+        Err(AppError::Sqlx(sqlx::Error::ColumnNotFound(col))) => {
+            // Live cdr table is missing at least one of the new RTP
+            // columns. Log once per occurrence (not per page load —
+            // the operator needs to know but we don't want to flood)
+            // and fall back to the minimal SELECT.
+            tracing::warn!(
+                cdr_id = id,
+                missing_column = %col,
+                "cdr table is missing RTP column — falling back to minimal SELECT"
+            );
+            crate::error::with_query_timeout(
+                timeout,
+                sqlx::query_as::<_, CdrRow>(minimal_select)
+                    .bind(id)
+                    .fetch_optional(&state.pool),
+            )
+            .await?
+        }
+        Err(e) => return Err(e),
+    };
 
     let Some(cdr) = row else {
         return Ok((StatusCode::NOT_FOUND, "CDR not found").into_response());
