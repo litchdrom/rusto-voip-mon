@@ -33,7 +33,7 @@ pub struct CdrListTemplate {
     pub filters: FiltersView,
     pub distinct: DistinctView,
     pub export_url: String,
-    /// Same filter as `export_url`, aimed at GET /pcap/batch вЂ” used by
+    /// Same filter as `export_url`, aimed at GET /pcap/batch — used by
     /// the <noscript> fallback link for "Download zip of all matching".
     /// When no filter is set, this is just `/pcap/batch` (which the
     /// server will 400 on, but the link is harmless and honest).
@@ -261,7 +261,7 @@ fn url_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-// (No ListQuery struct вЂ” multi-value fields don't work with serde_urlencoded,
+// (No ListQuery struct — multi-value fields don't work with serde_urlencoded,
 // so we parse the raw query string ourselves via RawQuery.)
 
 pub async fn cdr_list(
@@ -312,7 +312,7 @@ pub async fn cdr_list(
 
     let view = FiltersView::from(&filters, tz);
     let export_url = format!("/cdr/export.csv{}", view.export_query());
-    // Same filter, different endpoint вЂ” the <noscript> fallback "Download
+    // Same filter, different endpoint — the <noscript> fallback "Download
     // zip of all matching" link. Built server-side so the template can
     // emit a plain <a href="/pcap/batch?filter=..."> without trying to
     // strip the leading `?` or url-encode in askama.
@@ -385,21 +385,21 @@ pub async fn cdr_detail(
     // Try the full SELECT first (with per-leg RTP stats). If the live
     // install is missing any of the new columns (older VoIPmonitor
     // version, custom cdr table, etc.) fall back to a minimal SELECT
-    // so the page still renders вЂ” the RTP panel is omitted (it hides
+    // so the page still renders — the RTP panel is omitted (it hides
     // itself when every leg is unpopulated). One warning per process is
     // plenty; we don't want to spam the log every page load.
     let full_select = format!(
         "SELECT {} FROM cdr WHERE ID = ? LIMIT 1",
         cdr::CDR_FULL_SELECT_COLUMNS,
     );
-    // Fallback for installs where some RTP columns are missing вЂ”
+    // Fallback for installs where some RTP columns are missing —
     // pre-`a_mos_lqo_mult10` schema. The minimal SELECT still satisfies
     // sqlx's `FromRow` derive because every remaining column on
-    // CdrRow is Option<_> вЂ” sqlx fills missing columns with None.
+    // CdrRow is Option<_> — sqlx fills missing columns with None.
     //
     // NOTE: this assumes the live cdr table at minimum has all the
     // pre-RTP columns. If a column in that minimal set is also
-    // missing, we hit ColumnNotFound again вЂ” at which point the
+    // missing, we hit ColumnNotFound again — at which point the
     // operator needs to fall back to a much older binary or patch
     // their schema.
     let minimal_select = "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
@@ -418,13 +418,13 @@ pub async fn cdr_detail(
         Ok(r) => r,
         Err(AppError::Sqlx(sqlx::Error::ColumnNotFound(col))) => {
             // Live cdr table is missing at least one of the new RTP
-            // columns. Log once per occurrence (not per page load вЂ”
+            // columns. Log once per occurrence (not per page load —
             // the operator needs to know but we don't want to flood)
             // and fall back to the minimal SELECT.
             tracing::warn!(
                 cdr_id = id,
                 missing_column = %col,
-                "cdr table is missing RTP column вЂ” falling back to minimal SELECT"
+                "cdr table is missing RTP column — falling back to minimal SELECT"
             );
             crate::error::with_query_timeout(
                 timeout,
@@ -441,12 +441,12 @@ pub async fn cdr_detail(
         return Ok((StatusCode::NOT_FOUND, "CDR not found").into_response());
     };
     // Capture the caller IP before the CdrSummary conversion drops it
-    // вЂ” used as the direction marker for the SIP timeline (an outgoing
+    // — used as the direction marker for the SIP timeline (an outgoing
     // request is one whose `sipcallerip` matches the CDR's own).
     let sipcallerip = cdr.sipcallerip;
     let cdr = CdrSummary::from(cdr);
 
-    // Pull the optional extension tables in parallel вЂ” all three are tiny.
+    // Pull the optional extension tables in parallel — all three are tiny.
     let (next, branches, sip_messages) = tokio::join!(
         crate::error::with_query_timeout(timeout, cdr::fetch_cdr_next(&state.pool, id)),
         crate::error::with_query_timeout(timeout, cdr::fetch_cdr_branches(&state.pool, id)),
@@ -457,7 +457,7 @@ pub async fn cdr_detail(
     );
     let next = next?;
     let branches = branches?;
-    // SIP fetch failure is non-fatal вЂ” we just render the page without
+    // SIP fetch failure is non-fatal — we just render the page without
     // the timeline. Logging uses Debug (not Display) so the underlying
     // sqlx DatabaseError message + column name show up in the log line;
     // Display on `sqlx::Error` collapses to the generic "database error"
@@ -474,7 +474,7 @@ pub async fn cdr_detail(
     // doesn't populate it, schema doesn't match, or the rows were
     // purged), parse the SIP messages straight out of the merged
     // pcap archive. VoIPmonitor always writes the SIP wire format
-    // there вЂ” it's the source of truth. Cost: one pcap extraction
+    // there — it's the source of truth. Cost: one pcap extraction
     // per page load, bounded by the user's existing pcap_dir I/O.
     if sip_messages.is_empty() {
         match crate::routes::pcap::build_pcap_bytes(&state, id).await {
@@ -618,7 +618,7 @@ pub async fn cdr_detail(
         },
         branches_html = render_branches(&branches),
         // sngrep-style call flow sits between the call-leg / RTP
-        // panels and the SIP message timeline вЂ” the eye reads it as
+        // panels and the SIP message timeline — the eye reads it as
         // "what shape did the call have?" before drilling into the
         // per-message details below. Reuses the same SipMessage
         // vector; no extra fetch.
@@ -633,7 +633,7 @@ pub async fn cdr_detail(
         .into_response())
 }
 
-/// Render the per-leg RTP statistics panel вЂ” a two-column "A leg /
+/// Render the per-leg RTP statistics panel — a two-column "A leg /
 /// Render the SIP message timeline in the classic `sngrep` style:
 /// two horizontal rows (outgoing from us, incoming to us), each
 /// message rendered as a small chip showing `method + response
@@ -728,17 +728,39 @@ fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
 /// early hangups) so the section is omitted entirely.
 fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
     fn dim_or_dash(v: &str) -> &str {
-        if v.is_empty() { "<span class=\"muted\">вЂ”</span>" } else { v }
+        if v.is_empty() { "<span class=\"muted\">—</span>" } else { v }
     }
     if !rtp_a.is_populated() && !rtp_b.is_populated() {
         return String::new();
     }
+    // Sub-header line per leg showing the RTP-level source IP and the
+    // other leg's source IP joined with a bidirectional arrow. VoIP-
+    // monitor's `a_saddr` / `b_saddr` are the hosts that sent RTP in
+    // each direction — they can differ from `sipcallerip` / `sipcalledip`
+    // when media traverses a relay, which is the exact case where the
+    // analyst most needs to see them.
+    fn ip_subhead(leg: &cdr::RtpLeg) -> String {
+        if leg.src_ip_str.is_empty() && leg.dst_ip_str.is_empty() {
+            return String::from("<small class=\"muted\">no RTP endpoints</small>");
+        }
+        let src = html_escape(&leg.src_ip_str);
+        let dst = html_escape(&leg.dst_ip_str);
+        match (leg.src_ip_str.is_empty(), leg.dst_ip_str.is_empty()) {
+            (true, false) => format!("<small>&rarr; {dst}</small>"),
+            (false, true) => format!("<small>{src}</small>"),
+            (false, false) => format!("<small>{src} &harr; {dst}</small>"),
+            _ => unreachable!(),
+        }
+    }
     let mut out = String::from("<h2>RTP statistics</h2>");
-    out.push_str(
-        "<table class=\"cdrs rtp-stats\"><thead><tr>\
-         <th>metric</th><th>A leg (caller)</th><th>B leg (callee)</th>\
-         </tr></thead><tbody>",
-    );
+    out.push_str(&format!(
+        "<table class=\"cdrs rtp-stats\"><thead>\
+         <tr><th>metric</th><th>A leg (caller)<br>{}</th>\
+         <th>B leg (callee)<br>{}</th></tr>\
+         </thead><tbody>",
+        ip_subhead(rtp_a),
+        ip_subhead(rtp_b),
+    ));
     let row = |label: &str, a: &str, b: &str| -> String {
         format!(
             "<tr><th>{label}</th><td>{}</td><td>{}</td></tr>",
@@ -746,6 +768,13 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
             dim_or_dash(b),
         )
     };
+    // VoIPmonitor's "jitter" columns (a_avgjitter_mult10, a_maxjitter)
+    // are interarrival times, not RFC 3550 smoothed jitter — explain
+    // it via the `title` attribute so the label can stay short.
+    let jitter_tooltip = "VoIPmonitor's avg/max \"jitter\" is the \
+         average / worst packet-to-packet interarrival time, not RFC \
+         3550 smoothed jitter. See \"RTCP max jitter\" for the RFC 3550 \
+         estimate that matches Wireshark.";
     out.push_str(&row(
         "MOS LQO",
         &rtp_a.mos_str(),
@@ -762,15 +791,17 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
         &rtp_b.ptime.map(|p| format!("{p} ms")).unwrap_or_default(),
     ));
     out.push_str(&row("Loss", &rtp_a.loss_str(), &rtp_b.loss_str()));
-    out.push_str(&row(
-        "Avg jitter",
-        &format!("{} ms", rtp_a.avg_jitter_ms()),
-        &format!("{} ms", rtp_b.avg_jitter_ms()),
+    out.push_str(&format!(
+        "<tr><th title=\"{jt}\">Avg interarrival</th><td>{} ms</td><td>{} ms</td></tr>",
+        rtp_a.avg_jitter_ms(),
+        rtp_b.avg_jitter_ms(),
+        jt = jitter_tooltip,
     ));
-    out.push_str(&row(
-        "Max jitter",
-        &format!("{} ms", rtp_a.max_jitter_ms()),
-        &format!("{} ms", rtp_b.max_jitter_ms()),
+    out.push_str(&format!(
+        "<tr><th title=\"{jt}\">Max interarrival</th><td>{} ms</td><td>{} ms</td></tr>",
+        rtp_a.max_jitter_ms(),
+        rtp_b.max_jitter_ms(),
+        jt = jitter_tooltip,
     ));
     out.push_str(&row(
         "Avg one-way delay",
@@ -790,12 +821,12 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
     out.push_str("</tbody></table>");
     // Footnote: explain where these come from. Analysts often want
     // to know "is this real-time or stored?" before trusting the
-    // numbers вЂ” they ARE real-time (VoIPmonitor stores them when the
+    // numbers — they ARE real-time (VoIPmonitor stores them when the
     // call ends) but they are aggregates, not per-second.
     out.push_str(
         "<p class=\"muted small\">RTP stats come from VoIPmonitor's \
          RTCP reports captured during the call. They are per-call \
-         aggregates, not time-series вЂ” for a per-second view, pull \
+         aggregates, not time-series — for a per-second view, pull \
          the pcap.</p>",
     );
     out
@@ -848,7 +879,7 @@ fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
 /// row with no request block.
 ///
 /// The cap is enforced server-side (500 in `fetch_sip_messages`); if
-/// we hit it the heading shows "+ more not shown вЂ” check the pcap".
+/// we hit it the heading shows "+ more not shown — check the pcap".
 fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     if messages.is_empty() {
         return String::new();
@@ -886,7 +917,7 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
         let dst = html_escape(&m.dst_ip_str);
         let content_type = html_escape(&m.content_type);
         // Build the expandable body. Only show the toggle when there's
-        // something useful to look at вЂ” bare CANCEL/ACK messages often
+        // something useful to look at — bare CANCEL/ACK messages often
         // have empty content and showing them is just noise.
         let body_html = if m.content.trim().is_empty() {
             String::new()
@@ -917,7 +948,7 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     out
 }
 
-/// CSS class for the response-code cell вЂ” colors 1xx / 2xx / 3xx /
+/// CSS class for the response-code cell — colors 1xx / 2xx / 3xx /
 /// 4xx / 5xx / 6xx distinctly so a glance at the column tells you
 /// which leg failed.
 fn sip_code_class(code: u16) -> &'static str {
@@ -932,7 +963,7 @@ fn sip_code_class(code: u16) -> &'static str {
     }
 }
 
-/// CSS class for the method cell вЂ” INVITE / BYE / CANCEL are the
+/// CSS class for the method cell — INVITE / BYE / CANCEL are the
 /// "lifecycle" methods that matter when triaging a failed call;
 /// the rest are answered with a neutral colour.
 fn sip_method_class(method: &str) -> &'static str {
@@ -955,7 +986,7 @@ fn sip_method_class(method: &str) -> &'static str {
     }
 }
 
-/// Minimal HTML escape вЂ” good enough for v0.1 since headers come from
+/// Minimal HTML escape — good enough for v0.1 since headers come from
 /// trusted admin-configured SIP traffic, but use a real sanitizer if you
 /// ever start rendering attacker-controlled data.
 fn html_escape(s: &str) -> String {
@@ -999,7 +1030,7 @@ pub async fn cdr_export_csv(
     let cap = per_request.unwrap_or(state.config.csv_export_limit);
 
     // Spawn the streaming query (sync call). We can't time-bound it
-    // directly вЂ” `list_stream` returns immediately and a background task
+    // directly — `list_stream` returns immediately and a background task
     // drives the cursor. Instead, we wait for the *first* row with the
     // configured timeout: if the server can't produce one within `timeout`
     // seconds, we 504 and drop the channel. Once rows start flowing, the
@@ -1022,7 +1053,7 @@ pub async fn cdr_export_csv(
             return;
         }
 
-        // Wait for the first row with a timeout вЂ” bounds the initial
+        // Wait for the first row with a timeout — bounds the initial
         // query latency. Subsequent rows stream without a per-row cap.
         let first_row = if timeout > 0 {
             tokio::time::timeout(
@@ -1110,7 +1141,7 @@ pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilter
         called: q.called.clone().filter(|s| !s.is_empty()),
         // `caller_in` / `called_in` are the multi-value exact-match fields.
         // Repeated keys (`?caller_in=A&caller_in=B`) AND a comma-joined
-        // single key (`?caller_in=A,B`) both work вЂ” the SQL is a single
+        // single key (`?caller_in=A,B`) both work — the SQL is a single
         // `caller IN (?, ?, ?)` rather than a chain of `LIKE OR LIKE`.
         caller_in: merge_str_list(params.all("caller_in")),
         called_in: merge_u64_list(params.all("called_in")),
@@ -1131,7 +1162,7 @@ pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilter
 
 /// All query parameters parsed into a `name -> Vec<value>` map. We parse
 /// manually because `serde_urlencoded` does not aggregate repeated keys
-/// into `Vec<String>` вЂ” every `key=value` pair is delivered individually
+/// into `Vec<String>` — every `key=value` pair is delivered individually
 /// as a String to deserialize, which fails for sequence types.
 #[derive(Debug, Default, Clone)]
 pub struct QueryParams {
@@ -1181,7 +1212,7 @@ pub fn parse_query_params(raw: &str) -> QueryParams {
     out
 }
 
-/// Scalar params only вЂ” multi-value fields are pulled separately from
+/// Scalar params only — multi-value fields are pulled separately from
 /// `QueryParams` because of the serde_urlencoded limitation described
 /// above.
 #[derive(Debug, Default)]
@@ -1231,7 +1262,7 @@ pub(crate) fn merge_str_list(values: Option<&[String]>) -> Vec<String> {
 }
 
 /// Like `merge_str_list` but parses each value as `u64`. Non-numeric
-/// entries are silently dropped вЂ” the URL contract is "list of numbers",
+/// entries are silently dropped — the URL contract is "list of numbers",
 /// so `?called_in=abc` shouldn't blow up; it just contributes nothing.
 pub(crate) fn merge_u64_list(values: Option<&[String]>) -> Vec<u64> {
     merge_str_list(values)
@@ -1376,9 +1407,9 @@ mod sip_render_tests {
             content: String::new(),
         };
         let html = render_sip_timeline(&[mk("INVITE", 200), mk("INVITE", 503)]);
-        // First row: success вЂ” green 2xx class.
+        // First row: success — green 2xx class.
         assert!(html.contains(r#"class="num sip-2xx""#));
-        // Second row: failure вЂ” red 5xx class + red 5xx method class.
+        // Second row: failure — red 5xx class + red 5xx method class.
         assert!(html.contains(r#"class="num sip-5xx""#));
         // Method cell uses the invite highlight class.
         assert!(html.contains("sip-method-invite"));
@@ -1386,7 +1417,7 @@ mod sip_render_tests {
         assert!(html.contains(r#"class="num dir-out">в†’<"#));
     }
 
-    /// Helper for the call-flow tests below вЂ” makes a synthetic SIP
+    /// Helper for the call-flow tests below — makes a synthetic SIP
     /// message at `seconds_offset` after the call start.
     fn mk_msg(method: &str, code: u16, seconds_offset: f64) -> cdr::SipMessage {
         let t0 = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)

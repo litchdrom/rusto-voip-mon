@@ -43,6 +43,14 @@ pub struct RtpLeg {
     /// Codec name derived from the RTP payload type (e.g. "G.711 µ-law"
     /// for PT=0). Empty string when PT is unknown.
     pub codec_name: String,
+    /// Source IP of this leg (a_saddr / b_saddr as int) pre-formatted
+    /// to dotted-quad. Empty string when VoIPmonitor didn't populate
+    /// the column.
+    pub src_ip_str: String,
+    /// "Other" endpoint's IP — for the A leg (caller) this is the
+    /// callee's address; for the B leg (callee) it's the caller's.
+    /// Pre-formatted dotted-quad or empty string.
+    pub dst_ip_str: String,
 }
 
 impl RtpLeg {
@@ -151,6 +159,14 @@ pub struct CdrRow {
     pub b_payload: Option<i32>,
     pub a_rtp_ptime: Option<u8>,
     pub b_rtp_ptime: Option<u8>,
+    /// Source IP of leg A (the caller's side) as a host-order int.
+    /// Stored as `a_saddr` in cdr; we render it as a dotted-quad in
+    /// the RTP panel so the analyst can see at a glance which leg
+    /// corresponds to which endpoint IP.
+    pub a_saddr: Option<u32>,
+    /// Source IP of leg B (the callee's side). Same purpose as
+    /// `a_saddr` but for the B leg.
+    pub b_saddr: Option<u32>,
 }
 
 /// All `cdr` columns that `CdrRow` expects via `FromRow`. Every
@@ -175,7 +191,8 @@ pub const CDR_FULL_SELECT_COLUMNS: &str = "ID AS `id`, calldate, callend, durati
         a_rtcp_loss, b_rtcp_loss, \
         a_rtcp_maxjitter, b_rtcp_maxjitter, \
         a_payload, b_payload, \
-        a_rtp_ptime, b_rtp_ptime";
+        a_rtp_ptime, b_rtp_ptime, \
+        a_saddr, b_saddr";
 
 /// View struct used by templates and the CSV exporter.
 #[derive(Debug, Clone, Serialize)]
@@ -216,16 +233,42 @@ impl RtpLeg {
             .unwrap_or_default()
     }
 
-    /// Loss rendered as "N (P.P%)" — count first, percent in parens.
-    /// Returns "" if both fields are unset.
+    /// Loss rendered with denominator context — "N / T (P.P%)" where
+    /// T = lost + received (the packets VoIPmonitor saw on this leg).
+    /// "21.0%" alone is meaningless without a denominator; "5 / 23
+    /// (21.0%)" reads as "5 packets lost out of 23 total". Falls back
+    /// gracefully when only some fields are populated.
     pub fn loss_str(&self) -> String {
-        match (self.lost, self.loss_perc_mult1000) {
-            (None, None) => String::new(),
-            (Some(n), Some(perc)) => {
-                format!("{} ({:.1}%)", n, perc as f32 / 10.0)
+        let pct = self
+            .loss_perc_mult1000
+            .map(|p| format!(" ({:.1}%)", p as f32 / 10.0));
+        match (self.lost, self.received) {
+            // Both unset — show percent only (no count to precede it).
+            (None, None) => pct
+                .map(|p| p.trim_start().to_string())
+                .unwrap_or_default(),
+            // The interesting case — both populated.
+            (Some(lost), Some(received)) => {
+                let total = lost + received;
+                let mut s = format!("{} / {}", lost, total);
+                if let Some(p) = pct {
+                    s.push_str(&p);
+                }
+                s
             }
-            (Some(n), None) => n.to_string(),
-            (None, Some(perc)) => format!("({:.1}%)", perc as f32 / 10.0),
+            // Lost known, received missing — drop the denominator.
+            (Some(n), None) => match pct {
+                Some(p) => format!("{}{}", n, p),
+                None => n.to_string(),
+            },
+            // Received known, lost missing — show received only as a
+            // last-resort. We can't reconstruct the denominator, so
+            // don't pretend. The "(P.P%)" is still meaningful because
+            // VoIPmonitor stored it independently.
+            (None, Some(r)) => match pct {
+                Some(p) => format!("{}{}", r, p),
+                None => r.to_string(),
+            },
         }
     }
 
@@ -260,8 +303,17 @@ impl From<CdrRow> for CdrSummary {
             .mos_min_mult10
             .map(|m| format!("{:.1}", m as f32 / 10.0))
             .unwrap_or_default();
+        // SIP-signalling endpoints (used by the SIP flow table).
         let src_ip_str = row.sipcallerip.map(int_to_ipv4).unwrap_or_default();
         let dst_ip_str = row.sipcalledip.map(int_to_ipv4).unwrap_or_default();
+        // RTP-level endpoints: a_saddr is the host that sent RTP to
+        // us in the caller direction; b_saddr is the host that sent
+        // RTP to us in the callee direction. They can differ from the
+        // SIP endpoints when the call is behind a media relay
+        // (RTPEngine, SBC). Pre-format both legs so the template can
+        // show "from X.X.X.X → Y.Y.Y.Y" without re-encoding.
+        let a_saddr_str = row.a_saddr.map(int_to_ipv4).unwrap_or_default();
+        let b_saddr_str = row.b_saddr.map(int_to_ipv4).unwrap_or_default();
         let rtp_a = RtpLeg {
             mos_lqo_mult10: row.a_mos_lqo_mult10,
             lost: row.a_lost,
@@ -275,6 +327,8 @@ impl From<CdrRow> for CdrSummary {
             payload: row.a_payload,
             ptime: row.a_rtp_ptime,
             codec_name: row.a_payload.map(codec_name_from_pt).unwrap_or("").to_string(),
+            src_ip_str: a_saddr_str.clone(),
+            dst_ip_str: b_saddr_str.clone(),
         };
         let rtp_b = RtpLeg {
             mos_lqo_mult10: row.b_mos_lqo_mult10,
@@ -289,6 +343,8 @@ impl From<CdrRow> for CdrSummary {
             payload: row.b_payload,
             ptime: row.b_rtp_ptime,
             codec_name: row.b_payload.map(codec_name_from_pt).unwrap_or("").to_string(),
+            src_ip_str: b_saddr_str,
+            dst_ip_str: a_saddr_str,
         };
         Self {
             id: row.id,
@@ -1399,6 +1455,8 @@ mod rtp_leg_tests {
         assert_eq!(leg.max_jitter_ms(), "");
         assert_eq!(leg.delay_ms(), "");
         assert_eq!(leg.codec_name, "");
+        assert_eq!(leg.src_ip_str, "");
+        assert_eq!(leg.dst_ip_str, "");
     }
 
     #[test]
@@ -1410,20 +1468,47 @@ mod rtp_leg_tests {
     }
 
     #[test]
-    fn rtp_leg_loss_str_combines_count_and_percent() {
-        // Both present → "N (P.P%)".
+    fn rtp_leg_loss_str_shows_denominator_with_percent() {
+        // The user complained "21.0% los. 21 % from what?" — the fix
+        // is to put the total-packet count next to the lost count.
+        // lost=5, received=18 → total=23 → "5 / 23 (21.7%)".
         let leg = RtpLeg {
-            lost: Some(150),
-            loss_perc_mult1000: Some(250), // 25.0%
+            lost: Some(5),
+            received: Some(18),
+            loss_perc_mult1000: Some(217), // 21.7%
             ..Default::default()
         };
-        assert_eq!(leg.loss_str(), "150 (25.0%)");
-        // Count only.
+        assert_eq!(leg.loss_str(), "5 / 23 (21.7%)");
+        // Without percent — denominator still shown.
+        let leg = RtpLeg {
+            lost: Some(150),
+            received: Some(450),
+            ..Default::default()
+        };
+        assert_eq!(leg.loss_str(), "150 / 600");
+        // Lost only, no received — fall back to "N (P.P%)" form.
+        let leg = RtpLeg {
+            lost: Some(42),
+            loss_perc_mult1000: Some(100), // 10.0%
+            ..Default::default()
+        };
+        assert_eq!(leg.loss_str(), "42 (10.0%)");
+        // Lost only, no percent.
         let leg = RtpLeg { lost: Some(42), ..Default::default() };
         assert_eq!(leg.loss_str(), "42");
-        // Percent only.
-        let leg = RtpLeg { loss_perc_mult1000: Some(50), ..Default::default() };
+        // Percent only — show "(P.P%)".
+        let leg = RtpLeg {
+            loss_perc_mult1000: Some(50),
+            ..Default::default()
+        };
         assert_eq!(leg.loss_str(), "(5.0%)");
+        // Received only, with percent (degraded but VoIPmonitor stored it).
+        let leg = RtpLeg {
+            received: Some(500),
+            loss_perc_mult1000: Some(35), // 3.5%
+            ..Default::default()
+        };
+        assert_eq!(leg.loss_str(), "500 (3.5%)");
         // Neither.
         let leg = RtpLeg::default();
         assert_eq!(leg.loss_str(), "");
@@ -1476,5 +1561,125 @@ mod rtp_leg_tests {
         assert_eq!(codec_name_from_pt(255), "");
         assert_eq!(codec_name_from_pt(-1), "");
         assert_eq!(codec_name_from_pt(200), "");
+    }
+
+    /// From<CdrRow> must copy a_saddr / b_saddr into the RTP leg
+    /// slots and cross-assign so each leg's `dst_ip_str` is the
+    /// *other* leg's source. The SIP-level src_ip_str / dst_ip_str
+    /// (from sipcallerip / sipcalledip) stays on CdrSummary itself.
+    #[test]
+    fn cdr_summary_populates_rtp_leg_ips_from_saddr() {
+        use chrono::NaiveDate;
+        let row = CdrRow {
+            id: 7,
+            calldate: NaiveDate::from_ymd_opt(2026, 10, 4)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            callend: NaiveDate::from_ymd_opt(2026, 10, 4)
+                .unwrap()
+                .and_hms_opt(0, 0, 1)
+                .unwrap(),
+            duration: None,
+            connect_duration: None,
+            caller: Some("+1".into()),
+            callername: None,
+            called: Some("+2".into()),
+            sipcallerip: Some(0x0a00_0001), // 10.0.0.1
+            sipcalledip: Some(0x0a00_0002), // 10.0.0.2
+            last_sip_response_num: Some(200),
+            mos_min_mult10: None,
+            a_lost: None,
+            b_lost: None,
+            id_sensor: None,
+            a_mos_lqo_mult10: None,
+            b_mos_lqo_mult10: None,
+            a_received: None,
+            b_received: None,
+            a_avgjitter_mult10: None,
+            b_avgjitter_mult10: None,
+            a_maxjitter: None,
+            b_maxjitter: None,
+            a_packet_loss_perc_mult1000: None,
+            b_packet_loss_perc_mult1000: None,
+            a_delay_avg_mult100: None,
+            b_delay_avg_mult100: None,
+            a_rtcp_loss: None,
+            b_rtcp_loss: None,
+            a_rtcp_maxjitter: None,
+            b_rtcp_maxjitter: None,
+            a_payload: None,
+            b_payload: None,
+            a_rtp_ptime: None,
+            b_rtp_ptime: None,
+            a_saddr: Some(0x0a00_0001),
+            b_saddr: Some(0x0a00_0002),
+        };
+        let s = CdrSummary::from(row);
+        // SIP-level IPs stay where they were.
+        assert_eq!(s.src_ip_str, "10.0.0.1");
+        assert_eq!(s.dst_ip_str, "10.0.0.2");
+        // RTP-level IPs land on the per-leg structs.
+        assert_eq!(s.rtp_a.src_ip_str, "10.0.0.1");
+        assert_eq!(s.rtp_a.dst_ip_str, "10.0.0.2");
+        assert_eq!(s.rtp_b.src_ip_str, "10.0.0.2");
+        assert_eq!(s.rtp_b.dst_ip_str, "10.0.0.1");
+    }
+
+    /// When VoIPmonitor didn't populate a_saddr / b_saddr, the RTP
+    /// leg IPs must be empty strings, not "0.0.0.0".
+    #[test]
+    fn cdr_summary_rtp_leg_ips_empty_when_saddrs_unset() {
+        use chrono::NaiveDate;
+        let row = CdrRow {
+            id: 8,
+            calldate: NaiveDate::from_ymd_opt(2026, 10, 4)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            callend: NaiveDate::from_ymd_opt(2026, 10, 4)
+                .unwrap()
+                .and_hms_opt(0, 0, 1)
+                .unwrap(),
+            duration: None,
+            connect_duration: None,
+            caller: None,
+            callername: None,
+            called: None,
+            sipcallerip: None,
+            sipcalledip: None,
+            last_sip_response_num: None,
+            mos_min_mult10: None,
+            a_lost: None,
+            b_lost: None,
+            id_sensor: None,
+            a_mos_lqo_mult10: Some(40), // populated so is_populated() is true
+            b_mos_lqo_mult10: None,
+            a_received: None,
+            b_received: None,
+            a_avgjitter_mult10: None,
+            b_avgjitter_mult10: None,
+            a_maxjitter: None,
+            b_maxjitter: None,
+            a_packet_loss_perc_mult1000: None,
+            b_packet_loss_perc_mult1000: None,
+            a_delay_avg_mult100: None,
+            b_delay_avg_mult100: None,
+            a_rtcp_loss: None,
+            b_rtcp_loss: None,
+            a_rtcp_maxjitter: None,
+            b_rtcp_maxjitter: None,
+            a_payload: None,
+            b_payload: None,
+            a_rtp_ptime: None,
+            b_rtp_ptime: None,
+            a_saddr: None,
+            b_saddr: None,
+        };
+        let s = CdrSummary::from(row);
+        assert_eq!(s.rtp_a.src_ip_str, "");
+        assert_eq!(s.rtp_a.dst_ip_str, "");
+        assert_eq!(s.rtp_b.src_ip_str, "");
+        assert_eq!(s.rtp_b.dst_ip_str, "");
     }
 }
