@@ -1037,7 +1037,7 @@ fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
 /// headers, full message body behind a `<details>` toggle.
 ///
 /// We try to pair requests with their responses on the same row so an
-/// analyst sees "INVITE в†’ 200 OK" at a glance, with the raw request +
+/// analyst sees "INVITE → 200 OK" at a glance, with the raw request +
 /// response stacked below in a `<pre>`. Unpaired responses (e.g. an
 /// out-of-dialog BYE without a matching request) render as a single
 /// row with no request block.
@@ -1066,7 +1066,7 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     for m in messages {
         let ts = m.calldate.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let method_class = sip_method_class(&m.method);
-        let dir_arrow = if m.direction == "out" { "в†’" } else { "в†ђ" };
+        let dir_arrow = if m.direction == "out" { "→" } else { "в†ђ" };
         let dir_class = if m.direction == "out" { "dir-out" } else { "dir-in" };
         let code_class = sip_code_class(m.response_num);
         let resp_display = if m.response_num == 0 {
@@ -1435,8 +1435,8 @@ pub(crate) fn merge_u64_list(values: Option<&[String]>) -> Vec<u64> {
         .collect()
 }
 
-/// Parse an optional form field. Empty / whitespace в†’ None.
-/// Non-empty but unparseable в†’ also None (we log it as a warning).
+/// Parse an optional form field. Empty / whitespace → None.
+/// Non-empty but unparseable → also None (we log it as a warning).
 fn parse_opt<T: std::str::FromStr>(s: Option<&str>) -> Option<T> {
     let s = s?.trim();
     if s.is_empty() {
