@@ -288,6 +288,23 @@ impl RtpLeg {
             .unwrap_or_default()
     }
 
+    /// RTCP max jitter rendered in ms (with the " ms" suffix), or "" when
+    /// unset / sentinel. VoIPmonitor's `*_rtcp_maxjitter` column is
+    /// stored as u16 and uses 65535 (the u16 max) as a sentinel value
+    /// when no RTCP report was received for that direction — short
+    /// calls, mid-stream SSRC changes, and certain NAT pinholes that
+    /// drop RTCP all leave the column at 65535. Showing that as
+    /// "65535 ms" alongside a clean 0.4 ms on the other leg would be
+    /// misleading, so we collapse the sentinel to "" and let the
+    /// existing `dim_or_dash` render a muted em-dash.
+    pub fn rtcp_max_jitter_ms(&self) -> String {
+        match self.rtcp_maxjitter {
+            None => String::new(),
+            Some(65535) => String::new(),
+            Some(v) => format!("{v} ms"),
+        }
+    }
+
     /// Delay rendered in ms (the mult-100 scaling makes the int a
     /// hundredth-of-millisecond — we divide by 100 to land on real ms).
     pub fn delay_ms(&self) -> String {
@@ -1561,6 +1578,21 @@ mod rtp_leg_tests {
         assert_eq!(codec_name_from_pt(255), "");
         assert_eq!(codec_name_from_pt(-1), "");
         assert_eq!(codec_name_from_pt(200), "");
+    }
+
+    #[test]
+    fn rtcp_max_jitter_ms_collapses_65535_sentinel() {
+        // 65535 is VoIPmonitor's u16 sentinel for "no RTCP report
+        // received" — it is NOT a real jitter measurement and
+        // showing it as "65535 ms" misleads the operator.
+        let leg = RtpLeg { rtcp_maxjitter: Some(65535), ..Default::default() };
+        assert_eq!(leg.rtcp_max_jitter_ms(), "");
+        // Genuinely small values pass through with the " ms" suffix.
+        let leg = RtpLeg { rtcp_maxjitter: Some(12), ..Default::default() };
+        assert_eq!(leg.rtcp_max_jitter_ms(), "12 ms");
+        // None / unset stays empty.
+        let leg = RtpLeg::default();
+        assert_eq!(leg.rtcp_max_jitter_ms(), "");
     }
 
     /// From<CdrRow> must copy a_saddr / b_saddr into the RTP leg

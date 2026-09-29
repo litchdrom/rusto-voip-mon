@@ -687,9 +687,13 @@ fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
         );
         for m in lane_messages {
             let offset_ms = (m.calldate - t_min).num_milliseconds();
-            // Clamp to [0, 100] — out-of-order timestamps (DB jitter)
-            // and rounding drift must not push chips off the track.
-            let pct = ((offset_ms as f64 / span_ms as f64) * 100.0).clamp(0.0, 100.0);
+            // Clamp to [2, 98] so chips at the call's very first or
+            // very last instant are kept fully inside the visible
+            // track. Chips at left:0% / left:100% with translate(-50%)
+            // are half-clipped at the track edge otherwise — visible
+            // bug when the first or last message is the only one in
+            // its lane (e.g. a single BYE chip on a long call).
+            let pct = ((offset_ms as f64 / span_ms as f64) * 100.0).clamp(2.0, 98.0);
             let method_class = sip_method_class(&m.method);
             let code_class = sip_code_class(m.response_num);
             let method_disp = if m.method.is_empty() {
@@ -866,10 +870,16 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
         &rtp_a.rtcp_loss.map(|n| n.to_string()).unwrap_or_default(),
         &rtp_b.rtcp_loss.map(|n| n.to_string()).unwrap_or_default(),
     ));
+    // RTCP max jitter collapses VoIPmonitor's 65535 (u16 max) sentinel
+    // for "no RTCP report received" — short calls, mid-stream SSRC
+    // changes, and certain NAT pinholes that drop RTCP. The helper
+    // returns "" for the sentinel so the cell renders as a muted
+    // em-dash instead of an impossible "65535 ms" next to a clean
+    // 0.4 ms on the other leg.
     out.push_str(&row(
         "RTCP max jitter",
-        &rtp_a.rtcp_maxjitter.map(|j| format!("{j} ms")).unwrap_or_default(),
-        &rtp_b.rtcp_maxjitter.map(|j| format!("{j} ms")).unwrap_or_default(),
+        &rtp_a.rtcp_max_jitter_ms(),
+        &rtp_b.rtcp_max_jitter_ms(),
     ));
     out.push_str("</tbody></table>");
     // Footnote: explain where these come from. Analysts often want
@@ -1566,9 +1576,10 @@ mod sip_render_tests {
 
     #[test]
     fn sngrep_flow_positions_chips_by_relative_time() {
-        // Three outgoing messages at 0.0, 1.0, 5.0 seconds. The first
-        // chip must land at left:0%, the last at left:100%, the
-        // middle one at left:20% (1s out of 5s span).
+        // Three outgoing messages at 0.0, 1.0, 5.0 seconds. With the
+        // 2 %/98 % edge-clamp (so chips at the absolute first/last
+        // instant are kept fully inside the visible track), the
+        // middle one at 1 s of 5 s span lands at left:20 %.
         let mut msgs = vec![
             mk_msg("INVITE", 0, 0.0),
             mk_msg("ACK",    0, 1.0),
@@ -1578,12 +1589,16 @@ mod sip_render_tests {
             m.direction = "out".into();
         }
         let html = render_sngrep_flow(&msgs);
-        // First message at left:0.00%.
-        assert!(html.contains(r#"style="left: 0.00%""#));
+        // First message clamps to left:2.00%.
+        assert!(html.contains(r#"style="left: 2.00%""#));
         // Middle at 20% (1s of 5s span).
         assert!(html.contains(r#"style="left: 20.00%""#));
-        // Last at 100%.
-        assert!(html.contains(r#"style="left: 100.00%""#));
+        // Last clamps to left:98.00%.
+        assert!(html.contains(r#"style="left: 98.00%""#));
+        // Defensive — we should NOT emit 0% or 100% literally,
+        // those are the values that clip.
+        assert!(!html.contains(r#"style="left: 0.00%""#));
+        assert!(!html.contains(r#"style="left: 100.00%""#));
     }
 
     #[test]

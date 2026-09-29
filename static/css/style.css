@@ -598,10 +598,13 @@ table.sip-timeline .sip-row:hover {
 }
 /* Axis caption lives in the same 2-column grid as the lanes
    (28px gutter + 1fr track) so its left/right timestamps align
-   with the time-axis endpoints. */
+   with the time-axis endpoints. We split the right side into
+   two 1fr columns so the two timestamp spans each take their
+   own cell — putting them in a single cell with flex would have
+   stacked them on top of each other (visible bug). */
 .sngrep-axis {
   display: grid;
-  grid-template-columns: 28px 1fr;
+  grid-template-columns: 28px 1fr 1fr;
   align-items: center;
   margin-bottom: 4px;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
@@ -609,11 +612,8 @@ table.sip-timeline .sip-row:hover {
   color: var(--fg-muted);
   padding: 0 8px 4px 0;
 }
-.sngrep-axis > span {
-  grid-column: 2;
-  display: flex;
-  justify-content: space-between;
-}
+.sngrep-axis > span:first-of-type { grid-column: 2; justify-self: start; }
+.sngrep-axis > span:last-of-type { grid-column: 3; justify-self: end; }
 .sngrep-lane {
   display: grid;
   grid-template-columns: 28px 1fr;
@@ -621,9 +621,12 @@ table.sip-timeline .sip-row:hover {
   height: 38px;
   border: 1px solid var(--border);
   background: var(--bg);
-  margin-bottom: 6px;
+  /* Bottom margin absorbs the overflow of chips anchored at the
+     right edge (left:100% with translate(-50%)) so they don't
+     crash into the next lane. */
+  margin-bottom: 24px;
   border-radius: 4px;
-  overflow: hidden;
+  overflow: visible;
 }
 .sngrep-lane-out {
   border-left: 3px solid var(--accent);
