@@ -1,4 +1,4 @@
-use askama::Template;
+﻿use askama::Template;
 use axum::{
     body::Body,
     extract::{RawQuery, State},
@@ -33,7 +33,7 @@ pub struct CdrListTemplate {
     pub filters: FiltersView,
     pub distinct: DistinctView,
     pub export_url: String,
-    /// Same filter as `export_url`, aimed at GET /pcap/batch — used by
+    /// Same filter as `export_url`, aimed at GET /pcap/batch вЂ” used by
     /// the <noscript> fallback link for "Download zip of all matching".
     /// When no filter is set, this is just `/pcap/batch` (which the
     /// server will 400 on, but the link is harmless and honest).
@@ -261,7 +261,7 @@ fn url_encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-// (No ListQuery struct — multi-value fields don't work with serde_urlencoded,
+// (No ListQuery struct вЂ” multi-value fields don't work with serde_urlencoded,
 // so we parse the raw query string ourselves via RawQuery.)
 
 pub async fn cdr_list(
@@ -312,7 +312,7 @@ pub async fn cdr_list(
 
     let view = FiltersView::from(&filters, tz);
     let export_url = format!("/cdr/export.csv{}", view.export_query());
-    // Same filter, different endpoint — the <noscript> fallback "Download
+    // Same filter, different endpoint вЂ” the <noscript> fallback "Download
     // zip of all matching" link. Built server-side so the template can
     // emit a plain <a href="/pcap/batch?filter=..."> without trying to
     // strip the leading `?` or url-encode in askama.
@@ -385,21 +385,21 @@ pub async fn cdr_detail(
     // Try the full SELECT first (with per-leg RTP stats). If the live
     // install is missing any of the new columns (older VoIPmonitor
     // version, custom cdr table, etc.) fall back to a minimal SELECT
-    // so the page still renders — the RTP panel is omitted (it hides
+    // so the page still renders вЂ” the RTP panel is omitted (it hides
     // itself when every leg is unpopulated). One warning per process is
     // plenty; we don't want to spam the log every page load.
     let full_select = format!(
         "SELECT {} FROM cdr WHERE ID = ? LIMIT 1",
         cdr::CDR_FULL_SELECT_COLUMNS,
     );
-    // Fallback for installs where some RTP columns are missing —
+    // Fallback for installs where some RTP columns are missing вЂ”
     // pre-`a_mos_lqo_mult10` schema. The minimal SELECT still satisfies
     // sqlx's `FromRow` derive because every remaining column on
-    // CdrRow is Option<_> — sqlx fills missing columns with None.
+    // CdrRow is Option<_> вЂ” sqlx fills missing columns with None.
     //
     // NOTE: this assumes the live cdr table at minimum has all the
     // pre-RTP columns. If a column in that minimal set is also
-    // missing, we hit ColumnNotFound again — at which point the
+    // missing, we hit ColumnNotFound again вЂ” at which point the
     // operator needs to fall back to a much older binary or patch
     // their schema.
     let minimal_select = "SELECT ID AS `id`, calldate, callend, duration, connect_duration, \
@@ -418,13 +418,13 @@ pub async fn cdr_detail(
         Ok(r) => r,
         Err(AppError::Sqlx(sqlx::Error::ColumnNotFound(col))) => {
             // Live cdr table is missing at least one of the new RTP
-            // columns. Log once per occurrence (not per page load —
+            // columns. Log once per occurrence (not per page load вЂ”
             // the operator needs to know but we don't want to flood)
             // and fall back to the minimal SELECT.
             tracing::warn!(
                 cdr_id = id,
                 missing_column = %col,
-                "cdr table is missing RTP column — falling back to minimal SELECT"
+                "cdr table is missing RTP column вЂ” falling back to minimal SELECT"
             );
             crate::error::with_query_timeout(
                 timeout,
@@ -441,12 +441,12 @@ pub async fn cdr_detail(
         return Ok((StatusCode::NOT_FOUND, "CDR not found").into_response());
     };
     // Capture the caller IP before the CdrSummary conversion drops it
-    // — used as the direction marker for the SIP timeline (an outgoing
+    // вЂ” used as the direction marker for the SIP timeline (an outgoing
     // request is one whose `sipcallerip` matches the CDR's own).
     let sipcallerip = cdr.sipcallerip;
     let cdr = CdrSummary::from(cdr);
 
-    // Pull the optional extension tables in parallel — all three are tiny.
+    // Pull the optional extension tables in parallel вЂ” all three are tiny.
     let (next, branches, sip_messages) = tokio::join!(
         crate::error::with_query_timeout(timeout, cdr::fetch_cdr_next(&state.pool, id)),
         crate::error::with_query_timeout(timeout, cdr::fetch_cdr_branches(&state.pool, id)),
@@ -457,7 +457,7 @@ pub async fn cdr_detail(
     );
     let next = next?;
     let branches = branches?;
-    // SIP fetch failure is non-fatal — we just render the page without
+    // SIP fetch failure is non-fatal вЂ” we just render the page without
     // the timeline. Logging uses Debug (not Display) so the underlying
     // sqlx DatabaseError message + column name show up in the log line;
     // Display on `sqlx::Error` collapses to the generic "database error"
@@ -474,7 +474,7 @@ pub async fn cdr_detail(
     // doesn't populate it, schema doesn't match, or the rows were
     // purged), parse the SIP messages straight out of the merged
     // pcap archive. VoIPmonitor always writes the SIP wire format
-    // there — it's the source of truth. Cost: one pcap extraction
+    // there вЂ” it's the source of truth. Cost: one pcap extraction
     // per page load, bounded by the user's existing pcap_dir I/O.
     if sip_messages.is_empty() {
         match crate::routes::pcap::build_pcap_bytes(&state, id).await {
@@ -580,7 +580,7 @@ pub async fn cdr_detail(
     <tr><th>digest_username</th><td><code>{digest_username}</code></td></tr>
     <tr><th>GeoPosition</th><td>{geo_position}</td></tr>
     <tr><th>hold</th><td>{hold}</td></tr>
-    <tr><th>spool_index</th><td>{spool_index} <span class="muted small">(tar.zst type bucket: 0=SIP, 1=RTP, …)</span></td></tr>
+    <tr><th>spool_index</th><td>{spool_index} <span class="muted small">(tar.zst type bucket: 0=SIP, 1=RTP, вЂ¦)</span></td></tr>
   </table>
   {custom_headers_html}
   {branches_html}
@@ -617,11 +617,12 @@ pub async fn cdr_detail(
             )
         },
         branches_html = render_branches(&branches),
-        // Call flow diagram sits between the call-leg / RTP panels
-        // and the SIP message timeline — the eye reads it as "what
-        // shape did the call have?" before drilling into the
-        // per-message details below.
-        flow_html = render_call_flow_diagram(&compute_call_phases(&sip_messages)),
+        // sngrep-style call flow sits between the call-leg / RTP
+        // panels and the SIP message timeline вЂ” the eye reads it as
+        // "what shape did the call have?" before drilling into the
+        // per-message details below. Reuses the same SipMessage
+        // vector; no extra fetch.
+        flow_html = render_sngrep_flow(&sip_messages),
         sip_html = render_sip_timeline(&sip_messages),
         rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
     );
@@ -632,323 +633,102 @@ pub async fn cdr_detail(
         .into_response())
 }
 
-/// One slice of the call's lifecycle for the flow diagram. Each
-/// phase has a name, an offset/duration relative to the call's
-/// first SIP message, the worst response code seen during it, and
-/// a short outcome label so the diagram stays scannable.
-#[derive(Debug)]
-struct CallPhase {
-    name: &'static str,
-    /// Offset from the first message's timestamp, in milliseconds.
-    start_ms: i64,
-    /// Duration in milliseconds. `end_ms = start_ms + duration_ms`.
-    duration_ms: i64,
-    /// Worst response code seen during the phase (highest value in
-    /// the 100..699 range). 0 if the phase contains no responses
-    /// (e.g. pure request phase). Drives the box's colour.
-    worst_code: u16,
-    /// Short label for the box: "answered", "busy", "cancelled",
-    /// "ringing", "ok", "abnormal". Empty string when N/A.
-    outcome: &'static str,
-}
-
-/// Walk the SIP message timeline once and bucket each message into
-/// a phase. The boundaries are derived from SIP transaction shapes
-/// (INVITE → 200 = Setup, 200 OK → BYE = Established, BYE → 200 =
-/// Termination) — not hard-coded timestamps, so they survive odd
-/// message orders and missing messages gracefully.
+/// Render the per-leg RTP statistics panel вЂ” a two-column "A leg /
+/// Render the SIP message timeline in the classic `sngrep` style:
+/// two horizontal rows (outgoing from us, incoming to us), each
+/// message rendered as a small chip showing `method + response
+/// code`, colour-coded by the response class, connected by `→`
+/// arrows in time order. Reuses the same `SipMessage` vector the
+/// SIP timeline below the panel uses — no extra fetch.
 ///
-/// Returns an empty Vec if `messages` is empty (the panel omits
-/// itself in that case).
+/// One glance shows the dialog shape: an INVITE that gets through
+/// to 200 OK in 300 ms looks very different from an INVITE that
+/// spends 8 seconds bouncing between 100/180. With `direction`
+/// known (we set it from the CDR's `sipcallerip` against each
+/// message's `ip_src`), the two-row layout naturally shows the
+/// caller → callee → caller → caller round-trips.
 ///
-/// Time math uses millisecond offsets relative to the first message
-/// so the diagram's axis stays stable across DB vs pcap sources
-/// (different absolute timestamps, identical relative shape).
-fn compute_call_phases(messages: &[cdr::SipMessage]) -> Vec<CallPhase> {
+/// Returns "" when `messages` is empty (the section is then omitted).
+fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
     if messages.is_empty() {
-        return Vec::new();
-    }
-    let t0 = messages[0].calldate;
-    let offset_ms = |m: &cdr::SipMessage| -> i64 {
-        (m.calldate - t0).num_milliseconds().max(0)
-    };
-    let max_code = |a: u16, b: u16| a.max(b);
-
-    let mut phases: Vec<CallPhase> = Vec::new();
-    let mut i = 0usize;
-
-    // ---- Setup phase: from first message until the call is
-    // "settled" (200-class answered, 4xx/5xx rejected, or CANCEL).
-    let setup_start = i;
-    let mut setup_worst: u16 = 0;
-    let mut setup_outcome: &'static str = "answered";
-    while i < messages.len() {
-        let m = &messages[i];
-        if m.method == "CANCEL" {
-            setup_outcome = "cancelled";
-            // CANCEL belongs to Setup — don't increment i.
-            break;
-        }
-        if (400..600).contains(&m.response_num) {
-            setup_worst = max_code(setup_worst, m.response_num);
-            setup_outcome = match m.response_num {
-                486 => "busy",
-                487 => "cancelled",
-                404 | 410 => "not found",
-                401 | 407 => "auth required",
-                480 => "unavailable",
-                408 => "timeout",
-                503 => "service unavailable",
-                _ if m.response_num >= 500 => "server error",
-                _ => "rejected",
-            };
-            // The 4xx/5xx response belongs to Setup — don't increment i.
-            break;
-        }
-        if (200..300).contains(&m.response_num) {
-            // First 2xx — call is answered. Setup ends here. We
-            // intentionally do NOT increment `i` so the 200 OK stays
-            // as the boundary: it's the last message of Setup AND the
-            // first message of Established. The Established scan below
-            // picks it up and uses it as the phase start timestamp.
-            setup_worst = max_code(setup_worst, m.response_num);
-            break;
-        }
-        if m.response_num > 0 {
-            setup_worst = max_code(setup_worst, m.response_num);
-        }
-        i += 1;
-    }
-    let setup_end = i;
-    if setup_end > setup_start {
-        // The 200 OK / CANCEL / 4xx-5xx is the LAST message of Setup
-        // (because we `break` without incrementing `i`), so use
-        // `messages[setup_end]` directly for the end timestamp.
-        let s = offset_ms(&messages[setup_start]);
-        let e = offset_ms(&messages[setup_end]);
-        phases.push(CallPhase {
-            name: "Setup",
-            start_ms: s,
-            duration_ms: (e - s).max(0),
-            worst_code: setup_worst,
-            outcome: setup_outcome,
-        });
-    }
-
-    // ---- Early media phase: 183 Session Progress before the final
-    // 200 OK (RFC 3960). Only meaningful if the call actually
-    // went through early media — many successful calls don't.
-    if setup_outcome == "answered" && setup_end < messages.len() {
-        // Scan ahead for a 183 followed eventually by a 200.
-        let mut saw_183 = false;
-        let mut early_start = usize::MAX;
-        let mut early_end = usize::MAX;
-        for j in setup_end..messages.len().min(setup_end + 12) {
-            let m = &messages[j];
-            if m.response_num == 183 {
-                if !saw_183 {
-                    early_start = j;
-                    saw_183 = true;
-                }
-            } else if (200..300).contains(&m.response_num) && saw_183 {
-                early_end = j + 1;
-                break;
-            } else if m.method == "BYE" || m.method == "CANCEL" {
-                break;
-            }
-        }
-        if saw_183 && early_end != usize::MAX {
-            let s = offset_ms(&messages[early_start]);
-            let e = offset_ms(&messages[early_end - 1]);
-            phases.push(CallPhase {
-                name: "Early media",
-                start_ms: s,
-                duration_ms: (e - s).max(0),
-                worst_code: 183,
-                outcome: "ringing",
-            });
-            // Skip past early-media messages for the next phase scan.
-            i = early_end;
-        } else {
-            i = setup_end;
-        }
-    }
-
-    // ---- Established phase: only when the call was answered. A
-    // rejected (4xx/5xx) or cancelled (CANCEL) call ends at Setup —
-    // there's no media interval to show.
-    if setup_outcome == "answered" {
-        let established_start = i;
-        let mut est_end = messages.len();
-        for j in i..messages.len() {
-            let m = &messages[j];
-            if m.method == "BYE" || m.method == "CANCEL" {
-                est_end = j;
-                break;
-            }
-        }
-        let s = offset_ms(&messages[established_start]);
-        let e = if est_end < messages.len() {
-            offset_ms(&messages[est_end])
-        } else {
-            offset_ms(&messages[messages.len() - 1])
-        };
-        phases.push(CallPhase {
-            name: "Established",
-            start_ms: s,
-            duration_ms: (e - s).max(0),
-            worst_code: 0, // no SIP responses during established media
-            outcome: "",
-        });
-        i = est_end;
-    }
-
-    // ---- Termination phase: BYE/CANCEL → final response. Only
-    // present when the call was actually answered — a rejected or
-    // cancelled call ends at Setup.
-    if setup_outcome == "answered" && i < messages.len() {
-        let term_start = i;
-        let mut term_worst: u16 = 0;
-        let mut term_outcome: &'static str = "ok";
-        while i < messages.len() {
-            let m = &messages[i];
-            if m.response_num > 0 {
-                term_worst = max_code(term_worst, m.response_num);
-                if (400..600).contains(&m.response_num) {
-                    term_outcome = "abnormal";
-                }
-            }
-            i += 1;
-        }
-        let term_end = i;
-        if term_end > term_start {
-            let s = offset_ms(&messages[term_start]);
-            let e = offset_ms(&messages[term_end - 1]);
-            phases.push(CallPhase {
-                name: "Termination",
-                start_ms: s,
-                duration_ms: (e - s).max(0),
-                worst_code: term_worst,
-                outcome: term_outcome,
-            });
-        }
-    }
-
-    // Stitch relative offsets into a continuous timeline so the CSS
-    // can render boxes side-by-side proportionally.
-    let mut cursor_ms = 0i64;
-    for p in &mut phases {
-        if p.start_ms < cursor_ms {
-            p.start_ms = cursor_ms;
-        }
-        cursor_ms = p.start_ms + p.duration_ms;
-    }
-    phases
-}
-
-/// Render the call flow as a horizontal series of phase boxes
-/// connected by `→` arrows. Colour of each box comes from the
-/// phase's worst response code (same colour scale as the SIP
-/// timeline so the two panels visually agree).
-///
-/// Width of each box is proportional to its duration so an
-/// instant CANCEL renders as a thin sliver and a 10-minute call
-/// has a wide Established box. Returns "" when there are no
-/// phases (e.g. empty message list).
-fn render_call_flow_diagram(phases: &[CallPhase]) -> String {
-    if phases.is_empty() {
         return String::new();
     }
-    let total_ms: i64 = phases
+    // Bucket by direction. Messages with empty `direction` (the
+    // raw DB-fetched case where we haven't applied the marker yet)
+    // fall through to "out" so they still render — better than
+    // dropping them silently.
+    let (outgoing, incoming): (Vec<&cdr::SipMessage>, Vec<&cdr::SipMessage>) = messages
         .iter()
-        .map(|p| p.start_ms + p.duration_ms)
-        .max()
-        .unwrap_or(0);
-    if total_ms <= 0 {
-        return String::new();
-    }
-    let mut out = String::from("<h2>Call flow</h2>");
-    out.push_str("<div class=\"call-flow\">");
-    for (idx, p) in phases.iter().enumerate() {
-        if idx > 0 {
-            out.push_str("<span class=\"cf-arrow\">→</span>");
+        .partition(|m| m.direction != "in");
+
+    let render_row = |row_messages: &[&cdr::SipMessage], arrow: &str| -> String {
+        if row_messages.is_empty() {
+            return String::new();
         }
-        let width_pct = ((p.duration_ms as f64 / total_ms as f64) * 100.0)
-            .max(4.0)  // never collapse a phase below ~4% so labels fit
-            .min(100.0);
-        let code_class = sip_code_class(p.worst_code);
-        let outcome_class = if p.outcome.is_empty() {
-            ""
-        } else {
-            " has-outcome"
-        };
-        let duration_str = format_duration_ms(p.duration_ms);
-        let outcome = if p.outcome.is_empty() {
-            String::new()
-        } else {
-            format!(" · <span class=\"cf-outcome\">{}</span>", p.outcome)
-        };
-        // Box shows: phase name (big) + duration + outcome + (worst
-        // code, only if non-zero). The worst_code drives the bg
-        // colour via `sip-2xx/4xx/5xx` classes already defined for
-        // the SIP timeline.
-        let worst_label = if p.worst_code == 0 {
-            String::new()
-        } else {
-            format!("<span class=\"cf-code {code_class}\">{}</span> ", p.worst_code)
-        };
-        out.push_str(&format!(
-            "<div class=\"cf-phase {code_class}{outcome_class}\" \
-                  style=\"flex: {width_pct:.2} 0 0;\" \
-                  title=\"{name} · {duration_str}{outcome_text}\">\
-               <div class=\"cf-name\">{name}</div>\
-               <div class=\"cf-meta\">{worst_label}{duration_str}{outcome}</div>\
-             </div>",
-            name = p.name,
-            duration_str = duration_str,
-            outcome_text = if p.outcome.is_empty() { String::new() } else { format!(" · {}", p.outcome) },
-        ));
-    }
-    out.push_str("</div>");
-    // Footnote: total duration so the analyst doesn't have to add
-    // the phases up by hand.
-    out.push_str(&format!(
-        "<p class=\"muted small\">Total: {} (across {} phase{})</p>",
-        format_duration_ms(total_ms),
-        phases.len(),
-        if phases.len() == 1 { "" } else { "s" },
-    ));
-    out
+        let mut html = format!(
+            "<div class=\"sngrep-row\"><span class=\"sngrep-dir\">{arrow}</span>"
+        );
+        for m in row_messages {
+            let method_class = sip_method_class(&m.method);
+            let code_class = sip_code_class(m.response_num);
+            let method_disp = if m.method.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<span class=\"sngrep-method {method_class}\">{}</span> ",
+                    html_escape(&m.method)
+                )
+            };
+            let code_disp = if m.response_num == 0 {
+                String::new()
+            } else {
+                format!(
+                    "<span class=\"sngrep-code {code_class}\">{}</span>",
+                    m.response_num
+                )
+            };
+            let tip = format!(
+                "{} {} @ {}",
+                m.method,
+                m.response_text,
+                m.calldate.format("%H:%M:%S%.3f")
+            );
+            html.push_str(&format!(
+                "<span class=\"sngrep-chip {code_class}\" title=\"{tip}\">\
+                 {method_disp}{code_disp}</span> \
+                 <span class=\"sngrep-sep\">→</span>"
+            ));
+        }
+        // Drop the trailing arrow on the last chip — sngrep never
+        // shows a hanging "→" at the end of a row.
+        if let Some(last_arrow_start) = html.rfind("<span class=\"sngrep-sep\">") {
+            html.truncate(last_arrow_start);
+        }
+        html.push_str("</div>");
+        html
+    };
+
+    let out_row = render_row(&outgoing, "→");
+    let in_row = render_row(&incoming, "←");
+    let total = outgoing.len() + incoming.len();
+    let total_msgs = messages.len();
+
+    format!(
+        "<h2>Call flow</h2>\
+         <p class=\"muted small\">\
+           {total} of {total_msgs} messages bucketed by direction (out / in).\
+         </p>\
+         {out_row}\
+         {in_row}",
+    )
 }
 
-/// Render milliseconds as a compact human duration:
-///   500      → "500 ms"
-///   2500     → "2.5 s"
-///   65000    → "1 m 5 s"
-///   3700000  → "1 h 1 m"
-fn format_duration_ms(ms: i64) -> String {
-    if ms < 1000 {
-        format!("{} ms", ms)
-    } else if ms < 60_000 {
-        format!("{:.1} s", ms as f64 / 1000.0)
-    } else if ms < 3_600_000 {
-        let m = ms / 60_000;
-        let s = (ms % 60_000) / 1000;
-        format!("{m} m {s} s")
-    } else {
-        let h = ms / 3_600_000;
-        let m = (ms % 3_600_000) / 60_000;
-        format!("{h} h {m} m")
-    }
-}
-
-/// Render the per-leg RTP statistics panel — a two-column "A leg /
 /// B leg" table with the most useful VoIPmonitor-derived quality
 /// metrics. Returns "" when neither leg has any data (failed calls,
 /// early hangups) so the section is omitted entirely.
 fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
     fn dim_or_dash(v: &str) -> &str {
-        if v.is_empty() { "<span class=\"muted\">—</span>" } else { v }
+        if v.is_empty() { "<span class=\"muted\">вЂ”</span>" } else { v }
     }
     if !rtp_a.is_populated() && !rtp_b.is_populated() {
         return String::new();
@@ -1010,12 +790,12 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
     out.push_str("</tbody></table>");
     // Footnote: explain where these come from. Analysts often want
     // to know "is this real-time or stored?" before trusting the
-    // numbers — they ARE real-time (VoIPmonitor stores them when the
+    // numbers вЂ” they ARE real-time (VoIPmonitor stores them when the
     // call ends) but they are aggregates, not per-second.
     out.push_str(
         "<p class=\"muted small\">RTP stats come from VoIPmonitor's \
          RTCP reports captured during the call. They are per-call \
-         aggregates, not time-series — for a per-second view, pull \
+         aggregates, not time-series вЂ” for a per-second view, pull \
          the pcap.</p>",
     );
     out
@@ -1044,7 +824,7 @@ fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
                     String::new()
                 } else {
                     format!(
-                        "<span class=\"muted small\">· fbasename=<code>{}</code></span>",
+                        "<span class=\"muted small\">В· fbasename=<code>{}</code></span>",
                         html_escape(fbasename)
                     )
                 }
@@ -1062,13 +842,13 @@ fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
 /// headers, full message body behind a `<details>` toggle.
 ///
 /// We try to pair requests with their responses on the same row so an
-/// analyst sees "INVITE → 200 OK" at a glance, with the raw request +
+/// analyst sees "INVITE в†’ 200 OK" at a glance, with the raw request +
 /// response stacked below in a `<pre>`. Unpaired responses (e.g. an
 /// out-of-dialog BYE without a matching request) render as a single
 /// row with no request block.
 ///
 /// The cap is enforced server-side (500 in `fetch_sip_messages`); if
-/// we hit it the heading shows "+ more not shown — check the pcap".
+/// we hit it the heading shows "+ more not shown вЂ” check the pcap".
 fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     if messages.is_empty() {
         return String::new();
@@ -1091,7 +871,7 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     for m in messages {
         let ts = m.calldate.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let method_class = sip_method_class(&m.method);
-        let dir_arrow = if m.direction == "out" { "→" } else { "←" };
+        let dir_arrow = if m.direction == "out" { "в†’" } else { "в†ђ" };
         let dir_class = if m.direction == "out" { "dir-out" } else { "dir-in" };
         let code_class = sip_code_class(m.response_num);
         let resp_display = if m.response_num == 0 {
@@ -1106,7 +886,7 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
         let dst = html_escape(&m.dst_ip_str);
         let content_type = html_escape(&m.content_type);
         // Build the expandable body. Only show the toggle when there's
-        // something useful to look at — bare CANCEL/ACK messages often
+        // something useful to look at вЂ” bare CANCEL/ACK messages often
         // have empty content and showing them is just noise.
         let body_html = if m.content.trim().is_empty() {
             String::new()
@@ -1137,7 +917,7 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     out
 }
 
-/// CSS class for the response-code cell — colors 1xx / 2xx / 3xx /
+/// CSS class for the response-code cell вЂ” colors 1xx / 2xx / 3xx /
 /// 4xx / 5xx / 6xx distinctly so a glance at the column tells you
 /// which leg failed.
 fn sip_code_class(code: u16) -> &'static str {
@@ -1152,7 +932,7 @@ fn sip_code_class(code: u16) -> &'static str {
     }
 }
 
-/// CSS class for the method cell — INVITE / BYE / CANCEL are the
+/// CSS class for the method cell вЂ” INVITE / BYE / CANCEL are the
 /// "lifecycle" methods that matter when triaging a failed call;
 /// the rest are answered with a neutral colour.
 fn sip_method_class(method: &str) -> &'static str {
@@ -1175,7 +955,7 @@ fn sip_method_class(method: &str) -> &'static str {
     }
 }
 
-/// Minimal HTML escape — good enough for v0.1 since headers come from
+/// Minimal HTML escape вЂ” good enough for v0.1 since headers come from
 /// trusted admin-configured SIP traffic, but use a real sanitizer if you
 /// ever start rendering attacker-controlled data.
 fn html_escape(s: &str) -> String {
@@ -1219,7 +999,7 @@ pub async fn cdr_export_csv(
     let cap = per_request.unwrap_or(state.config.csv_export_limit);
 
     // Spawn the streaming query (sync call). We can't time-bound it
-    // directly — `list_stream` returns immediately and a background task
+    // directly вЂ” `list_stream` returns immediately and a background task
     // drives the cursor. Instead, we wait for the *first* row with the
     // configured timeout: if the server can't produce one within `timeout`
     // seconds, we 504 and drop the channel. Once rows start flowing, the
@@ -1242,7 +1022,7 @@ pub async fn cdr_export_csv(
             return;
         }
 
-        // Wait for the first row with a timeout — bounds the initial
+        // Wait for the first row with a timeout вЂ” bounds the initial
         // query latency. Subsequent rows stream without a per-row cap.
         let first_row = if timeout > 0 {
             tokio::time::timeout(
@@ -1330,7 +1110,7 @@ pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilter
         called: q.called.clone().filter(|s| !s.is_empty()),
         // `caller_in` / `called_in` are the multi-value exact-match fields.
         // Repeated keys (`?caller_in=A&caller_in=B`) AND a comma-joined
-        // single key (`?caller_in=A,B`) both work — the SQL is a single
+        // single key (`?caller_in=A,B`) both work вЂ” the SQL is a single
         // `caller IN (?, ?, ?)` rather than a chain of `LIKE OR LIKE`.
         caller_in: merge_str_list(params.all("caller_in")),
         called_in: merge_u64_list(params.all("called_in")),
@@ -1351,7 +1131,7 @@ pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilter
 
 /// All query parameters parsed into a `name -> Vec<value>` map. We parse
 /// manually because `serde_urlencoded` does not aggregate repeated keys
-/// into `Vec<String>` — every `key=value` pair is delivered individually
+/// into `Vec<String>` вЂ” every `key=value` pair is delivered individually
 /// as a String to deserialize, which fails for sequence types.
 #[derive(Debug, Default, Clone)]
 pub struct QueryParams {
@@ -1401,7 +1181,7 @@ pub fn parse_query_params(raw: &str) -> QueryParams {
     out
 }
 
-/// Scalar params only — multi-value fields are pulled separately from
+/// Scalar params only вЂ” multi-value fields are pulled separately from
 /// `QueryParams` because of the serde_urlencoded limitation described
 /// above.
 #[derive(Debug, Default)]
@@ -1451,7 +1231,7 @@ pub(crate) fn merge_str_list(values: Option<&[String]>) -> Vec<String> {
 }
 
 /// Like `merge_str_list` but parses each value as `u64`. Non-numeric
-/// entries are silently dropped — the URL contract is "list of numbers",
+/// entries are silently dropped вЂ” the URL contract is "list of numbers",
 /// so `?called_in=abc` shouldn't blow up; it just contributes nothing.
 pub(crate) fn merge_u64_list(values: Option<&[String]>) -> Vec<u64> {
     merge_str_list(values)
@@ -1460,8 +1240,8 @@ pub(crate) fn merge_u64_list(values: Option<&[String]>) -> Vec<u64> {
         .collect()
 }
 
-/// Parse an optional form field. Empty / whitespace → None.
-/// Non-empty but unparseable → also None (we log it as a warning).
+/// Parse an optional form field. Empty / whitespace в†’ None.
+/// Non-empty but unparseable в†’ also None (we log it as a warning).
 fn parse_opt<T: std::str::FromStr>(s: Option<&str>) -> Option<T> {
     let s = s?.trim();
     if s.is_empty() {
@@ -1556,7 +1336,7 @@ mod sip_render_tests {
     #[test]
     fn sip_method_class_recognises_lifecycle_methods() {
         // Lifecycle methods get their own highlight colour so a triage
-        // session can spot INVITE → BYE pairs immediately.
+        // session can spot INVITE в†’ BYE pairs immediately.
         for m in ["INVITE", "BYE", "CANCEL", "ACK", "REGISTER"] {
             assert_ne!(sip_method_class(m), "sip-method-other", "{m}");
         }
@@ -1596,17 +1376,17 @@ mod sip_render_tests {
             content: String::new(),
         };
         let html = render_sip_timeline(&[mk("INVITE", 200), mk("INVITE", 503)]);
-        // First row: success — green 2xx class.
+        // First row: success вЂ” green 2xx class.
         assert!(html.contains(r#"class="num sip-2xx""#));
-        // Second row: failure — red 5xx class + red 5xx method class.
+        // Second row: failure вЂ” red 5xx class + red 5xx method class.
         assert!(html.contains(r#"class="num sip-5xx""#));
         // Method cell uses the invite highlight class.
         assert!(html.contains("sip-method-invite"));
         // Direction arrow renders for outbound requests.
-        assert!(html.contains(r#"class="num dir-out">→<"#));
+        assert!(html.contains(r#"class="num dir-out">в†’<"#));
     }
 
-    /// Helper for the call-flow tests below — makes a synthetic SIP
+    /// Helper for the call-flow tests below вЂ” makes a synthetic SIP
     /// message at `seconds_offset` after the call start.
     fn mk_msg(method: &str, code: u16, seconds_offset: f64) -> cdr::SipMessage {
         let t0 = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
@@ -1631,101 +1411,79 @@ mod sip_render_tests {
     }
 
     #[test]
-    fn call_flow_happy_path_has_three_phases() {
-        // Normal successful call: INVITE -> 100 -> 180 -> 200,
-        // media, BYE -> 200.
+    fn sngrep_flow_renders_two_rows_with_arrows() {
+        // Happy-path call: outgoing INVITE/ACK/BYE, incoming 100/180/200/200.
         let msgs = vec![
             mk_msg("INVITE", 0,   0.0),
             mk_msg("",       100, 0.1),
             mk_msg("",       180, 0.2),
             mk_msg("",       200, 0.3),
+            mk_msg("ACK",    0,   0.4),
             mk_msg("BYE",    0,   5.0),
             mk_msg("",       200, 5.0),
         ];
-        let phases = compute_call_phases(&msgs);
-        assert_eq!(phases.len(), 3, "expected Setup + Established + Termination");
-        assert_eq!(phases[0].name, "Setup");
-        assert_eq!(phases[0].outcome, "answered");
-        assert_eq!(phases[0].worst_code, 200);
-        assert_eq!(phases[1].name, "Established");
-        assert_eq!(phases[2].name, "Termination");
-        assert_eq!(phases[2].outcome, "ok");
-        assert_eq!(phases[2].worst_code, 200);
+        // Tag directions for the test.
+        let mut tagged = msgs;
+        // out = INVITE/ACK/BYE; in = the four responses
+        tagged[0].direction = "out".into(); tagged[1].direction = "in".into();
+        tagged[2].direction = "in".into(); tagged[3].direction = "in".into();
+        tagged[4].direction = "out".into(); tagged[5].direction = "out".into();
+        tagged[6].direction = "in".into();
+        let html = render_sngrep_flow(&tagged);
+        // Two rows.
+        assert_eq!(html.matches("sngrep-row").count(), 2);
+        // Outgoing row: 3 chips (INVITE, ACK, BYE).
+        let out_section = html.split("sngrep-row").nth(1).unwrap_or("");
+        assert_eq!(out_section.matches("sngrep-chip").count(), 3);
+        assert!(out_section.contains("INVITE"));
+        assert!(out_section.contains("ACK"));
+        assert!(out_section.contains("BYE"));
+        // Incoming row: 4 chips (100, 180, 200, 200).
+        let in_section = html.split("sngrep-row").nth(2).unwrap_or("");
+        assert_eq!(in_section.matches("sngrep-chip").count(), 4);
+        // 2xx-coded chips colour-coded green.
+        assert!(in_section.contains(r#"class="sngrep-code sip-2xx">200</span>"#));
+        // No hanging "→" at the end of either row.
+        let row_ends_with_arrow = |s: &str| {
+            // Find the last "sngrep-chip" or "sngrep-sep" and check
+            // whether it's followed by another sep (hanging arrow).
+            !s.rfind("sngrep-sep").is_some()
+                || s.split("sngrep-sep").last().map(|x| !x.contains(">")).unwrap_or(true)
+        };
+        // (The above is approximate; the truncation guarantee is the
+        // important part — just sanity-check no junk after the last chip.)
+        assert!(!out_section.ends_with("→<"));
+        assert!(!in_section.ends_with("→<"));
     }
 
     #[test]
-    fn call_flow_busy_call_short_circuits_at_486() {
-        // Failed call: INVITE -> 486 Busy Here. No Established phase.
-        let msgs = vec![
-            mk_msg("INVITE", 0,   0.0),
-            mk_msg("",       100, 0.1),
-            mk_msg("",       486, 0.2),
-        ];
-        let phases = compute_call_phases(&msgs);
-        assert_eq!(phases.len(), 1, "no Established phase when call rejected");
-        assert_eq!(phases[0].name, "Setup");
-        assert_eq!(phases[0].outcome, "busy");
-        assert_eq!(phases[0].worst_code, 486);
+    fn sngrep_flow_omitted_for_empty_messages() {
+        assert_eq!(render_sngrep_flow(&[]), "");
     }
 
     #[test]
-    fn call_flow_cancel_during_setup() {
-        // Operator cancels before any final response.
-        let msgs = vec![
-            mk_msg("INVITE", 0,   0.0),
-            mk_msg("",       100, 0.1),
-            mk_msg("CANCEL", 0,   0.5),
-        ];
-        let phases = compute_call_phases(&msgs);
-        assert_eq!(phases.len(), 1);
-        assert_eq!(phases[0].name, "Setup");
-        assert_eq!(phases[0].outcome, "cancelled");
+    fn sngrep_flow_drops_trailing_arrow() {
+        // Single message should NOT have a trailing "→" separator.
+        let m = vec![{
+            let mut x = mk_msg("INVITE", 0, 0.0);
+            x.direction = "out".into();
+            x
+        }];
+        let html = render_sngrep_flow(&m);
+        // 1 chip, 0 separators (the trailing arrow is dropped).
+        assert_eq!(html.matches("sngrep-chip").count(), 1);
+        assert_eq!(html.matches("sngrep-sep").count(), 0);
     }
 
     #[test]
-    fn call_flow_empty_messages_returns_no_phases() {
-        assert!(compute_call_phases(&[]).is_empty());
-    }
-
-    #[test]
-    fn call_flow_diagram_renders_arrows_between_phases() {
-        let phases = vec![
-            CallPhase {
-                name: "Setup",
-                start_ms: 0,
-                duration_ms: 1000,
-                worst_code: 200,
-                outcome: "answered",
-            },
-            CallPhase {
-                name: "Established",
-                start_ms: 1000,
-                duration_ms: 60_000,
-                worst_code: 0,
-                outcome: "",
-            },
-        ];
-        let html = render_call_flow_diagram(&phases);
-        // One arrow between two boxes.
-        assert_eq!(html.matches("cf-arrow").count(), 1);
-        assert!(html.contains("Setup"));
-        assert!(html.contains("Established"));
-        assert!(html.contains("answered"));
-        // Total duration note at the bottom.
-        assert!(html.contains("1 m 0 s"));
-    }
-
-    #[test]
-    fn call_flow_diagram_omitted_for_empty_phases() {
-        assert_eq!(render_call_flow_diagram(&[]), "");
-    }
-
-    #[test]
-    fn format_duration_ms_compact_formats() {
-        assert_eq!(format_duration_ms(500), "500 ms");
-        assert_eq!(format_duration_ms(999), "999 ms");
-        assert_eq!(format_duration_ms(2500), "2.5 s");
-        assert_eq!(format_duration_ms(65_000), "1 m 5 s");
-        assert_eq!(format_duration_ms(3_700_000), "1 h 1 m");
+    fn sngrep_flow_partitions_by_direction() {
+        // All outgoing → no incoming row.
+        let mut msgs = vec![mk_msg("INVITE", 0, 0.0), mk_msg("ACK", 0, 1.0)];
+        msgs[0].direction = "out".into();
+        msgs[1].direction = "out".into();
+        let html = render_sngrep_flow(&msgs);
+        // Two rows are emitted (out + empty in) — the empty in row
+        // contributes nothing visible. The chip count is 2 (both out).
+        assert_eq!(html.matches("sngrep-chip").count(), 2);
     }
 }

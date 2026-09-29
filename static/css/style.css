@@ -585,3 +585,70 @@ table.sip-timeline .sip-row:hover {
   font-size: 16px;
   flex: 0 0 auto;
 }
+
+/* sngrep-style call flow (above the SIP timeline).
+   Two horizontal rows (outgoing from us, incoming to us) with
+   message chips separated by → arrows. Each chip carries the
+   method (with a method-specific colour class) and the response
+   code (coloured by its sip-Nxx class). Same colour scale as the
+   SIP timeline below so the two panels visually agree. */
+.sngrep-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 8px 10px;
+  margin-bottom: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.sngrep-row:nth-of-type(2) {
+  /* Incoming row gets a left accent stripe so the two rows are
+     visually distinguishable at a glance. */
+  border-left: 3px solid var(--accent);
+}
+.sngrep-dir {
+  font-weight: 600;
+  color: var(--fg-muted);
+  margin-right: 4px;
+  font-size: 14px;
+}
+.sngrep-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 8px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 12px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+}
+.sngrep-method {
+  font-weight: 600;
+}
+.sngrep-code {
+  padding: 0 4px;
+  border-radius: 2px;
+  font-weight: 600;
+}
+/* Method-specific colours — match the SIP timeline. */
+.sngrep-method.sip-method-invite,
+.sngrep-method.sip-method-bye,
+.sngrep-method.sip-method-cancel,
+.sngrep-method.sip-method-ack,
+.sngrep-method.sip-method-register {
+  color: var(--accent);
+}
+.sngrep-code.sip-1xx { color: var(--fg-muted); }
+.sngrep-code.sip-2xx { color: #4ade80; }
+.sngrep-code.sip-3xx { color: #fbbf24; }
+.sngrep-code.sip-4xx { color: #fb923c; }
+.sngrep-code.sip-5xx,
+.sngrep-code.sip-6xx { color: #f87171; }
+.sngrep-sep {
+  color: var(--fg-muted);
+  margin: 0 2px;
+  font-size: 14px;
+}
