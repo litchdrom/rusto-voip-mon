@@ -692,10 +692,13 @@ fn render_sngrep_flow(
     // Time axis: relative to the first message's timestamp.
     let t_min = messages.iter().map(|m| m.calldate).min().unwrap();
 
-    // Walk messages, accumulating HTML rows. Between media-active
-    // markers (last 2xx/ACK → first BYE) we emit a single RTP-flow
-    // row showing the negotiated codec and packet counts.
-    let mut rows: Vec<String> = Vec::with_capacity(messages.len() + 1);
+    // Walk messages, emitting one <tr> per row. Each row has four
+    // cells: time, caller-arrow, message, callee-arrow. Outgoing
+    // messages get an outgoing arrow on the caller side; incoming
+    // messages get an incoming arrow on the callee side. RTP rows
+    // (inserted between last 2xx/ACK and first BYE) use the same
+    // 4-column shape with bidirectional arrows.
+    let mut rows: Vec<String> = Vec::with_capacity(messages.len() + 2);
     let mut media_started = false;
     let mut media_inserted = false;
 
@@ -710,7 +713,7 @@ fn render_sngrep_flow(
             String::new()
         } else {
             format!(
-                "<span class=\"seq-method {method_class}\">{}</span> ",
+                "<span class=\"seq-method {method_class}\">{}</span>",
                 html_escape(&m.method)
             )
         };
@@ -722,8 +725,6 @@ fn render_sngrep_flow(
                 m.response_num
             )
         };
-        let arrow_short = if is_out { "►" } else { "◄" };
-        let arrow_long = if is_out { "────►" } else { "◄────" };
         let src_esc = html_escape(&m.src_ip_str);
         let dst_esc = html_escape(&m.dst_ip_str);
         let title = format!(
@@ -735,14 +736,33 @@ fn render_sngrep_flow(
             m.calldate.format("%H:%M:%S%.3f"),
         );
 
+        // Build the 4 cells: time | caller-arrow | message | callee-arrow.
+        // Outgoing: caller side shows "►───", callee side empty.
+        // Incoming: caller side empty, callee side shows "───◄".
+        let caller_cell = if is_out {
+            r#"<td class="seq-arrow-cell seq-arrow-out">►───</td>"#
+        } else {
+            r#"<td class="seq-arrow-cell"></td>"#
+        };
+        let callee_cell = if is_out {
+            r#"<td class="seq-arrow-cell"></td>"#
+        } else {
+            r#"<td class="seq-arrow-cell seq-arrow-in">───◄</td>"#
+        };
         rows.push(format!(
-            "<div class=\"seq-msg {kind}\" title=\"{title}\">\
-             <span class=\"seq-time\">{rel_time}</span>\
-             <span class=\"seq-endpoints\">{src_esc} {arrow_short} {dst_esc}</span>\
-             <span class=\"seq-arrow seq-arrow-{kind2}\">{arrow_long} {method_disp}{code_disp}</span>\
-             </div>",
-            kind = if is_out { "seq-msg-out" } else { "seq-msg-in" },
-            kind2 = if is_out { "out" } else { "in" },
+            "<tr class=\"seq-row seq-row-{}\" title=\"{}\">\
+             <td class=\"seq-time\">{}</td>\
+             {}\
+             <td class=\"seq-msg-cell\">{}{}</td>\
+             {}\
+             </tr>",
+            if is_out { "out" } else { "in" },
+            title,
+            rel_time,
+            caller_cell,
+            method_disp,
+            code_disp,
+            callee_cell,
         ));
 
         // Mark media_started at first 2xx or ACK.
@@ -754,9 +774,9 @@ fn render_sngrep_flow(
                 media_started = true;
             }
         }
-        // Insert RTP row right before the first BYE/CANCEL after media.
+        // Insert RTP rows right before the first BYE/CANCEL after media.
         if media_started && !media_inserted && (m.method == "BYE" || m.method == "CANCEL") {
-            rows.push(rtp_row(
+            rows.push(rtp_row_html(
                 rtp_a_pkts,
                 rtp_a_codec.as_deref(),
                 rtp_a_src,
@@ -770,7 +790,7 @@ fn render_sngrep_flow(
         }
     }
     if media_started && !media_inserted {
-        rows.push(rtp_row(
+        rows.push(rtp_row_html(
             rtp_a_pkts,
             rtp_a_codec.as_deref(),
             rtp_a_src,
@@ -788,33 +808,33 @@ fn render_sngrep_flow(
         "<h2>Call flow</h2>\
          <p class=\"muted small\">\
            {total} SIP messages, time top-to-bottom. \
-           Outgoing solid, incoming dashed; arrows point in the message direction.\
+           Arrows in the caller / callee columns point in the message direction; \
+           RTP rows show the negotiated codec and packet counts per direction.\
          </p>\
          <div class=\"seq-diagram\">\
-           <div class=\"seq-header\">\
-             <div class=\"seq-actor seq-actor-left\">\
-               <div class=\"seq-actor-label\">caller</div>\
-               <div class=\"seq-actor-ip\">{caller_ip}</div>\
-             </div>\
-             <div class=\"seq-actor seq-actor-right\">\
-               <div class=\"seq-actor-label\">callee</div>\
-               <div class=\"seq-actor-ip\">{callee_ip}</div>\
-             </div>\
-           </div>\
-           <div class=\"seq-body\">{rows}</div>\
+           <table class=\"seq-table\">\
+             <thead><tr>\
+               <th class=\"seq-time\">time</th>\
+               <th class=\"seq-actor\">caller<br><small>{caller_ip}</small></th>\
+               <th class=\"seq-msg-col\">message</th>\
+               <th class=\"seq-actor\">callee<br><small>{callee_ip}</small></th>\
+             </tr></thead>\
+             <tbody>{rows}</tbody>\
+           </table>\
          </div>",
         rows = rows.join("\n"),
     )
 }
 
 /// Render the RTP-flow rows that live between the last 2xx/ACK and
-/// the first BYE. We emit ONE row per direction (caller→callee and
+/// the first BYE. Each row is a `<tr>` matching the column layout
+/// in `render_sngrep_flow` (time | caller-arrow | message |
+/// callee-arrow). We emit ONE row per direction (caller→callee and
 /// callee→caller) rather than collapsing both into one — RTP can
 /// take a different network path than SIP (proxy scenarios, NAT
 /// pinholes, media relays), so each leg needs its own row showing
-/// the actual RTP endpoints and packet count. Visual idiom matches
-/// Wireshark's Telephony > SIP Flows media annotation.
-fn rtp_row(
+/// the actual RTP endpoints and packet count.
+fn rtp_row_html(
     a_pkts: Option<u32>,
     a_codec: Option<&str>,
     a_src: &str,
@@ -840,26 +860,30 @@ fn rtp_row(
         .map(|n| format!("{} pkts", n))
         .unwrap_or_else(|| "—".to_string());
 
-    // Two rows: outgoing (caller → callee) and incoming (callee → caller).
-    // Each shows its actual RTP endpoints, which can differ from the
-    // SIP endpoints when RTP traverses a relay / NAT.
+    // Two table rows: outgoing (caller → callee) and incoming
+    // (callee → caller). Each shows its actual RTP endpoints, which
+    // can differ from the SIP endpoints when RTP traverses a relay
+    // / NAT.
+    let a_esc = html_escape(a_src);
+    let a_dst_esc = html_escape(a_dst);
+    let b_esc = html_escape(b_src);
+    let b_dst_esc = html_escape(b_dst);
+
     let outgoing = format!(
-        "<div class=\"seq-msg seq-msg-rtp seq-msg-out\">\
-         <span class=\"seq-time\">RTP</span>\
-         <span class=\"seq-endpoints\">{src_a} ► {dst_a}</span>\
-         <span class=\"seq-arrow seq-arrow-out\">────► RTP {codec} ({a_count}) ────</span>\
-         </div>",
-        src_a = html_escape(a_src),
-        dst_a = html_escape(a_dst),
+        "<tr class=\"seq-row seq-row-out seq-row-rtp\">\
+         <td class=\"seq-time\">RTP</td>\
+         <td class=\"seq-arrow-cell seq-arrow-out\">═══►</td>\
+         <td class=\"seq-msg-cell\">RTP {codec} ({a_count})<br><small class=\"muted\">{a_esc} → {a_dst_esc}</small></td>\
+         <td class=\"seq-arrow-cell\"></td>\
+         </tr>",
     );
     let incoming = format!(
-        "<div class=\"seq-msg seq-msg-rtp seq-msg-in\">\
-         <span class=\"seq-time\">RTP</span>\
-         <span class=\"seq-endpoints\">{src_b} ◄ {dst_b}</span>\
-         <span class=\"seq-arrow seq-arrow-in\">◄──── RTP {codec} ({b_count}) ────</span>\
-         </div>",
-        src_b = html_escape(b_src),
-        dst_b = html_escape(b_dst),
+        "<tr class=\"seq-row seq-row-in seq-row-rtp\">\
+         <td class=\"seq-time\">RTP</td>\
+         <td class=\"seq-arrow-cell\"></td>\
+         <td class=\"seq-msg-cell\">RTP {codec} ({b_count})<br><small class=\"muted\">{b_esc} → {b_dst_esc}</small></td>\
+         <td class=\"seq-arrow-cell seq-arrow-in\">◄═══</td>\
+         </tr>",
     );
     format!("{outgoing}{incoming}")
 }
@@ -1591,14 +1615,14 @@ mod sip_render_tests {
         let mut r200b = mk_msg("", 200, 5.1); r200b.direction = "in".into();
         let msgs = vec![invite, r100, r200a, ack, bye, r200b];
         let html = render_sngrep_flow(&msgs, None, None, "", "", None, None, "", "");
-        // Six message rows + two RTP-flow rows (one per direction) = 8 seq-msg elements.
-        assert_eq!(html.matches(r#"class="seq-msg "#).count(), 8);
-        // 3 outgoing SIP + 1 outgoing RTP = 4.
-        assert_eq!(html.matches(r#" seq-msg-out""#).count(), 4);
-        // 3 incoming SIP + 1 incoming RTP = 4.
-        assert_eq!(html.matches(r#" seq-msg-in""#).count(), 4);
+        // Six message rows + two RTP-flow rows (one per direction) = 8 <tr> rows.
+        assert_eq!(html.matches(r#"class="seq-row seq-row-"#).count(), 8);
+        // 3 outgoing SIP + 1 outgoing RTP = 4 rows carrying seq-row-out.
+        assert_eq!(html.matches(r" seq-row-out").count(), 4);
+        // 3 incoming SIP + 1 incoming RTP = 4 rows carrying seq-row-in.
+        assert_eq!(html.matches(r" seq-row-in").count(), 4);
         // Two RTP rows total (one per direction).
-        assert_eq!(html.matches(r"seq-msg-rtp").count(), 2);
+        assert_eq!(html.matches(r"seq-row-rtp").count(), 2);
     }
 
     #[test]
