@@ -674,12 +674,21 @@ fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
         if lane_messages.is_empty() {
             return String::new();
         }
-        let mut html =
-            format!("<div class=\"sngrep-lane {lane_class}\"><span class=\"sngrep-dir\">{dir_arrow}</span>");
+        // Two-column grid: direction gutter (28px) + time-axis track
+        // (1fr). Chips live inside the track so `left: N%` resolves
+        // against the track's width, not the lane's padding box —
+        // which is the only way to make `left: 0%` mean "at the start
+        // of the time axis" cleanly. (Earlier paddding-left on the
+        // lane made that confusingly offset by 28px.)
+        let mut html = format!(
+            "<div class=\"sngrep-lane {lane_class}\">\
+             <span class=\"sngrep-dir\">{dir_arrow}</span>\
+             <div class=\"sngrep-track\">"
+        );
         for m in lane_messages {
             let offset_ms = (m.calldate - t_min).num_milliseconds();
             // Clamp to [0, 100] — out-of-order timestamps (DB jitter)
-            // and rounding drift must not push chips off the lane.
+            // and rounding drift must not push chips off the track.
             let pct = ((offset_ms as f64 / span_ms as f64) * 100.0).clamp(0.0, 100.0);
             let method_class = sip_method_class(&m.method);
             let code_class = sip_code_class(m.response_num);
@@ -711,7 +720,7 @@ fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
                  {method_disp}{code_disp}</span>"
             ));
         }
-        html.push_str("</div>");
+        html.push_str("</div></div>");
         html
     };
 
@@ -1590,6 +1599,39 @@ mod sip_render_tests {
         }
         let html = render_sngrep_flow(&msgs);
         assert!(html.contains("sngrep-axis"), "long call should have axis");
+    }
+
+    #[test]
+    fn sngrep_flow_wraps_chips_in_track_for_grid_layout() {
+        // Regression test for the grid+track restructure: each lane
+        // must contain a `.sngrep-track` div that holds the chips, so
+        // the lane's 28 px direction-gutter and 1fr time-axis track
+        // are siblings in the CSS grid. Without the track wrapper,
+        // `left: N%` resolves against the lane's padding box and the
+        // chips drift right by 28 px (and the time-origin chip ends
+        // up hidden under the direction arrow).
+        let mut msgs = vec![
+            mk_msg("INVITE", 0, 0.0),
+            mk_msg("",       200, 1.0),
+        ];
+        msgs[0].direction = "out".into();
+        msgs[1].direction = "in".into();
+        let html = render_sngrep_flow(&msgs);
+        // Each lane has exactly one .sngrep-track.
+        assert_eq!(html.matches("sngrep-track").count(), 2);
+        // The chip is INSIDE the track — `left: 0%` must appear
+        // AFTER `<div class="sngrep-track">`, never before.
+        let out_section = html
+            .split("sngrep-lane-out")
+            .nth(1)
+            .and_then(|s| s.split("sngrep-lane-in").next())
+            .unwrap_or("");
+        let track_open = out_section.find("sngrep-track").unwrap_or(usize::MAX);
+        let first_chip = out_section.find("sngrep-chip").unwrap_or(0);
+        assert!(
+            track_open < first_chip,
+            "chips must be inside the .sngrep-track, not siblings of the lane"
+        );
     }
 
     #[test]

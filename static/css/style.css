@@ -596,36 +596,34 @@ table.sip-timeline .sip-row:hover {
 .sngrep-flow {
   margin: 8px 0 12px;
 }
+/* Axis caption lives in the same 2-column grid as the lanes
+   (28px gutter + 1fr track) so its left/right timestamps align
+   with the time-axis endpoints. */
 .sngrep-axis {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  align-items: center;
+  margin-bottom: 4px;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
   font-size: 11px;
   color: var(--fg-muted);
-  padding: 0 32px 4px;
-  margin-bottom: 2px;
+  padding: 0 8px 4px 0;
+}
+.sngrep-axis > span {
+  grid-column: 2;
+  display: flex;
+  justify-content: space-between;
 }
 .sngrep-lane {
-  position: relative;
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  align-items: stretch;
   height: 38px;
   border: 1px solid var(--border);
   background: var(--bg);
   margin-bottom: 6px;
   border-radius: 4px;
-  /* Reserve room on the left for the direction arrow so chips
-     starting at left:0% don't overlap it. */
-  padding-left: 28px;
-}
-/* Horizontal dashed time-line through the lane centre. */
-.sngrep-lane::after {
-  content: "";
-  position: absolute;
-  left: 28px;
-  right: 8px;
-  top: 50%;
-  border-top: 1px dashed var(--border);
-  pointer-events: none;
-  z-index: 0;
+  overflow: hidden;
 }
 .sngrep-lane-out {
   border-left: 3px solid var(--accent);
@@ -634,20 +632,36 @@ table.sip-timeline .sip-row:hover {
   border-left: 3px solid #fbbf24;
 }
 .sngrep-dir {
-  position: absolute;
-  left: 8px;
-  top: 50%;
-  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-weight: 600;
   color: var(--fg-muted);
   font-size: 14px;
-  z-index: 1;
+  background: var(--bg-elev);
+}
+.sngrep-track {
+  position: relative;
+  height: 100%;
+}
+/* Horizontal dashed time-line through the track centre. */
+.sngrep-track::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  border-top: 1px dashed var(--border);
+  pointer-events: none;
+  z-index: 0;
 }
 .sngrep-chip {
   position: absolute;
   top: 50%;
-  /* Centre the chip horizontally on its time position — `left: N%`
-     would otherwise anchor the chip's *left edge* to N%. */
+  /* Centre the chip horizontally on its time position so `left: 0%`
+     and `left: 100%` chips are partially off the track — same as
+     classic sngrep, which signals "this happened at the very edge
+     of the call". overflow:hidden on the lane crops the rest. */
   transform: translate(-50%, -50%);
   display: inline-flex;
   align-items: center;
