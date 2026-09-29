@@ -586,173 +586,95 @@ table.sip-timeline .sip-row:hover {
   flex: 0 0 auto;
 }
 
-/* sngrep-style call flow (above the SIP timeline).
-   Two horizontal lanes (outgoing from us, incoming to us) sharing
-   a time axis. Each marker (chip + below-chip time/IP label) is
-   positioned at `left: N%` so a quick glance shows where in the
-   call the message fell. The dashed centre line is the time axis
-   itself — same visual idiom as sngrep's terminal UI.
-
-   Chip weight is asymmetric: outgoing = filled, incoming =
-   outline-only. The eye reads top-to-bottom as the conversation
-   flow. CSeq-paired chips share a coloured left-edge accent so
-   request ↔ response transactions are visually grouped. */
-.sngrep-flow {
-  margin: 8px 0 12px;
-}
-.sngrep-axis {
-  display: grid;
-  grid-template-columns: 28px 1fr 1fr;
-  align-items: center;
-  margin-bottom: 4px;
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
-  font-size: 11px;
-  color: var(--fg-muted);
-  padding: 0 8px 4px 0;
-}
-.sngrep-axis > span:first-of-type { grid-column: 2; justify-self: start; }
-.sngrep-axis > span:last-of-type { grid-column: 3; justify-self: end; }
-.sngrep-lane {
-  display: grid;
-  grid-template-columns: 28px 1fr;
-  align-items: stretch;
-  /* 60 px tall: chip (24 px) + 2 px gap + label (14 px) + 14 px headroom
-     for the chip sitting on the time-line at the lane centre. */
-  height: 60px;
+/* UML-style sequence diagram for the Call flow panel above the
+   SIP timeline. Two vertical actors (caller / callee) at the top;
+   each row is one SIP message, with a horizontal arrow between the
+   two lifelines pointing in the message direction. Time flows
+   top-to-bottom; relative-time offset is shown at the left of each
+   row. A separate row inserted between setup (last 2xx/ACK) and
+   teardown (first BYE) carries the RTP-flow summary — same visual
+   idiom as Wireshark's Telephony > SIP Flows view. */
+.seq-diagram {
   border: 1px solid var(--border);
+  border-radius: 6px;
   background: var(--bg);
-  /* Bottom margin holds the gap where pair-lines travel between the
-     outgoing chip's bottom edge and the incoming chip's top edge. */
-  margin-bottom: 30px;
-  border-radius: 4px;
-  overflow: visible;
+  margin: 12px 0;
+  overflow: hidden;
 }
-.sngrep-lane:last-of-type { margin-bottom: 0; }
-.sngrep-lane-out { border-left: 3px solid var(--accent); }
-.sngrep-lane-in  { border-left: 3px solid #fbbf24; }
-.sngrep-dir {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 600;
-  color: var(--fg-muted);
-  font-size: 14px;
+.seq-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
   background: var(--bg-elev);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
 }
-.sngrep-track {
-  position: relative;
-  height: 100%;
-}
-/* Horizontal dashed time-line through the track centre — the chip
-   sits ON this line, the label hangs below. */
-.sngrep-track::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  border-top: 1px dashed var(--border);
-  pointer-events: none;
-  z-index: 0;
-}
-.sngrep-marker {
-  position: absolute;
-  /* Position so the chip's *centre* lands on the time-line: chip is
-  24 px tall, so its top edge sits at (50% − 12 px). */
-  top: calc(50% - 12px);
+.seq-actor { text-align: center; font-weight: 600; }
+.seq-actor-label { font-size: 13px; }
+.seq-actor-ip { color: var(--fg-muted); font-size: 11px; font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace; }
+.seq-body {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 2px;
-  z-index: 1;
-  /* Horizontal centring via inline `left: N%` is applied by the
-     renderer; we shift back by 50 % of the marker's own width. */
-  transform: translateX(-50%);
-}
-.sngrep-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  padding: 2px 8px;
-  border-radius: 3px;
-  font-size: 12px;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
-  white-space: nowrap;
+  font-size: 12px;
+  padding: 6px 0;
 }
-/* Visual hierarchy: outgoing = filled, incoming = outline-only. */
-.sngrep-chip.sngrep-chip-out {
-  background: var(--bg-elev-2);
-  border: 1px solid var(--border);
+.seq-msg {
+  display: grid;
+  grid-template-columns: 70px 1fr;
+  align-items: center;
+  padding: 4px 12px;
+  gap: 8px;
+}
+.seq-msg-out .seq-endpoints { color: var(--accent); }
+.seq-msg-in .seq-endpoints { color: #fbbf24; }
+.seq-time {
+  text-align: right;
+  color: var(--fg-muted);
+  font-size: 11px;
+}
+.seq-endpoints {
+  text-align: center;
+  font-size: 11px;
+}
+.seq-arrow {
+  display: block;
+  text-align: center;
+  padding: 6px 14px;
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.seq-arrow-out {
+  background: rgba(74, 158, 255, 0.15);
+  border: 1px solid var(--accent);
+  color: var(--accent);
   font-weight: 600;
 }
-.sngrep-chip.sngrep-chip-in {
+.seq-arrow-in {
   background: transparent;
-  border: 1px solid var(--fg-muted);
-  font-weight: 500;
-}
-.sngrep-marker-label {
-  font-size: 10px;
-  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
-  color: var(--fg-muted);
-  white-space: nowrap;
-  line-height: 1.2;
-}
-.sngrep-marker-label .sngrep-label-time {
+  border: 1px dashed var(--fg-muted);
   color: var(--fg);
 }
-.sngrep-marker-label .sngrep-label-sep {
-  color: var(--fg-muted);
-  margin: 0 4px;
-  opacity: 0.6;
+.seq-arrow-rtp {
+  background: rgba(74, 222, 128, 0.08);
+  border: 1px solid #4ade80;
+  color: #4ade80;
+  font-style: italic;
 }
-/* Pair connector: a hairline that drops from the outgoing chip down
-   to the bottom of the outgoing lane, AND a matching hairline that
-   rises from the top of the incoming lane up to the incoming chip.
-   The two halves visually align (same `left: N%`) across the lane
-   gap, drawing the eye along the request ↔ response transaction. */
-.sngrep-pair-out {
-  position: absolute;
-  width: 1px;
-  /* chip bottom is at lane centre + 12 px, lane bottom is 100 %. */
-  top: calc(50% + 12px);
-  bottom: 0;
-  background: var(--accent);
-  opacity: 0.35;
-  pointer-events: none;
-  z-index: 0;
-  transform: translateX(-50%);
-}
-.sngrep-pair-in {
-  position: absolute;
-  width: 1px;
-  top: 0;
-  /* chip top is at lane centre − 12 px. */
-  bottom: calc(50% - 12px);
-  background: var(--accent);
-  opacity: 0.35;
-  pointer-events: none;
-  z-index: 0;
-  transform: translateX(-50%);
-}
-.sngrep-method {
-  font-weight: 600;
-}
-.sngrep-code {
-  padding: 0 4px;
-  border-radius: 2px;
-  font-weight: 600;
-}
-/* Method-specific colours — match the SIP timeline. */
-.sngrep-method.sip-method-invite,
-.sngrep-method.sip-method-bye,
-.sngrep-method.sip-method-cancel,
-.sngrep-method.sip-method-ack,
-.sngrep-method.sip-method-register {
-  color: var(--accent);
-}
-.sngrep-code.sip-1xx { color: var(--fg-muted); }
-.sngrep-code.sip-2xx { color: #4ade80; }
-.sngrep-code.sip-3xx { color: #fbbf24; }
-.sngrep-code.sip-4xx { color: #fb923c; }
-.sngrep-code.sip-5xx,
-.sngrep-code.sip-6xx { color: #f87171; }
+.seq-method { font-weight: 700; margin-right: 4px; }
+.seq-method.sip-method-invite,
+.seq-method.sip-method-bye,
+.seq-method.sip-method-cancel,
+.seq-method.sip-method-ack,
+.seq-method.sip-method-register { color: var(--accent); }
+.seq-code { padding: 0 4px; border-radius: 2px; font-weight: 600; }
+.seq-code.sip-1xx { color: var(--fg-muted); }
+.seq-code.sip-2xx { color: #4ade80; }
+.seq-code.sip-3xx { color: #fbbf24; }
+.seq-code.sip-4xx { color: #fb923c; }
+.seq-code.sip-5xx,
+.seq-code.sip-6xx { color: #f87171; }
+.seq-msg-rtp { padding: 6px 12px; }
+.seq-msg-rtp .seq-endpoints { color: #4ade80; font-style: italic; }
+

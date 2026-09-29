@@ -622,7 +622,13 @@ pub async fn cdr_detail(
         // "what shape did the call have?" before drilling into the
         // per-message details below. Reuses the same SipMessage
         // vector; no extra fetch.
-        flow_html = render_sngrep_flow(&sip_messages),
+        flow_html = render_sngrep_flow(
+            &sip_messages,
+            cdr.rtp_a.received,
+            if cdr.rtp_a.codec_name.is_empty() { None } else { Some(cdr.rtp_a.codec_name.clone()) },
+            cdr.rtp_b.received,
+            if cdr.rtp_b.codec_name.is_empty() { None } else { Some(cdr.rtp_b.codec_name.clone()) },
+        ),
         sip_html = render_sip_timeline(&sip_messages),
         rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
     );
@@ -648,277 +654,175 @@ pub async fn cdr_detail(
 /// message's `ip_src`), the two-lane layout naturally shows the
 /// caller → callee → caller → caller round-trips.
 ///
-/// Each chip sits on a shared time axis at `left: N%` (first message
-/// at 0 %, last at 100 %, mid-points proportional to wall-clock time).
-/// Below each chip we render a small label with the relative time
-/// (`+0.6s`) and the source IP, so the operator gets per-chip context
-/// without having to hover. Outgoing chips are visually heavier
-/// (filled background, bold) than incoming chips (outline-only) so
-/// the eye reads top-to-bottom as the conversation flow. CSeq-paired
-/// chips get a thin vertical line connector — same `left: N%` on
-/// both sides of the lane gap — drawing the eye along request ↔
-/// response transactions, classic-sngrep-style.
+/// Each row is one SIP message: time offset on the left, an arrow
+/// running from caller (left actor) to callee (right actor) or vice
+/// versa, with method/response code rendered inside the arrow.
+/// Between setup (last 2xx/ACK) and teardown (first BYE) we render
+/// an RTP-flow row showing the negotiated codec and per-direction
+/// packet counts — same visual idiom as Wireshark's
+/// Telephony > SIP Flows view.
 ///
 /// Returns "" when `messages` is empty (the section is then omitted).
-fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
+fn render_sngrep_flow(
+    messages: &[cdr::SipMessage],
+    rtp_a_pkts: Option<u32>,
+    rtp_a_codec: Option<String>,
+    rtp_b_pkts: Option<u32>,
+    rtp_b_codec: Option<String>,
+) -> String {
     if messages.is_empty() {
         return String::new();
     }
-    // Time axis range. We use min/max across all messages so lanes
-    // share a common scale even if one side has only a single chip.
-    // Degenerate case (all messages at the same instant) collapses
-    // to span_ms=1 to avoid divide-by-zero — chips then stack at 0%.
+
+    // Caller / callee endpoint labels — derived from the first
+    // outgoing message we see (its src/dst IPs are the two endpoints).
+    let first = messages.iter().find(|m| !m.src_ip_str.is_empty());
+    let (caller_ip, callee_ip) = first.map_or((String::new(), String::new()), |m| {
+        (m.src_ip_str.clone(), m.dst_ip_str.clone())
+    });
+
+    // Time axis: relative to the first message's timestamp.
     let t_min = messages.iter().map(|m| m.calldate).min().unwrap();
-    let t_max = messages.iter().map(|m| m.calldate).max().unwrap();
-    let span_ms = (t_max - t_min).num_milliseconds().max(1);
 
-    // Compute CSeq pairing so we can draw the request ↔ response
-    // connector lines. We group outgoing requests by (cseq_num,
-    // cseq_method) — both must match because CSeq numbers are scoped
-    // per dialog but the (num, method) pair is the unambiguous
-    // transaction identifier. Messages with no parsed CSeq are
-    // silently unpaired (no line drawn).
-    let pairs = compute_sip_pairs(messages);
-    // Pre-build the set of ALL indices that participate in any
-    // transaction — keys (outgoing requests) AND values (incoming
-    // responses). Used below to decide whether to emit a pair-line
-    // half on each lane. Without this we'd check only outgoing-side
-    // keys when iterating the incoming lane.
-    let paired_indices: std::collections::HashSet<usize> = pairs
-        .iter()
-        .flat_map(|(k, v)| [*k, *v])
-        .collect();
+    // Walk messages, accumulating HTML rows. Between media-active
+    // markers (last 2xx/ACK → first BYE) we emit a single RTP-flow
+    // row showing the negotiated codec and packet counts.
+    let mut rows: Vec<String> = Vec::with_capacity(messages.len() + 1);
+    let mut media_started = false;
+    let mut media_inserted = false;
 
-    // Closure that renders a single lane (out or in) including chips
-    // and the half of the pair line that lives inside this lane.
-    let render_lane = |lane_messages: &[&cdr::SipMessage],
-                       lane_class: &str,
-                       lane_kind: &str, // "out" or "in"
-                       dir_arrow: &str|
-     -> String {
-        if lane_messages.is_empty() {
-            return String::new();
-        }
-        // Walk the ORIGINAL slice's indices, not the partitioned vec,
-        // so pair lookups match the keys `compute_sip_pairs` produced.
-        let mut html = format!(
-            "<div class=\"sngrep-lane {lane_class}\">\
-             <span class=\"sngrep-dir\">{dir_arrow}</span>\
-             <div class=\"sngrep-track\">"
+    for m in messages.iter() {
+        let offset_ms = (m.calldate - t_min).num_milliseconds();
+        let rel_time = format!("+{:.1}s", offset_ms as f64 / 1000.0);
+        let is_out = m.direction != "in";
+        let method_class = sip_method_class(&m.method);
+        let code_class = sip_code_class(m.response_num);
+
+        let method_disp = if m.method.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<span class=\"seq-method {method_class}\">{}</span> ",
+                html_escape(&m.method)
+            )
+        };
+        let code_disp = if m.response_num == 0 {
+            String::new()
+        } else {
+            format!(
+                "<span class=\"seq-code {code_class}\">{}</span>",
+                m.response_num
+            )
+        };
+        let arrow_short = if is_out { "►" } else { "◄" };
+        let arrow_long = if is_out { "────►" } else { "◄────" };
+        let src_esc = html_escape(&m.src_ip_str);
+        let dst_esc = html_escape(&m.dst_ip_str);
+        let title = format!(
+            "{} {} {} → {} @ {}",
+            m.method,
+            m.response_text,
+            src_esc,
+            dst_esc,
+            m.calldate.format("%H:%M:%S%.3f"),
         );
-        for (orig_idx, m) in messages.iter().enumerate() {
-            // Skip messages that belong to the OTHER lane.
-            let on_this_lane = match lane_kind {
-                "out" => m.direction != "in",
-                _ => m.direction == "in",
-            };
-            if !on_this_lane {
-                continue;
+
+        rows.push(format!(
+            "<div class=\"seq-msg {kind}\" title=\"{title}\">\
+             <span class=\"seq-time\">{rel_time}</span>\
+             <span class=\"seq-endpoints\">{src_esc} {arrow_short} {dst_esc}</span>\
+             <span class=\"seq-arrow seq-arrow-{kind2}\">{arrow_long} {method_disp}{code_disp}</span>\
+             </div>",
+            kind = if is_out { "seq-msg-out" } else { "seq-msg-in" },
+            kind2 = if is_out { "out" } else { "in" },
+        ));
+
+        // Mark media_started at first 2xx or ACK.
+        if !media_started {
+            let ack_or_2xx =
+                (!m.method.is_empty() && m.method == "ACK") ||
+                (m.response_num >= 200 && m.response_num < 300);
+            if ack_or_2xx {
+                media_started = true;
             }
-            // Belt-and-braces: only render the message at the index
-            // we're walking, not by re-scanning lane_messages.
-            if !lane_messages.iter().any(|lm| std::ptr::eq(*lm, m)) {
-                continue;
-            }
-
-            let offset_ms = (m.calldate - t_min).num_milliseconds();
-            // Clamp to [2, 98] so chips at the call's very first or
-            // very last instant are kept fully inside the visible
-            // track. Chips at left:0% / left:100% with translate(-50%)
-            // are half-clipped at the track edge otherwise — visible
-            // bug when the first or last message is the only one in
-            // its lane (e.g. a single BYE chip on a long call).
-            let pct = ((offset_ms as f64 / span_ms as f64) * 100.0).clamp(2.0, 98.0);
-
-            // Pair-line: each lane emits ONE half of the connector at the chip's
-            // own X position. The two halves visually align across the
-            // lane gap when request and response arrive close in time
-            // (the common case — typical INVITE → 200 OK lands within
-            // 1 s). For long-gap transactions the two dangling
-            // hairlines are clearly the same colour, hinting at the
-            // pairing without drawing a literal connector line (CSS
-            // can't easily draw angled connectors).
-            let pair_line = if paired_indices.contains(&orig_idx) {
-                let cls = if lane_kind == "out" { "sngrep-pair-out" } else { "sngrep-pair-in" };
-                format!(
-                    "<span class=\"{cls}\" style=\"left: {pct:.2}%\"></span>"
-                )
-            } else {
-                String::new()
-            };
-
-            // Chip body — outgoing is filled, incoming is outline.
-            let method_class = sip_method_class(&m.method);
-            let code_class = sip_code_class(m.response_num);
-            let method_disp = if m.method.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "<span class=\"sngrep-method {method_class}\">{}</span> ",
-                    html_escape(&m.method)
-                )
-            };
-            let code_disp = if m.response_num == 0 {
-                String::new()
-            } else {
-                format!(
-                    "<span class=\"sngrep-code {code_class}\">{}</span>",
-                    m.response_num
-                )
-            };
-            // Below-chip label: relative time + source IP. The dest
-            // IP is implied (it's the other lane's source), and full
-            // context lives in the tooltip for operators who want it.
-            let rel_time = format!("+{:.1}s", offset_ms as f64 / 1000.0);
-            let src = if m.src_ip_str.is_empty() {
-                String::new()
-            } else {
-                html_escape(&m.src_ip_str)
-            };
-            let label = if src.is_empty() {
-                format!(
-                    "<small class=\"sngrep-marker-label\">\
-                     <span class=\"sngrep-label-time\">{rel_time}</span>\
-                     </small>"
-                )
-            } else {
-                format!(
-                    "<small class=\"sngrep-marker-label\">\
-                     <span class=\"sngrep-label-time\">{rel_time}</span>\
-                     <span class=\"sngrep-label-sep\">·</span>\
-                     <span class=\"sngrep-label-src\">{src}</span>\
-                     </small>"
-                )
-            };
-            // Tooltip carries the full context the chip label omits:
-            // both endpoints + the absolute timestamp.
-            let tip = format!(
-                "{} {} {} → {} @ {}",
-                m.method,
-                m.response_text,
-                html_escape(&m.src_ip_str),
-                html_escape(&m.dst_ip_str),
-                m.calldate.format("%H:%M:%S%.3f"),
-            );
-            html.push_str(&format!(
-                "{pair_line}\
-                 <span class=\"sngrep-marker\" style=\"left: {pct:.2}%\">\
-                 <span class=\"sngrep-chip sngrep-chip-{lane_kind} {code_class}\" \
-                 title=\"{tip}\">\
-                 {method_disp}{code_disp}</span>\
-                 {label}\
-                 </span>"
-            ));
         }
-        html.push_str("</div></div>");
-        html
-    };
+        // Insert RTP row right before the first BYE/CANCEL after media.
+        if media_started && !media_inserted && (m.method == "BYE" || m.method == "CANCEL") {
+            rows.push(rtp_row(
+                rtp_a_pkts,
+                rtp_a_codec.as_deref(),
+                rtp_b_pkts,
+                rtp_b_codec.as_deref(),
+            ));
+            media_inserted = true;
+        }
+    }
+    if media_started && !media_inserted {
+        rows.push(rtp_row(
+            rtp_a_pkts,
+            rtp_a_codec.as_deref(),
+            rtp_b_pkts,
+            rtp_b_codec.as_deref(),
+        ));
+    }
 
-    let (outgoing, incoming): (Vec<&cdr::SipMessage>, Vec<&cdr::SipMessage>) = messages
-        .iter()
-        .partition(|m| m.direction != "in");
-
-    let out_lane = render_lane(&outgoing, "sngrep-lane-out", "out", "→");
-    let in_lane = render_lane(&incoming, "sngrep-lane-in", "in", "←");
-    let total = outgoing.len() + incoming.len();
-    let total_msgs = messages.len();
-
-    // Time-axis caption above the lanes. We only emit start/end
-    // timestamps when the call spans ≥ 1s — sub-second calls (rejects,
-    // busy-here responses) clutter the UI for no analytic value.
-    let axis = if span_ms >= 1000 {
-        format!(
-            "<div class=\"sngrep-axis\"><span>{}</span><span>{}</span></div>",
-            t_min.format("%H:%M:%S%.3f"),
-            t_max.format("%H:%M:%S%.3f"),
-        )
-    } else {
-        String::new()
-    };
+    let total = messages.len();
 
     format!(
         "<h2>Call flow</h2>\
          <p class=\"muted small\">\
-           {total} of {total_msgs} messages on a time axis (outgoing / incoming).\
+           {total} SIP messages, time top-to-bottom. \
+           Outgoing solid, incoming dashed; arrows point in the message direction.\
          </p>\
-         <div class=\"sngrep-flow\">\
-           {axis}\
-           {out_lane}\
-           {in_lane}\
+         <div class=\"seq-diagram\">\
+           <div class=\"seq-header\">\
+             <div class=\"seq-actor seq-actor-left\">\
+               <div class=\"seq-actor-label\">caller</div>\
+               <div class=\"seq-actor-ip\">{caller_ip}</div>\
+             </div>\
+             <div class=\"seq-actor seq-actor-right\">\
+               <div class=\"seq-actor-label\">callee</div>\
+               <div class=\"seq-actor-ip\">{callee_ip}</div>\
+             </div>\
+           </div>\
+           <div class=\"seq-body\">{rows}</div>\
          </div>",
+        rows = rows.join("\n"),
     )
 }
 
-/// Compute CSeq pairing for the sngrep flow: returns a map from
-/// message-index → the OTHER side's index for every CSeq-matched
-/// pair. (cseq_num, cseq_method) is the unambiguous transaction
-/// identifier — CSeq numbers are per-dialog so we need the method
-/// too to disambiguate CSeq=1 INVITE from CSeq=1 BYE in calls that
-/// include an in-dialog re-INVITE.
-///
-/// Direction is the deciding filter: outgoing requests pair with
-/// incoming responses on the same CSeq that occur *after* the
-/// request. If multiple outgoing requests share a CSeq (rare but
-/// possible — call resends, parallel forks), we use the most recent
-/// one before the response. If multiple responses share a CSeq
-/// (the common case: INVITE → 100 → 183 → 200 all share CSeq=1),
-/// each response pairs with the same outgoing request.
-fn compute_sip_pairs(messages: &[cdr::SipMessage]) -> std::collections::HashMap<usize, usize> {
-    use std::collections::HashMap;
-    let mut result: HashMap<usize, usize> = HashMap::new();
-
-    // Build a (cseq_num, cseq_method) → outgoing index list. We sort
-    // each list by time so the linear scan below is monotonic.
-    let mut out_by_key: HashMap<(u32, String), Vec<usize>> = HashMap::new();
-    for (i, m) in messages.iter().enumerate() {
-        if m.direction == "in" {
-            continue;
-        }
-        if let (Some(n), Some(method)) = (m.cseq_num, m.cseq_method.as_ref()) {
-            out_by_key
-                .entry((n, method.clone()))
-                .or_default()
-                .push(i);
-        }
-    }
-    // Sort each value list by calldate so rev().find() finds the
-    // most-recent-prior outgoing request for a response.
-    for v in out_by_key.values_mut() {
-        v.sort_by_key(|&i| messages[i].calldate);
-    }
-
-    // For each response, find the outgoing request with the same
-    // (cseq_num, cseq_method) that occurred at or before this
-    // response's time, picking the most recent of those.
-    for (i, m) in messages.iter().enumerate() {
-        if m.direction != "in" {
-            continue;
-        }
-        let (Some(n), Some(method)) = (m.cseq_num, m.cseq_method.as_ref()) else {
-            continue;
-        };
-        let Some(outs) = out_by_key.get(&(n, method.clone())) else {
-            continue;
-        };
-        // Reverse-iterate to find the most recent outgoing with the
-        // same key whose calldate <= this response's calldate.
-        let matching = outs
-            .iter()
-            .rev()
-            .find(|&&out_idx| messages[out_idx].calldate <= m.calldate)
-            .copied();
-        if let Some(out_idx) = matching {
-            // Don't double-pair: if the outgoing request was already
-            // paired with an earlier response, leave the earlier
-            // pair alone and skip this response. (Classic sngrep
-            // shows only one pair-line per outgoing request, the
-            // final response.)
-            if !result.contains_key(&out_idx) {
-                result.insert(out_idx, i);
-            }
-        }
-    }
-    result
+/// Render the RTP-flow row that lives between the last 2xx/ACK and
+/// the first BYE. Shows the negotiated codec and per-direction
+/// packet counts in a single full-width bar — same visual idiom as
+/// Wireshark's Telephony > SIP Flows media annotation.
+fn rtp_row(
+    a_pkts: Option<u32>,
+    a_codec: Option<&str>,
+    b_pkts: Option<u32>,
+    b_codec: Option<&str>,
+) -> String {
+    let a_codec = a_codec.unwrap_or("").trim();
+    let b_codec = b_codec.unwrap_or("").trim();
+    let codec = if !a_codec.is_empty() {
+        a_codec.to_string()
+    } else if !b_codec.is_empty() {
+        b_codec.to_string()
+    } else {
+        "RTP".to_string()
+    };
+    let a_count = a_pkts
+        .map(|n| format!("{} pkts", n))
+        .unwrap_or_else(|| "—".to_string());
+    let b_count = b_pkts
+        .map(|n| format!("{} pkts", n))
+        .unwrap_or_else(|| "—".to_string());
+    format!(
+        "<div class=\"seq-msg seq-msg-rtp\">\
+         <span class=\"seq-time\">media</span>\
+         <span class=\"seq-endpoints\">A→B &nbsp; B→A</span>\
+         <span class=\"seq-arrow seq-arrow-rtp\">═════ RTP {codec} (A→B {a_count}, B→A {b_count}) ═════</span>\
+         </div>"
+    )
 }
 
 /// B leg" table with the most useful VoIPmonitor-derived quality
@@ -1569,35 +1473,28 @@ fn label_for_window(
 mod sip_render_tests {
     use super::*;
 
-    #[test]
-    fn sip_code_class_covers_every_response_class() {
-        // Each range boundary must land in its own class so the
-        // colour-coding renders the right shade.
-        assert_eq!(sip_code_class(100), "sip-1xx");
-        assert_eq!(sip_code_class(180), "sip-1xx");
-        assert_eq!(sip_code_class(199), "sip-1xx");
-        assert_eq!(sip_code_class(200), "sip-2xx");
-        assert_eq!(sip_code_class(302), "sip-3xx");
-        assert_eq!(sip_code_class(404), "sip-4xx");
-        assert_eq!(sip_code_class(503), "sip-5xx");
-        assert_eq!(sip_code_class(603), "sip-6xx");
-        assert_eq!(sip_code_class(0), "sip-other");
-        assert_eq!(sip_code_class(99), "sip-other");
-    }
-
-    #[test]
-    fn sip_method_class_recognises_lifecycle_methods() {
-        // Lifecycle methods get their own highlight colour so a triage
-        // session can spot INVITE в†’ BYE pairs immediately.
-        for m in ["INVITE", "BYE", "CANCEL", "ACK", "REGISTER"] {
-            assert_ne!(sip_method_class(m), "sip-method-other", "{m}");
+    fn mk_msg(method: &str, code: u16, seconds_offset: f64) -> cdr::SipMessage {
+        let t0 = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let delta_ms = (seconds_offset * 1000.0) as i64;
+        cdr::SipMessage {
+            id: 0,
+            calldate: t0 + chrono::Duration::milliseconds(delta_ms),
+            method: method.into(),
+            response_num: code,
+            response_text: format!("{code}"),
+            from_num: String::new(),
+            to_num: String::new(),
+            src_ip_str: String::new(),
+            dst_ip_str: String::new(),
+            direction: String::new(),
+            content_type: String::new(),
+            content: String::new(),
+            cseq_num: None,
+            cseq_method: None,
         }
-        // Methods without a dedicated bucket fall through to other.
-        // INFO has its own (it's RFC-defined), so use a known-unknown
-        // method name to exercise the wildcard branch.
-        assert_eq!(sip_method_class("INFO"), "sip-method-info");
-        assert_eq!(sip_method_class("KEEPALIVE"), "sip-method-other");
-        assert_eq!(sip_method_class("garbage"), "sip-method-other");
     }
 
     #[test]
@@ -1634,292 +1531,106 @@ mod sip_render_tests {
         assert!(html.contains(r#"class="num sip-2xx""#));
         // Second row: failure — red 5xx class + red 5xx method class.
         assert!(html.contains(r#"class="num sip-5xx""#));
-        // Method cell uses the invite highlight class.
-        assert!(html.contains("sip-method-invite"));
-        // Direction arrow renders for outbound requests.
-        assert!(html.contains(r#"class="num dir-out">в†’<"#));
-    }
-
-    /// Helper for the call-flow tests below — makes a synthetic SIP
-    /// message at `seconds_offset` after the call start.
-    fn mk_msg(method: &str, code: u16, seconds_offset: f64) -> cdr::SipMessage {
-        let t0 = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
-            .unwrap()
-            .and_hms_opt(14, 30, 0)
-            .unwrap();
-        let delta_ms = (seconds_offset * 1000.0) as i64;
-        cdr::SipMessage {
-            id: 0,
-            calldate: t0 + chrono::Duration::milliseconds(delta_ms),
-            method: method.into(),
-            response_num: code,
-            response_text: format!("{code}"),
-            from_num: String::new(),
-            to_num: String::new(),
-            src_ip_str: String::new(),
-            dst_ip_str: String::new(),
-            direction: String::new(),
-            content_type: String::new(),
-            content: String::new(),
-            // Tests that exercise transaction pairing pass Some() here;
-            // this default of None keeps the existing happy-path tests
-            // unaffected.
-            cseq_num: None,
-            cseq_method: None,
-        }
     }
 
     #[test]
-    fn sngrep_flow_renders_two_lanes_with_chips() {
-        // Happy-path call: outgoing INVITE/ACK/BYE, incoming 100/180/200/200.
+    fn seq_diagram_omitted_for_empty_messages() {
+        assert_eq!(render_sngrep_flow(&[], None, None, None, None), "");
+    }
+
+    #[test]
+    fn seq_diagram_renders_one_row_per_message() {
+        // INVITE / 100 / 200 / ACK / BYE / 200 — six messages, six rows.
+        // Direction must be set explicitly; empty defaults to "out"
+        // (m.direction != "in"), which would lump all messages into
+        // the outgoing lane.
+        let mut invite = mk_msg("INVITE", 0, 0.0); invite.direction = "out".into();
+        let mut r100 = mk_msg("", 100, 0.1); r100.direction = "in".into();
+        let mut r200a = mk_msg("", 200, 0.2); r200a.direction = "in".into();
+        let mut ack = mk_msg("ACK", 0, 0.3); ack.direction = "out".into();
+        let mut bye = mk_msg("BYE", 0, 5.0); bye.direction = "out".into();
+        let mut r200b = mk_msg("", 200, 5.1); r200b.direction = "in".into();
+        let msgs = vec![invite, r100, r200a, ack, bye, r200b];
+        let html = render_sngrep_flow(&msgs, None, None, None, None);
+        // Six message rows + one RTP-flow row = 7 seq-msg elements.
+        assert_eq!(html.matches(r#"class="seq-msg "#).count(), 7);
+        // Outgoing rows have seq-msg-out, incoming have seq-msg-in.
+        // Use unique substrings (the space before the closing quote is
+        // not shared with seq-msg-in / seq-msg-rtp).
+        assert_eq!(html.matches(r#" seq-msg-out""#).count(), 3);
+        assert_eq!(html.matches(r#" seq-msg-in""#).count(), 3);
+        // One RTP row (between media setup and teardown).
+        assert_eq!(html.matches(r"seq-msg-rtp").count(), 1);
+        eprintln!("DEBUG HTML:
+{html}
+END");
+    }
+
+    #[test]
+    fn seq_diagram_relative_time_offsets_in_each_row() {
+        // Each row shows the time offset relative to the first message.
         let msgs = vec![
-            mk_msg("INVITE", 0,   0.0),
-            mk_msg("",       100, 0.1),
-            mk_msg("",       180, 0.2),
-            mk_msg("",       200, 0.3),
-            mk_msg("ACK",    0,   0.4),
-            mk_msg("BYE",    0,   5.0),
-            mk_msg("",       200, 5.0),
-        ];
-        let mut tagged = msgs;
-        // out = INVITE/ACK/BYE; in = the four responses
-        tagged[0].direction = "out".into(); tagged[1].direction = "in".into();
-        tagged[2].direction = "in".into(); tagged[3].direction = "in".into();
-        tagged[4].direction = "out".into(); tagged[5].direction = "out".into();
-        tagged[6].direction = "in".into();
-        let html = render_sngrep_flow(&tagged);
-        // Two lanes (out + in) inside the .sngrep-flow container.
-        assert_eq!(html.matches("sngrep-lane-out").count(), 1);
-        assert_eq!(html.matches("sngrep-lane-in").count(), 1);
-        // Outgoing lane: 3 chips (INVITE, ACK, BYE). Note: we count
-        // "sngrep-chip-" (with the trailing dash) — the bare
-        // "sngrep-chip" substring also matches the "sngrep-chip"
-        // prefix of "sngrep-chip-out" / "sngrep-chip-in", doubling
-        // the count if we just match "sngrep-chip".
-        let out_section = html.split("sngrep-lane-out").nth(1).unwrap_or("");
-        let out_end = out_section.find("sngrep-lane-in").unwrap_or(out_section.len());
-        let out_only = &out_section[..out_end];
-        assert_eq!(out_only.matches("sngrep-chip-").count(), 3);
-        assert!(out_only.contains("INVITE"));
-        assert!(out_only.contains("ACK"));
-        assert!(out_only.contains("BYE"));
-        // Incoming lane: 4 chips (100, 180, 200, 200).
-        let in_section = html.split("sngrep-lane-in").nth(1).unwrap_or("");
-        assert_eq!(in_section.matches("sngrep-chip-").count(), 4);
-        // 2xx-coded chips colour-coded green.
-        assert!(in_section.contains(r#"class="sngrep-code sip-2xx">200</span>"#));
-    }
-
-    #[test]
-    fn sngrep_flow_omitted_for_empty_messages() {
-        assert_eq!(render_sngrep_flow(&[]), "");
-    }
-
-    #[test]
-    fn sngrep_flow_no_separators_between_chips() {
-        // The new design drops the `sngrep-sep` "→" between chips
-        // entirely — chips carry their own position via `style="left: …%"`.
-        // Regression test so we don't accidentally re-introduce it.
-        let m = vec![{
-            let mut x = mk_msg("INVITE", 0, 0.0);
-            x.direction = "out".into();
-            x
-        }];
-        let html = render_sngrep_flow(&m);
-        // Count with the trailing dash to avoid the prefix overlap
-        // with "sngrep-chip-out".
-        assert_eq!(html.matches("sngrep-chip-").count(), 1);
-        assert_eq!(html.matches("sngrep-sep").count(), 0);
-    }
-
-    #[test]
-    fn sngrep_flow_partitions_by_direction() {
-        // All outgoing → no incoming lane content.
-        let mut msgs = vec![mk_msg("INVITE", 0, 0.0), mk_msg("ACK", 0, 1.0)];
-        msgs[0].direction = "out".into();
-        msgs[1].direction = "out".into();
-        let html = render_sngrep_flow(&msgs);
-        // Out lane has 2 chips; in lane is rendered with no chips.
-        // Count with trailing dash to avoid prefix overlap.
-        assert_eq!(html.matches("sngrep-chip-").count(), 2);
-        let in_section = html.split("sngrep-lane-in").nth(1).unwrap_or("");
-        assert_eq!(in_section.matches("sngrep-chip-").count(), 0);
-    }
-
-    #[test]
-    fn sngrep_flow_positions_chips_by_relative_time() {
-        // Three outgoing messages at 0.0, 1.0, 5.0 seconds. With the
-        // 2 %/98 % edge-clamp (so chips at the absolute first/last
-        // instant are kept fully inside the visible track), the
-        // middle one at 1 s of 5 s span lands at left:20 %.
-        let mut msgs = vec![
             mk_msg("INVITE", 0, 0.0),
-            mk_msg("ACK",    0, 1.0),
-            mk_msg("BYE",    0, 5.0),
+            mk_msg("BYE", 0, 5.0),
         ];
-        for m in msgs.iter_mut() {
-            m.direction = "out".into();
-        }
-        let html = render_sngrep_flow(&msgs);
-        // First message clamps to left:2.00%.
-        assert!(html.contains(r#"style="left: 2.00%""#));
-        // Middle at 20% (1s of 5s span).
-        assert!(html.contains(r#"style="left: 20.00%""#));
-        // Last clamps to left:98.00%.
-        assert!(html.contains(r#"style="left: 98.00%""#));
-        // Defensive — we should NOT emit 0% or 100% literally,
-        // those are the values that clip.
-        assert!(!html.contains(r#"style="left: 0.00%""#));
-        assert!(!html.contains(r#"style="left: 100.00%""#));
+        let html = render_sngrep_flow(&msgs, None, None, None, None);
+        assert!(html.contains("+0.0s"));
+        assert!(html.contains("+5.0s"));
     }
 
     #[test]
-    fn sngrep_flow_shows_time_axis_caption_for_long_calls() {
-        // Calls spanning ≥ 1s get a start/end timestamp caption above
-        // the lanes. Sub-second calls skip the axis.
-        let mut msgs = vec![
+    fn seq_diagram_rtp_row_includes_codec_and_packet_counts() {
+        // When the caller passes rtp_a / rtp_b info, the RTP row
+        // surfaces it inline.
+        let msgs = vec![
             mk_msg("INVITE", 0, 0.0),
-            mk_msg("BYE",    0, 5.0),
+            mk_msg("", 200, 0.5),
+            mk_msg("ACK", 0, 0.6),
+            mk_msg("BYE", 0, 5.0),
+            mk_msg("", 200, 5.1),
         ];
-        for m in msgs.iter_mut() {
-            m.direction = "out".into();
-        }
-        let html = render_sngrep_flow(&msgs);
-        assert!(html.contains("sngrep-axis"), "long call should have axis");
-    }
-
-    #[test]
-    fn sngrep_flow_wraps_chips_in_track_for_grid_layout() {
-        // Regression test for the grid+track restructure: each lane
-        // must contain a `.sngrep-track` div that holds the chips, so
-        // the lane's 28 px direction-gutter and 1fr time-axis track
-        // are siblings in the CSS grid. Without the track wrapper,
-        // `left: N%` resolves against the lane's padding box and the
-        // chips drift right by 28 px (and the time-origin chip ends
-        // up hidden under the direction arrow).
-        let mut msgs = vec![
-            mk_msg("INVITE", 0, 0.0),
-            mk_msg("",       200, 1.0),
-        ];
-        msgs[0].direction = "out".into();
-        msgs[1].direction = "in".into();
-        let html = render_sngrep_flow(&msgs);
-        // Each lane has exactly one .sngrep-track.
-        assert_eq!(html.matches("sngrep-track").count(), 2);
-        // The chip is INSIDE the track — `left: 0%` must appear
-        // AFTER `<div class="sngrep-track">`, never before.
-        let out_section = html
-            .split("sngrep-lane-out")
-            .nth(1)
-            .and_then(|s| s.split("sngrep-lane-in").next())
-            .unwrap_or("");
-        let track_open = out_section.find("sngrep-track").unwrap_or(usize::MAX);
-        let first_chip = out_section.find("sngrep-chip").unwrap_or(0);
-        assert!(
-            track_open < first_chip,
-            "chips must be inside the .sngrep-track, not siblings of the lane"
+        let html = render_sngrep_flow(
+            &msgs,
+            Some(6739),
+            Some("G.722".into()),
+            Some(6763),
+            Some("G.722".into()),
         );
+        assert!(html.contains("G.722"), "RTP row should show the codec");
+        assert!(html.contains("6739 pkts"));
+        assert!(html.contains("6763 pkts"));
     }
 
     #[test]
-    fn sngrep_flow_omits_time_axis_for_subsecond_calls() {
-        // Three responses within 200 ms — no axis caption needed.
-        let mut msgs = vec![
-            mk_msg("", 100, 0.00),
-            mk_msg("", 180, 0.05),
-            mk_msg("", 200, 0.20),
-        ];
-        for m in msgs.iter_mut() {
-            m.direction = "in".into();
-        }
-        let html = render_sngrep_flow(&msgs);
-        assert!(!html.contains("sngrep-axis"), "sub-second call should skip axis");
-    }
-
-    /// Build a request SipMessage with both `direction` and `cseq_*` set
-    /// — most tests need a fully-populated chip.
-    fn mk_req(seq: u32, method: &str, seconds_offset: f64, src: &str, dst: &str) -> cdr::SipMessage {
-        let mut m = mk_msg(method, 0, seconds_offset);
-        m.direction = "out".into();
-        m.cseq_num = Some(seq);
-        m.cseq_method = Some(method.into());
-        m.src_ip_str = src.into();
-        m.dst_ip_str = dst.into();
-        m
-    }
-    fn mk_resp(seq: u32, method: &str, code: u16, seconds_offset: f64, src: &str, dst: &str) -> cdr::SipMessage {
-        let mut m = mk_msg(method, code, seconds_offset);
-        m.direction = "in".into();
-        m.cseq_num = Some(seq);
-        m.cseq_method = Some(method.into());
-        m.src_ip_str = src.into();
-        m.dst_ip_str = dst.into();
-        m
+    fn seq_diagram_actor_headers_show_endpoint_ips() {
+        // The header row labels caller / callee by their first-observed
+        // IPs from the SIP message stream.
+        let t0 = chrono::NaiveDate::from_ymd_opt(2026, 9, 29)
+            .unwrap()
+            .and_hms_opt(2, 9, 46)
+            .unwrap();
+        let mut invite = mk_msg("INVITE", 0, 0.0);
+        invite.src_ip_str = "10.101.1.1".into();
+        invite.dst_ip_str = "10.101.1.112".into();
+        let html = render_sngrep_flow(&[invite], None, None, None, None);
+        assert!(html.contains("caller"));
+        assert!(html.contains("callee"));
+        assert!(html.contains("10.101.1.1"));
+        assert!(html.contains("10.101.1.112"));
+        let _ = t0;
     }
 
     #[test]
-    fn sngrep_flow_pair_lines_connect_cseq_matched_request_response() {
-        // INVITE (CSeq=1) → 200 OK (CSeq=1) and BYE (CSeq=2) → 200 (CSeq=2).
-        // The pair lines should be emitted at each chip's X position
-        // on both the outgoing and incoming sides. ACK (CSeq=1) has
-        // no response — no pair line.
-        let msgs = vec![
-            mk_req(1, "INVITE", 0.0, "10.0.0.1", "10.0.0.2"),
-            mk_resp(1, "INVITE", 200, 0.6, "10.0.0.2", "10.0.0.1"),
-            mk_req(1, "ACK",    0.7, "10.0.0.1", "10.0.0.2"),
-            mk_req(2, "BYE",    5.0, "10.0.0.1", "10.0.0.2"),
-            mk_resp(2, "BYE",    200, 5.1, "10.0.0.2", "10.0.0.1"),
-        ];
-        let html = render_sngrep_flow(&msgs);
-        // Two pair lines per transaction: one half on each side of
-        // the lane gap. ACK has no pair line.
-        assert_eq!(html.matches("sngrep-pair-out").count(), 2,
-                   "INVITE and BYE each get one pair line on the outgoing side");
-        assert_eq!(html.matches("sngrep-pair-in").count(), 2,
-                   "the two 200 responses each get one pair line on the incoming side");
-    }
-
-    #[test]
-    fn sngrep_flow_chip_label_includes_relative_time_and_source_ip() {
-        // Below each chip is a small label: "+0.6s · 10.0.0.2".
-        // Source IP comes from the message's `src_ip_str`.
-        let msgs = vec![
-            mk_req(1, "INVITE", 0.0, "10.0.0.1", "10.0.0.2"),
-            mk_resp(1, "INVITE", 200, 0.6, "10.0.0.2", "10.0.0.1"),
-        ];
-        let html = render_sngrep_flow(&msgs);
-        assert!(html.contains("+0.6s"),
-                "relative-time label must appear under the chip");
-        assert!(html.contains("10.0.0.2"),
-                "source IP from the response must appear in the label");
-        // Tooltip carries the full A→B endpoint context.
-        assert!(html.contains("10.0.0.1 → 10.0.0.2"),
-                "tooltip must show src → dst for the INVITE");
-    }
-
-    #[test]
-    fn sngrep_flow_chip_weight_class_reflects_direction() {
-        // Outgoing = sngrep-chip-out (filled); incoming = sngrep-chip-in
-        // (outline-only). The CSS relies on this asymmetry to give the
-        // conversation a visual top-to-bottom flow.
-        let msgs = vec![
-            mk_req(1, "INVITE", 0.0, "10.0.0.1", "10.0.0.2"),
-            mk_resp(1, "INVITE", 200, 0.6, "10.0.0.2", "10.0.0.1"),
-        ];
-        let html = render_sngrep_flow(&msgs);
-        let out_section = html
-            .split("sngrep-lane-out")
-            .nth(1)
-            .and_then(|s| s.split("sngrep-lane-in").next())
-            .unwrap_or("");
-        assert!(out_section.contains("sngrep-chip-out"),
-                "outgoing chip must carry sngrep-chip-out class");
-        assert!(!out_section.contains("sngrep-chip-in"),
-                "outgoing lane must not contain sngrep-chip-in");
-        let in_section = html.split("sngrep-lane-in").nth(1).unwrap_or("");
-        assert!(in_section.contains("sngrep-chip-in"),
-                "incoming chip must carry sngrep-chip-in class");
-        assert!(!in_section.contains("sngrep-chip-out"),
-                "incoming lane must not contain sngrep-chip-out");
+    fn seq_diagram_arrow_direction_matches_message_direction() {
+        // Outgoing messages get the right-arrow class; incoming get
+        // the left-arrow class. The CSS uses this to colour and
+        // style the arrow differently.
+        let mut out = mk_msg("INVITE", 0, 0.0);
+        out.direction = "out".into();
+        let mut inc = mk_msg("", 200, 0.5);
+        inc.direction = "in".into();
+        let html = render_sngrep_flow(&[out, inc], None, None, None, None);
+        assert!(html.contains("seq-arrow-out"));
+        assert!(html.contains("seq-arrow-in"));
     }
 }
