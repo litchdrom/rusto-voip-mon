@@ -1131,6 +1131,46 @@ pub struct SipMessage {
     /// ACK with no body). The template decides whether to inline-show
     /// it or keep it behind a toggle.
     pub content: String,
+    /// CSeq sequence number, parsed from the SIP `CSeq:` header. The
+    /// `(cseq_num, cseq_method)` pair identifies a SIP transaction —
+    /// every response carries the request's CSeq, so we pair each
+    /// outgoing request with its incoming responses by matching this.
+    /// `None` when the header couldn't be parsed (malformed pcap /
+    /// schema bridge row with empty body).
+    pub cseq_num: Option<u32>,
+    /// CSeq method (e.g. "INVITE", "BYE"). Same `CSeq:` header as
+    /// `cseq_num`. Useful as a sanity check on the pairing — a
+    /// response that claims `CSeq: 1 ACK` is a bug upstream.
+    pub cseq_method: Option<String>,
+}
+
+/// Parse the CSeq header from a raw SIP message body. Returns
+/// `(number, method)` or `None` when the header is missing or
+/// malformed. Tolerates both `\r\n` and `\n` line endings (some
+/// pcap exporters strip CRs). Search is case-insensitive on the
+/// header name per RFC 3261 §7.5.
+pub fn parse_cseq(body: &str) -> Option<(u32, String)> {
+    // Walk the headers — they end at the first blank line, which
+    // separates headers from the message body. We don't care about
+    // the body for CSeq.
+    let headers_end = body.find("\n\n").or_else(|| body.find("\r\n\r\n"))?;
+    let headers = &body[..headers_end];
+    for raw_line in headers.split(|c| c == '\n' || c == '\r').filter(|l| !l.is_empty()) {
+        // Header line is "Name: value"; find the first colon.
+        let colon = raw_line.find(':')?;
+        let name = raw_line[..colon].trim();
+        if !name.eq_ignore_ascii_case("CSeq") {
+            continue;
+        }
+        let value = raw_line[colon + 1..].trim();
+        // Value is "<num> <METHOD>" — split on the first whitespace.
+        let mut parts = value.splitn(2, char::is_whitespace);
+        let num_str = parts.next()?.trim();
+        let method = parts.next()?.trim().to_string();
+        let num: u32 = num_str.parse().ok()?;
+        return Some((num, method));
+    }
+    None
 }
 
 /// Fetch all SIP messages for one CDR, oldest first.
@@ -1243,6 +1283,16 @@ pub async fn fetch_sip_messages(
             row.try_get("response_content").unwrap_or_default();
         let response_number: Option<u16> =
             row.try_get("response_number").ok().flatten();
+        // Parse CSeq upfront — the header lives in either request_content
+        // or response_content (one per sip_msg row), and we need to
+        // parse it before the `if/else` below moves either string
+        // into `content` (the compiler can't prove the branches are
+        // mutually exclusive at move-time).
+        let cseq = parse_cseq(&request_content)
+            .or_else(|| parse_cseq(&response_content));
+        let (cseq_num, cseq_method) = cseq
+            .map(|(n, m)| (Some(n), Some(m)))
+            .unwrap_or((None, None));
         // A row is a request if `request_content` is non-empty, a
         // response if `response_content` is non-empty. Both can be
         // populated for paired request/response rows.
@@ -1274,6 +1324,8 @@ pub async fn fetch_sip_messages(
             direction,
             content_type: String::new(), // schema has no per-message CT column
             content,
+            cseq_num,
+            cseq_method,
         });
     }
     Ok(out)

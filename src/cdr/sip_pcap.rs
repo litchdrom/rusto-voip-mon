@@ -138,6 +138,13 @@ pub fn parse_sip_messages_from_pcap(pcap_bytes: &[u8], limit: usize) -> Vec<SipM
         let (response_num, response_text) = parse_sip_response(&body, 0);
         // Direction is decided later by the caller (we don't know
         // the CDR's sipcallerip from inside this module).
+        // CSeq is needed for transaction pairing in the sngrep call-flow
+        // visualisation — INVITE ↔ 200, BYE ↔ 200, etc. Parse it once
+        // here and carry it on the SipMessage so the renderer doesn't
+        // have to re-walk the body.
+        let (cseq_num, cseq_method) = crate::cdr::parse_cseq(&body)
+            .map(|(n, m)| (Some(n), Some(m)))
+            .unwrap_or((None, None));
         out.push(SipMessage {
             id: 0,
             calldate,
@@ -151,6 +158,8 @@ pub fn parse_sip_messages_from_pcap(pcap_bytes: &[u8], limit: usize) -> Vec<SipM
             direction: String::new(), // filled in by caller
             content_type: extract_sip_header(&body, "Content-Type"),
             content: body,
+            cseq_num,
+            cseq_method,
         });
     }
     out
