@@ -626,8 +626,12 @@ pub async fn cdr_detail(
             &sip_messages,
             cdr.rtp_a.received,
             if cdr.rtp_a.codec_name.is_empty() { None } else { Some(cdr.rtp_a.codec_name.clone()) },
+            &cdr.rtp_a.src_ip_str,
+            &cdr.rtp_a.dst_ip_str,
             cdr.rtp_b.received,
             if cdr.rtp_b.codec_name.is_empty() { None } else { Some(cdr.rtp_b.codec_name.clone()) },
+            &cdr.rtp_b.src_ip_str,
+            &cdr.rtp_b.dst_ip_str,
         ),
         sip_html = render_sip_timeline(&sip_messages),
         rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
@@ -667,8 +671,12 @@ fn render_sngrep_flow(
     messages: &[cdr::SipMessage],
     rtp_a_pkts: Option<u32>,
     rtp_a_codec: Option<String>,
+    rtp_a_src: &str,
+    rtp_a_dst: &str,
     rtp_b_pkts: Option<u32>,
     rtp_b_codec: Option<String>,
+    rtp_b_src: &str,
+    rtp_b_dst: &str,
 ) -> String {
     if messages.is_empty() {
         return String::new();
@@ -751,8 +759,12 @@ fn render_sngrep_flow(
             rows.push(rtp_row(
                 rtp_a_pkts,
                 rtp_a_codec.as_deref(),
+                rtp_a_src,
+                rtp_a_dst,
                 rtp_b_pkts,
                 rtp_b_codec.as_deref(),
+                rtp_b_src,
+                rtp_b_dst,
             ));
             media_inserted = true;
         }
@@ -761,8 +773,12 @@ fn render_sngrep_flow(
         rows.push(rtp_row(
             rtp_a_pkts,
             rtp_a_codec.as_deref(),
+            rtp_a_src,
+            rtp_a_dst,
             rtp_b_pkts,
             rtp_b_codec.as_deref(),
+            rtp_b_src,
+            rtp_b_dst,
         ));
     }
 
@@ -791,15 +807,22 @@ fn render_sngrep_flow(
     )
 }
 
-/// Render the RTP-flow row that lives between the last 2xx/ACK and
-/// the first BYE. Shows the negotiated codec and per-direction
-/// packet counts in a single full-width bar — same visual idiom as
+/// Render the RTP-flow rows that live between the last 2xx/ACK and
+/// the first BYE. We emit ONE row per direction (caller→callee and
+/// callee→caller) rather than collapsing both into one — RTP can
+/// take a different network path than SIP (proxy scenarios, NAT
+/// pinholes, media relays), so each leg needs its own row showing
+/// the actual RTP endpoints and packet count. Visual idiom matches
 /// Wireshark's Telephony > SIP Flows media annotation.
 fn rtp_row(
     a_pkts: Option<u32>,
     a_codec: Option<&str>,
+    a_src: &str,
+    a_dst: &str,
     b_pkts: Option<u32>,
     b_codec: Option<&str>,
+    b_src: &str,
+    b_dst: &str,
 ) -> String {
     let a_codec = a_codec.unwrap_or("").trim();
     let b_codec = b_codec.unwrap_or("").trim();
@@ -816,13 +839,29 @@ fn rtp_row(
     let b_count = b_pkts
         .map(|n| format!("{} pkts", n))
         .unwrap_or_else(|| "—".to_string());
-    format!(
-        "<div class=\"seq-msg seq-msg-rtp\">\
-         <span class=\"seq-time\">media</span>\
-         <span class=\"seq-endpoints\">A→B &nbsp; B→A</span>\
-         <span class=\"seq-arrow seq-arrow-rtp\">═════ RTP {codec} (A→B {a_count}, B→A {b_count}) ═════</span>\
-         </div>"
-    )
+
+    // Two rows: outgoing (caller → callee) and incoming (callee → caller).
+    // Each shows its actual RTP endpoints, which can differ from the
+    // SIP endpoints when RTP traverses a relay / NAT.
+    let outgoing = format!(
+        "<div class=\"seq-msg seq-msg-rtp seq-msg-out\">\
+         <span class=\"seq-time\">RTP</span>\
+         <span class=\"seq-endpoints\">{src_a} ► {dst_a}</span>\
+         <span class=\"seq-arrow seq-arrow-out\">────► RTP {codec} ({a_count}) ────</span>\
+         </div>",
+        src_a = html_escape(a_src),
+        dst_a = html_escape(a_dst),
+    );
+    let incoming = format!(
+        "<div class=\"seq-msg seq-msg-rtp seq-msg-in\">\
+         <span class=\"seq-time\">RTP</span>\
+         <span class=\"seq-endpoints\">{src_b} ◄ {dst_b}</span>\
+         <span class=\"seq-arrow seq-arrow-in\">◄──── RTP {codec} ({b_count}) ────</span>\
+         </div>",
+        src_b = html_escape(b_src),
+        dst_b = html_escape(b_dst),
+    );
+    format!("{outgoing}{incoming}")
 }
 
 /// B leg" table with the most useful VoIPmonitor-derived quality
@@ -1535,7 +1574,7 @@ mod sip_render_tests {
 
     #[test]
     fn seq_diagram_omitted_for_empty_messages() {
-        assert_eq!(render_sngrep_flow(&[], None, None, None, None), "");
+        assert_eq!(render_sngrep_flow(&[], None, None, "", "", None, None, "", ""), "");
     }
 
     #[test]
@@ -1551,19 +1590,15 @@ mod sip_render_tests {
         let mut bye = mk_msg("BYE", 0, 5.0); bye.direction = "out".into();
         let mut r200b = mk_msg("", 200, 5.1); r200b.direction = "in".into();
         let msgs = vec![invite, r100, r200a, ack, bye, r200b];
-        let html = render_sngrep_flow(&msgs, None, None, None, None);
-        // Six message rows + one RTP-flow row = 7 seq-msg elements.
-        assert_eq!(html.matches(r#"class="seq-msg "#).count(), 7);
-        // Outgoing rows have seq-msg-out, incoming have seq-msg-in.
-        // Use unique substrings (the space before the closing quote is
-        // not shared with seq-msg-in / seq-msg-rtp).
-        assert_eq!(html.matches(r#" seq-msg-out""#).count(), 3);
-        assert_eq!(html.matches(r#" seq-msg-in""#).count(), 3);
-        // One RTP row (between media setup and teardown).
-        assert_eq!(html.matches(r"seq-msg-rtp").count(), 1);
-        eprintln!("DEBUG HTML:
-{html}
-END");
+        let html = render_sngrep_flow(&msgs, None, None, "", "", None, None, "", "");
+        // Six message rows + two RTP-flow rows (one per direction) = 8 seq-msg elements.
+        assert_eq!(html.matches(r#"class="seq-msg "#).count(), 8);
+        // 3 outgoing SIP + 1 outgoing RTP = 4.
+        assert_eq!(html.matches(r#" seq-msg-out""#).count(), 4);
+        // 3 incoming SIP + 1 incoming RTP = 4.
+        assert_eq!(html.matches(r#" seq-msg-in""#).count(), 4);
+        // Two RTP rows total (one per direction).
+        assert_eq!(html.matches(r"seq-msg-rtp").count(), 2);
     }
 
     #[test]
@@ -1573,7 +1608,7 @@ END");
             mk_msg("INVITE", 0, 0.0),
             mk_msg("BYE", 0, 5.0),
         ];
-        let html = render_sngrep_flow(&msgs, None, None, None, None);
+        let html = render_sngrep_flow(&msgs, None, None, "", "", None, None, "", "");
         assert!(html.contains("+0.0s"));
         assert!(html.contains("+5.0s"));
     }
@@ -1593,8 +1628,12 @@ END");
             &msgs,
             Some(6739),
             Some("G.722".into()),
+            "10.101.1.1",
+            "10.101.1.112",
             Some(6763),
             Some("G.722".into()),
+            "10.101.1.112",
+            "10.101.1.1",
         );
         assert!(html.contains("G.722"), "RTP row should show the codec");
         assert!(html.contains("6739 pkts"));
@@ -1612,7 +1651,7 @@ END");
         let mut invite = mk_msg("INVITE", 0, 0.0);
         invite.src_ip_str = "10.101.1.1".into();
         invite.dst_ip_str = "10.101.1.112".into();
-        let html = render_sngrep_flow(&[invite], None, None, None, None);
+        let html = render_sngrep_flow(&[invite], None, None, "", "", None, None, "", "");
         assert!(html.contains("caller"));
         assert!(html.contains("callee"));
         assert!(html.contains("10.101.1.1"));
@@ -1629,7 +1668,11 @@ END");
         out.direction = "out".into();
         let mut inc = mk_msg("", 200, 0.5);
         inc.direction = "in".into();
-        let html = render_sngrep_flow(&[out, inc], None, None, None, None);
+        let html = render_sngrep_flow(
+            &[out, inc],
+            None, None, "", "",
+            None, None, "", "",
+        );
         assert!(html.contains("seq-arrow-out"));
         assert!(html.contains("seq-arrow-in"));
     }
