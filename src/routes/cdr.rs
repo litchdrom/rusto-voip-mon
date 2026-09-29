@@ -645,30 +645,42 @@ pub async fn cdr_detail(
 /// to 200 OK in 300 ms looks very different from an INVITE that
 /// spends 8 seconds bouncing between 100/180. With `direction`
 /// known (we set it from the CDR's `sipcallerip` against each
-/// message's `ip_src`), the two-row layout naturally shows the
+/// message's `ip_src`), the two-lane layout naturally shows the
 /// caller → callee → caller → caller round-trips.
+///
+/// Each chip is positioned with `style="left: N%"` against a shared
+/// time axis — first message at 0%, last message at 100%, gaps in
+/// between proportional to wall-clock time. This is what classic
+/// sngrep does in the terminal: a horizontal timeline with messages
+/// dropped onto it at their relative time.
 ///
 /// Returns "" when `messages` is empty (the section is then omitted).
 fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
     if messages.is_empty() {
         return String::new();
     }
-    // Bucket by direction. Messages with empty `direction` (the
-    // raw DB-fetched case where we haven't applied the marker yet)
-    // fall through to "out" so they still render — better than
-    // dropping them silently.
-    let (outgoing, incoming): (Vec<&cdr::SipMessage>, Vec<&cdr::SipMessage>) = messages
-        .iter()
-        .partition(|m| m.direction != "in");
+    // Time axis range. We use min/max across all messages so lanes
+    // share a common scale even if one side has only a single chip.
+    // Degenerate case (all messages at the same instant) collapses
+    // to span_ms=1 to avoid divide-by-zero — chips then stack at 0%.
+    let t_min = messages.iter().map(|m| m.calldate).min().unwrap();
+    let t_max = messages.iter().map(|m| m.calldate).max().unwrap();
+    let span_ms = (t_max - t_min).num_milliseconds().max(1);
 
-    let render_row = |row_messages: &[&cdr::SipMessage], arrow: &str| -> String {
-        if row_messages.is_empty() {
+    let render_lane = |lane_messages: &[&cdr::SipMessage],
+                       lane_class: &str,
+                       dir_arrow: &str|
+     -> String {
+        if lane_messages.is_empty() {
             return String::new();
         }
-        let mut html = format!(
-            "<div class=\"sngrep-row\"><span class=\"sngrep-dir\">{arrow}</span>"
-        );
-        for m in row_messages {
+        let mut html =
+            format!("<div class=\"sngrep-lane {lane_class}\"><span class=\"sngrep-dir\">{dir_arrow}</span>");
+        for m in lane_messages {
+            let offset_ms = (m.calldate - t_min).num_milliseconds();
+            // Clamp to [0, 100] — out-of-order timestamps (DB jitter)
+            // and rounding drift must not push chips off the lane.
+            let pct = ((offset_ms as f64 / span_ms as f64) * 100.0).clamp(0.0, 100.0);
             let method_class = sip_method_class(&m.method);
             let code_class = sip_code_class(m.response_num);
             let method_disp = if m.method.is_empty() {
@@ -694,32 +706,47 @@ fn render_sngrep_flow(messages: &[cdr::SipMessage]) -> String {
                 m.calldate.format("%H:%M:%S%.3f")
             );
             html.push_str(&format!(
-                "<span class=\"sngrep-chip {code_class}\" title=\"{tip}\">\
-                 {method_disp}{code_disp}</span> \
-                 <span class=\"sngrep-sep\">→</span>"
+                "<span class=\"sngrep-chip {code_class}\" \
+                 style=\"left: {pct:.2}%\" title=\"{tip}\">\
+                 {method_disp}{code_disp}</span>"
             ));
-        }
-        // Drop the trailing arrow on the last chip — sngrep never
-        // shows a hanging "→" at the end of a row.
-        if let Some(last_arrow_start) = html.rfind("<span class=\"sngrep-sep\">") {
-            html.truncate(last_arrow_start);
         }
         html.push_str("</div>");
         html
     };
 
-    let out_row = render_row(&outgoing, "→");
-    let in_row = render_row(&incoming, "←");
+    let (outgoing, incoming): (Vec<&cdr::SipMessage>, Vec<&cdr::SipMessage>) = messages
+        .iter()
+        .partition(|m| m.direction != "in");
+
+    let out_lane = render_lane(&outgoing, "sngrep-lane-out", "→");
+    let in_lane = render_lane(&incoming, "sngrep-lane-in", "←");
     let total = outgoing.len() + incoming.len();
     let total_msgs = messages.len();
+
+    // Time-axis caption above the lanes. We only emit start/end
+    // timestamps when the call spans ≥ 1s — sub-second calls (rejects,
+    // busy-here responses) clutter the UI for no analytic value.
+    let axis = if span_ms >= 1000 {
+        format!(
+            "<div class=\"sngrep-axis\"><span>{}</span><span>{}</span></div>",
+            t_min.format("%H:%M:%S%.3f"),
+            t_max.format("%H:%M:%S%.3f"),
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         "<h2>Call flow</h2>\
          <p class=\"muted small\">\
-           {total} of {total_msgs} messages bucketed by direction (out / in).\
+           {total} of {total_msgs} messages on a time axis (outgoing / incoming).\
          </p>\
-         {out_row}\
-         {in_row}",
+         <div class=\"sngrep-flow\">\
+           {axis}\
+           {out_lane}\
+           {in_lane}\
+         </div>",
     )
 }
 
@@ -771,6 +798,14 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
     // VoIPmonitor's "jitter" columns (a_avgjitter_mult10, a_maxjitter)
     // are interarrival times, not RFC 3550 smoothed jitter — explain
     // it via the `title` attribute so the label can stay short.
+    // "Max packet gap" is renamed from "Max jitter" because the value
+    // (typically tens or hundreds of ms during a burst-loss event) is
+    // the worst single packet-to-packet gap, NOT sustained jitter —
+    // and showing "Max jitter: 992 ms" next to MOS 4.5 contradicts the
+    // operator's intuition. The cell is rendered with `.muted` class
+    // to make it visually subordinate to the RTCP max jitter row below,
+    // which carries the RFC 3550 smoothed value that actually maps to
+    // Wireshark.
     let jitter_tooltip = "VoIPmonitor's avg/max \"jitter\" is the \
          average / worst packet-to-packet interarrival time, not RFC \
          3550 smoothed jitter. See \"RTCP max jitter\" for the RFC 3550 \
@@ -797,8 +832,17 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
         rtp_b.avg_jitter_ms(),
         jt = jitter_tooltip,
     ));
+    // "Max packet gap" (VoIPmonitor's a_maxjitter) is rendered with
+    // the muted class on the cells — it spikes during packet loss
+    // (because the next packet arrives after the lost one would have)
+    // and is NOT sustained jitter, so a value of 992 ms alongside
+    // MOS 4.5 is normal, not alarming. The tooltip carries the full
+    // explanation; the cell de-emphasis keeps the table from reading
+    // as a quality failure at a glance.
     out.push_str(&format!(
-        "<tr><th title=\"{jt}\">Max interarrival</th><td>{} ms</td><td>{} ms</td></tr>",
+        "<tr><th title=\"{jt}\">Max packet gap</th>\
+         <td class=\"muted\" title=\"{jt}\">{} ms</td>\
+         <td class=\"muted\" title=\"{jt}\">{} ms</td></tr>",
         rtp_a.max_jitter_ms(),
         rtp_b.max_jitter_ms(),
         jt = jitter_tooltip,
@@ -1442,7 +1486,7 @@ mod sip_render_tests {
     }
 
     #[test]
-    fn sngrep_flow_renders_two_rows_with_arrows() {
+    fn sngrep_flow_renders_two_lanes_with_chips() {
         // Happy-path call: outgoing INVITE/ACK/BYE, incoming 100/180/200/200.
         let msgs = vec![
             mk_msg("INVITE", 0,   0.0),
@@ -1453,7 +1497,6 @@ mod sip_render_tests {
             mk_msg("BYE",    0,   5.0),
             mk_msg("",       200, 5.0),
         ];
-        // Tag directions for the test.
         let mut tagged = msgs;
         // out = INVITE/ACK/BYE; in = the four responses
         tagged[0].direction = "out".into(); tagged[1].direction = "in".into();
@@ -1461,30 +1504,22 @@ mod sip_render_tests {
         tagged[4].direction = "out".into(); tagged[5].direction = "out".into();
         tagged[6].direction = "in".into();
         let html = render_sngrep_flow(&tagged);
-        // Two rows.
-        assert_eq!(html.matches("sngrep-row").count(), 2);
-        // Outgoing row: 3 chips (INVITE, ACK, BYE).
-        let out_section = html.split("sngrep-row").nth(1).unwrap_or("");
-        assert_eq!(out_section.matches("sngrep-chip").count(), 3);
-        assert!(out_section.contains("INVITE"));
-        assert!(out_section.contains("ACK"));
-        assert!(out_section.contains("BYE"));
-        // Incoming row: 4 chips (100, 180, 200, 200).
-        let in_section = html.split("sngrep-row").nth(2).unwrap_or("");
+        // Two lanes (out + in) inside the .sngrep-flow container.
+        assert_eq!(html.matches("sngrep-lane-out").count(), 1);
+        assert_eq!(html.matches("sngrep-lane-in").count(), 1);
+        // Outgoing lane: 3 chips (INVITE, ACK, BYE).
+        let out_section = html.split("sngrep-lane-out").nth(1).unwrap_or("");
+        let out_end = out_section.find("sngrep-lane-in").unwrap_or(out_section.len());
+        let out_only = &out_section[..out_end];
+        assert_eq!(out_only.matches("sngrep-chip").count(), 3);
+        assert!(out_only.contains("INVITE"));
+        assert!(out_only.contains("ACK"));
+        assert!(out_only.contains("BYE"));
+        // Incoming lane: 4 chips (100, 180, 200, 200).
+        let in_section = html.split("sngrep-lane-in").nth(1).unwrap_or("");
         assert_eq!(in_section.matches("sngrep-chip").count(), 4);
         // 2xx-coded chips colour-coded green.
         assert!(in_section.contains(r#"class="sngrep-code sip-2xx">200</span>"#));
-        // No hanging "→" at the end of either row.
-        let row_ends_with_arrow = |s: &str| {
-            // Find the last "sngrep-chip" or "sngrep-sep" and check
-            // whether it's followed by another sep (hanging arrow).
-            !s.rfind("sngrep-sep").is_some()
-                || s.split("sngrep-sep").last().map(|x| !x.contains(">")).unwrap_or(true)
-        };
-        // (The above is approximate; the truncation guarantee is the
-        // important part — just sanity-check no junk after the last chip.)
-        assert!(!out_section.ends_with("→<"));
-        assert!(!in_section.ends_with("→<"));
     }
 
     #[test]
@@ -1493,28 +1528,82 @@ mod sip_render_tests {
     }
 
     #[test]
-    fn sngrep_flow_drops_trailing_arrow() {
-        // Single message should NOT have a trailing "→" separator.
+    fn sngrep_flow_no_separators_between_chips() {
+        // The new design drops the `sngrep-sep` "→" between chips
+        // entirely — chips carry their own position via `style="left: …%"`.
+        // Regression test so we don't accidentally re-introduce it.
         let m = vec![{
             let mut x = mk_msg("INVITE", 0, 0.0);
             x.direction = "out".into();
             x
         }];
         let html = render_sngrep_flow(&m);
-        // 1 chip, 0 separators (the trailing arrow is dropped).
         assert_eq!(html.matches("sngrep-chip").count(), 1);
         assert_eq!(html.matches("sngrep-sep").count(), 0);
     }
 
     #[test]
     fn sngrep_flow_partitions_by_direction() {
-        // All outgoing → no incoming row.
+        // All outgoing → no incoming lane content.
         let mut msgs = vec![mk_msg("INVITE", 0, 0.0), mk_msg("ACK", 0, 1.0)];
         msgs[0].direction = "out".into();
         msgs[1].direction = "out".into();
         let html = render_sngrep_flow(&msgs);
-        // Two rows are emitted (out + empty in) — the empty in row
-        // contributes nothing visible. The chip count is 2 (both out).
+        // Out lane has 2 chips; in lane is rendered with no chips.
         assert_eq!(html.matches("sngrep-chip").count(), 2);
+        let in_section = html.split("sngrep-lane-in").nth(1).unwrap_or("");
+        assert_eq!(in_section.matches("sngrep-chip").count(), 0);
+    }
+
+    #[test]
+    fn sngrep_flow_positions_chips_by_relative_time() {
+        // Three outgoing messages at 0.0, 1.0, 5.0 seconds. The first
+        // chip must land at left:0%, the last at left:100%, the
+        // middle one at left:20% (1s out of 5s span).
+        let mut msgs = vec![
+            mk_msg("INVITE", 0, 0.0),
+            mk_msg("ACK",    0, 1.0),
+            mk_msg("BYE",    0, 5.0),
+        ];
+        for m in msgs.iter_mut() {
+            m.direction = "out".into();
+        }
+        let html = render_sngrep_flow(&msgs);
+        // First message at left:0.00%.
+        assert!(html.contains(r#"style="left: 0.00%""#));
+        // Middle at 20% (1s of 5s span).
+        assert!(html.contains(r#"style="left: 20.00%""#));
+        // Last at 100%.
+        assert!(html.contains(r#"style="left: 100.00%""#));
+    }
+
+    #[test]
+    fn sngrep_flow_shows_time_axis_caption_for_long_calls() {
+        // Calls spanning ≥ 1s get a start/end timestamp caption above
+        // the lanes. Sub-second calls skip the axis.
+        let mut msgs = vec![
+            mk_msg("INVITE", 0, 0.0),
+            mk_msg("BYE",    0, 5.0),
+        ];
+        for m in msgs.iter_mut() {
+            m.direction = "out".into();
+        }
+        let html = render_sngrep_flow(&msgs);
+        assert!(html.contains("sngrep-axis"), "long call should have axis");
+    }
+
+    #[test]
+    fn sngrep_flow_omits_time_axis_for_subsecond_calls() {
+        // Three responses within 200 ms — no axis caption needed.
+        let mut msgs = vec![
+            mk_msg("", 100, 0.00),
+            mk_msg("", 180, 0.05),
+            mk_msg("", 200, 0.20),
+        ];
+        for m in msgs.iter_mut() {
+            m.direction = "in".into();
+        }
+        let html = render_sngrep_flow(&msgs);
+        assert!(!html.contains("sngrep-axis"), "sub-second call should skip axis");
     }
 }

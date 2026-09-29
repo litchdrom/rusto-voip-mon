@@ -587,34 +587,68 @@ table.sip-timeline .sip-row:hover {
 }
 
 /* sngrep-style call flow (above the SIP timeline).
-   Two horizontal rows (outgoing from us, incoming to us) with
-   message chips separated by → arrows. Each chip carries the
-   method (with a method-specific colour class) and the response
-   code (coloured by its sip-Nxx class). Same colour scale as the
-   SIP timeline below so the two panels visually agree. */
-.sngrep-row {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding: 8px 10px;
-  margin-bottom: 4px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
+   Two horizontal lanes (outgoing from us, incoming to us) sharing
+   a time axis. Each chip is positioned at `left: N%` so a quick
+   glance shows where in the call the message fell. The dashed
+   centre line is the time axis itself — same visual idiom as
+   sngrep's terminal UI. Chip colours match the SIP timeline below
+   so the two panels visually agree. */
+.sngrep-flow {
+  margin: 8px 0 12px;
 }
-.sngrep-row:nth-of-type(2) {
-  /* Incoming row gets a left accent stripe so the two rows are
-     visually distinguishable at a glance. */
+.sngrep-axis {
+  display: flex;
+  justify-content: space-between;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+  font-size: 11px;
+  color: var(--fg-muted);
+  padding: 0 32px 4px;
+  margin-bottom: 2px;
+}
+.sngrep-lane {
+  position: relative;
+  height: 38px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  margin-bottom: 6px;
+  border-radius: 4px;
+  /* Reserve room on the left for the direction arrow so chips
+     starting at left:0% don't overlap it. */
+  padding-left: 28px;
+}
+/* Horizontal dashed time-line through the lane centre. */
+.sngrep-lane::after {
+  content: "";
+  position: absolute;
+  left: 28px;
+  right: 8px;
+  top: 50%;
+  border-top: 1px dashed var(--border);
+  pointer-events: none;
+  z-index: 0;
+}
+.sngrep-lane-out {
   border-left: 3px solid var(--accent);
 }
+.sngrep-lane-in {
+  border-left: 3px solid #fbbf24;
+}
 .sngrep-dir {
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  transform: translateY(-50%);
   font-weight: 600;
   color: var(--fg-muted);
-  margin-right: 4px;
   font-size: 14px;
+  z-index: 1;
 }
 .sngrep-chip {
+  position: absolute;
+  top: 50%;
+  /* Centre the chip horizontally on its time position — `left: N%`
+     would otherwise anchor the chip's *left edge* to N%. */
+  transform: translate(-50%, -50%);
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -624,6 +658,8 @@ table.sip-timeline .sip-row:hover {
   border-radius: 3px;
   font-size: 12px;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+  white-space: nowrap;
+  z-index: 1;
 }
 .sngrep-method {
   font-weight: 600;
@@ -647,8 +683,3 @@ table.sip-timeline .sip-row:hover {
 .sngrep-code.sip-4xx { color: #fb923c; }
 .sngrep-code.sip-5xx,
 .sngrep-code.sip-6xx { color: #f87171; }
-.sngrep-sep {
-  color: var(--fg-muted);
-  margin: 0 2px;
-  font-size: 14px;
-}
