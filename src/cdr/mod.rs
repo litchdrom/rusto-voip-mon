@@ -1333,16 +1333,23 @@ pub async fn fetch_sip_messages(
 
 /// Parse the first whitespace-separated token of a SIP request line.
 /// `"INVITE sip:user@example.com SIP/2.0\r\n..."` → `"INVITE"`.
-/// Returns `""` for an empty body.
+/// Returns `""` for empty bodies and for response status lines
+/// (`"SIP/2.0 200 OK\r\n..."`) — a response carries a status code,
+/// not a method, and rendering "SIP/2.0 200" as the method column
+/// is misleading.
 fn parse_sip_method(request_content: &str) -> String {
     if request_content.is_empty() {
         return String::new();
     }
-    request_content
+    let first = request_content
         .split_whitespace()
         .next()
-        .unwrap_or("")
-        .to_string()
+        .unwrap_or("");
+    // Response status line — no method on a response.
+    if first.eq_ignore_ascii_case("SIP/2.0") {
+        return String::new();
+    }
+    first.to_string()
 }
 
 /// Parse a SIP response status line into `(code, reason)`:
