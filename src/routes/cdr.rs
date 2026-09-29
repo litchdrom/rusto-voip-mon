@@ -1090,7 +1090,7 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     for m in messages {
         let ts = m.calldate.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         let method_class = sip_method_class(&m.method);
-        let dir_arrow = if m.direction == "out" { "→" } else { "в†ђ" };
+        let dir_arrow = if m.direction == "out" { "→" } else { "←" };
         let dir_class = if m.direction == "out" { "dir-out" } else { "dir-in" };
         let code_class = sip_code_class(m.response_num);
         let resp_display = if m.response_num == 0 {
