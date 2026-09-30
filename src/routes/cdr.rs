@@ -779,10 +779,13 @@ fn render_sngrep_flow(
             m.calldate.format("%H:%M:%S%.3f"),
         );
 
-        // Per-actor cells: an arrow at the source side and the
-        // method/code text at the destination side. Cells in
-        // between are empty (they exist for visual symmetry and
-        // vertical column separators).
+        // Per-actor cells: just the arrow at the source side, and
+        // the arrow + method/code text at the destination side.
+        // Cells in between are empty (they exist for visual symmetry
+        // and vertical column separators). Splitting arrow from
+        // text avoids the previous "duplicate message" rendering
+        // where the same `INVITE` appeared in both the caller and
+        // callee columns.
         let src_idx = actor_idx(&m.src_ip_str);
         let dst_idx = actor_idx(&m.dst_ip_str);
         let mut cells: Vec<String> = Vec::with_capacity(actors.len() + 2);
@@ -790,23 +793,28 @@ fn render_sngrep_flow(
         let arrow_char = if is_out { "──►" } else { "◄──" };
         let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
         let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
+        let arrow_html = format!(
+            "<span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span>"
+        );
         // The method/code text always goes in the dst actor's cell
-        // so the arrow points to it from the src actor's cell.
-        let msg_payload = format!(
-            "<span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span> \
-             <span class=\"seq-msg-body {msg_class}\">{method_disp}{code_disp}</span>"
+        // so the arrow at the src cell points TO it.
+        let text_html = format!(
+            "<span class=\"seq-msg-body {msg_class}\">{method_disp}{code_disp}</span>"
         );
         for (i, _) in actors.iter().enumerate() {
             let cell = if Some(i) == src_idx && Some(i) == dst_idx {
                 // Self-loop (rare): method/code only, no arrow.
-                format!("<td class=\"seq-actor-cell\">{msg_payload}</td>")
+                format!("<td class=\"seq-actor-cell\">{text_html}</td>")
             } else if Some(i) == src_idx {
-                // Outgoing source cell: arrow points right.
-                format!("<td class=\"seq-actor-cell\">{msg_payload}</td>")
+                // Source cell: arrow only, pointing toward dst.
+                format!("<td class=\"seq-actor-cell\">{arrow_html}</td>")
             } else if Some(i) == dst_idx {
-                // Destination cell: arrow points in (left for in,
-                // right for out).
-                format!("<td class=\"seq-actor-cell\">{msg_payload}</td>")
+                // Destination cell: arrow + method/code text.
+                // The arrow continues to point in flow direction
+                // (matches the Wireshark / sngrep "two arrows per
+                // row" idiom where each lifeline has a directional
+                // arrow showing flow direction).
+                format!("<td class=\"seq-actor-cell\">{arrow_html} {text_html}</td>")
             } else {
                 format!("<td class=\"seq-actor-cell\"></td>")
             };
@@ -831,6 +839,7 @@ fn render_sngrep_flow(
         // Insert RTP rows right before the first BYE/CANCEL after media.
         if media_started && !media_inserted && (m.method == "BYE" || m.method == "CANCEL") {
             rows.push(rtp_row_html(
+                &rel_time,
                 rtp_a_pkts,
                 rtp_a_codec.as_deref(),
                 rtp_a_src,
@@ -846,7 +855,18 @@ fn render_sngrep_flow(
         }
     }
     if media_started && !media_inserted {
+        // No teardown message (call was abandoned); label RTP rows
+        // with the time of the last media-bearing message so they
+        // still have a time stamp in the time column.
+        let fallback_time = messages
+            .last()
+            .map(|m| {
+                let offset_ms = (m.calldate - t_min).num_milliseconds();
+                format!("+{:.1}s", offset_ms as f64 / 1000.0)
+            })
+            .unwrap_or_else(|| "+0.0s".to_string());
         rows.push(rtp_row_html(
+            &fallback_time,
             rtp_a_pkts,
             rtp_a_codec.as_deref(),
             rtp_a_src,
@@ -887,9 +907,15 @@ fn render_sngrep_flow(
 
 /// Render the RTP-flow rows that live between the last 2xx/ACK and
 /// the first BYE. One row per direction with the actual RTP
-/// endpoints. The actor-index closure places the arrow + payload
-/// in the cell corresponding to the RTP source actor.
+/// endpoints. The actor-index closure places the arrow in the
+/// cell corresponding to the RTP source actor; the codec + count
+/// + src→dst info lands in the destination actor's cell — same
+/// shape as a SIP message row, with "RTP" + codec + packet count
+/// standing in for method/response code. The time cell shows the
+/// time offset passed in (the BYE/CANCEL message's time, since
+/// that's where the RTP row is inserted).
 fn rtp_row_html(
+    time_label: &str,
     a_pkts: Option<u32>,
     a_codec: Option<&str>,
     a_src: &str,
@@ -917,16 +943,16 @@ fn rtp_row_html(
         .map(|n| format!("{} pkts", n))
         .unwrap_or_else(|| "—".to_string());
 
-    // Build the actor cells for the outgoing RTP leg: arrow at
-    // a_src's actor cell, payload at a_dst's, empty elsewhere.
-    // RTP payload collapses src + dst + codec + count onto a single
-    // line in the destination cell; the source cell gets just the
-    // arrow + "RTP" label.
+    // Build the actor cells for one RTP leg: arrow at the source
+    // actor's cell, codec + count + src→dst info at the destination
+    // actor's cell, empty elsewhere. Same shape as a SIP message
+    // row, so the eye reads RTP and SIP rows the same way.
     fn build_rtp_cells(
         src_ip: &str,
         dst_ip: &str,
         codec: &str,
         count: &str,
+        time_label: &str,
         n_actors: usize,
         actor_idx: &dyn Fn(&str) -> Option<usize>,
         is_out: bool,
@@ -934,20 +960,30 @@ fn rtp_row_html(
         let arrow_char = if is_out { "═══►" } else { "◄═══" };
         let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
         let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
-        let mut cells = String::from("<td class=\"seq-time\">RTP</td>");
+        let src_idx = actor_idx(src_ip);
+        let dst_idx = actor_idx(dst_ip);
+        let mut cells = format!("<td class=\"seq-time\">{time_label}</td>");
+        let arrow_html = format!(
+            "<span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span>"
+        );
+        let text_html = format!(
+            "<span class=\"seq-msg-body {msg_class}\">RTP {codec} ({count})</span>\
+             <br><small class=\"muted\">{src_ip} → {dst_ip}</small>",
+            src_ip = html_escape(src_ip),
+            dst_ip = html_escape(dst_ip),
+        );
         for i in 0..n_actors {
-            let cell = if actor_idx(src_ip) == Some(i) {
-                format!(
-                    "<td class=\"seq-actor-cell\">\
-                     <span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span> \
-                     <span class=\"seq-msg-body {msg_class}\">RTP {codec} ({count})</span>\
-                     <br><small class=\"muted\">{src_ip} → {dst_ip}</small>\
-                     </td>",
-                    src_ip = html_escape(src_ip),
-                    dst_ip = html_escape(dst_ip),
-                )
+            let cell = if Some(i) == src_idx && Some(i) == dst_idx {
+                // Self-loop (rare): text only, no arrow.
+                format!("<td class=\"seq-actor-cell\">{text_html}</td>")
+            } else if Some(i) == src_idx {
+                // Source cell: arrow only, pointing toward dst.
+                format!("<td class=\"seq-actor-cell\">{arrow_html}</td>")
+            } else if Some(i) == dst_idx {
+                // Destination cell: arrow + codec/count/src→dst.
+                format!("<td class=\"seq-actor-cell\">{arrow_html} {text_html}</td>")
             } else {
-                "<td class=\"seq-actor-cell\"></td>".to_string()
+                format!("<td class=\"seq-actor-cell\"></td>")
             };
             cells.push_str(&cell);
         }
@@ -956,11 +992,11 @@ fn rtp_row_html(
 
     let outgoing = format!(
         "<tr class=\"seq-row seq-row-out seq-row-rtp\">{}</tr>",
-        build_rtp_cells(a_src, a_dst, &codec, &a_count, n_actors, actor_idx, true)
+        build_rtp_cells(a_src, a_dst, &codec, &a_count, time_label, n_actors, actor_idx, true)
     );
     let incoming = format!(
         "<tr class=\"seq-row seq-row-in seq-row-rtp\">{}</tr>",
-        build_rtp_cells(b_src, b_dst, &codec, &b_count, n_actors, actor_idx, false)
+        build_rtp_cells(b_src, b_dst, &codec, &b_count, time_label, n_actors, actor_idx, false)
     );
     format!("{outgoing}{incoming}")
 }
@@ -1791,5 +1827,31 @@ mod sip_render_tests {
         );
         assert!(html.contains("seq-arrow-out"));
         assert!(html.contains("seq-arrow-in"));
+    }
+
+    #[test]
+    fn seq_diagram_method_text_appears_only_once_per_row() {
+        // Regression test: an earlier version put the full
+        // msg_payload (arrow + method/code) in BOTH the source and
+        // destination actor cells, so `INVITE` showed up twice per
+        // row. The fix splits msg_payload into arrow + text and
+        // puts the text only in the destination cell.
+        let mut out = mk_msg("INVITE", 0, 0.0);
+        out.direction = "out".into();
+        out.src_ip_str = "10.0.0.1".into();
+        out.dst_ip_str = "10.0.0.2".into();
+        let html = render_sngrep_flow(
+            &[out],
+            None, None, "", "",
+            None, None, "", "",
+        );
+        // Exactly one msg-body span per row (only the destination
+        // cell carries the method/code text). Pre-fix this would
+        // have been 2 (one per cell).
+        assert_eq!(
+            html.matches("seq-msg-body").count(),
+            1,
+            "method/code text should appear in exactly one actor cell, not both"
+        );
     }
 }
