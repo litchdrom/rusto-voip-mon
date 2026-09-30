@@ -825,14 +825,19 @@ fn render_sngrep_flow(
             };
             cells.push(cell);
         }
-        rows.push(format!(
+        let sip_row_html = format!(
             "<tr class=\"seq-row seq-row-{}\" title=\"{}\">{}</tr>",
             if is_out { "out" } else { "in" },
             title,
             cells.join(""),
-        ));
+        );
 
-        // Mark media_started at first 2xx or ACK.
+        // Track when media becomes active (first 2xx / ACK). The RTP
+        // rows are inserted at this point — between the last 2xx/ACK
+        // and the first BYE/CANCEL — to show the media stream while
+        // it's actually flowing, not after the call has been torn
+        // down. The time stamp for the RTP row is the BYE/CANCEL
+        // message's time offset (the moment media stops).
         if !media_started {
             let ack_or_2xx =
                 (!m.method.is_empty() && m.method == "ACK") ||
@@ -841,15 +846,14 @@ fn render_sngrep_flow(
                 media_started = true;
             }
         }
-        // Insert RTP rows right before the first BYE/CANCEL after media.
-        // Use the literal label "RTP" for the time column instead of
-        // the surrounding BYE/CANCEL's time offset — the media
-        // stream isn't a single instant, and labelling the row "RTP"
-        // makes it visually distinct from per-message SIP rows that
-        // carry their own time stamps.
+        // Insert RTP rows right before the first BYE/CANCEL after
+        // media. Push them BEFORE the current SIP row so they
+        // visually appear above the BYE in the timeline (matching
+        // the sngrep / Wireshark layout where the media stream is
+        // shown between setup and teardown, not after teardown).
         if media_started && !media_inserted && (m.method == "BYE" || m.method == "CANCEL") {
             rows.push(rtp_row_html(
-                "RTP",
+                &rel_time,
                 rtp_a_pkts,
                 rtp_a_codec.as_deref(),
                 rtp_a_src,
@@ -863,13 +867,19 @@ fn render_sngrep_flow(
             ));
             media_inserted = true;
         }
+        rows.push(sip_row_html);
     }
     if media_started && !media_inserted {
-        // No teardown message (call was abandoned); use the literal
-        // "RTP" label anyway — same visual idiom as the
-        // teardown-present case above.
+        // No teardown message (call was abandoned without BYE);
+        // append the RTP rows after the last media-bearing message
+        // and stamp them with that message's time offset.
+        let last_offset_ms = messages
+            .last()
+            .map(|m| (m.calldate - t_min).num_milliseconds())
+            .unwrap_or(0);
+        let last_time = format!("+{:.1}s", last_offset_ms as f64 / 1000.0);
         rows.push(rtp_row_html(
-            "RTP",
+            &last_time,
             rtp_a_pkts,
             rtp_a_codec.as_deref(),
             rtp_a_src,
@@ -932,10 +942,21 @@ fn rtp_row_html(
 ) -> String {
     let a_codec = a_codec.unwrap_or("").trim();
     let b_codec = b_codec.unwrap_or("").trim();
+    // The codec field carries the descriptive form from
+    // codec_name_from_pt() — e.g. "PCMA (G.711 A-law)". For the
+    // compact flow-row display we want just the short token
+    // ("PCMA") that fits on one line alongside the packet count.
+    fn short_codec(s: &str) -> &str {
+        // Take everything before the first " (" or "(".
+        match s.find(" (") {
+            Some(i) => &s[..i],
+            None => s,
+        }
+    }
     let codec = if !a_codec.is_empty() {
-        a_codec.to_string()
+        short_codec(a_codec).to_string()
     } else if !b_codec.is_empty() {
-        b_codec.to_string()
+        short_codec(b_codec).to_string()
     } else {
         "RTP".to_string()
     };
@@ -949,7 +970,10 @@ fn rtp_row_html(
     // Build the actor cells for one RTP leg: arrow at the source
     // actor's cell, codec + count + src→dst info at the destination
     // actor's cell, empty elsewhere. Same shape as a SIP message
-    // row, so the eye reads RTP and SIP rows the same way.
+    // row, so the eye reads RTP and SIP rows the same way. The
+    // rendered payload uses the compact form "PCMA 3043 pkts" (no
+    // "RTP" prefix, no parenthetical description) — matches the
+    // sngrep / Wireshark RTP-flow row idiom.
     fn build_rtp_cells(
         src_ip: &str,
         dst_ip: &str,
@@ -970,7 +994,7 @@ fn rtp_row_html(
             "<span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span>"
         );
         let text_html = format!(
-            "<span class=\"seq-msg-body {msg_class}\">RTP {codec} ({count})</span>\
+            "<span class=\"seq-msg-body {msg_class}\">{codec} {count}</span>\
              <br><small class=\"muted\">{src_ip} → {dst_ip}</small>",
             src_ip = html_escape(src_ip),
             dst_ip = html_escape(dst_ip),
@@ -1855,6 +1879,61 @@ mod sip_render_tests {
             html.matches("seq-msg-body").count(),
             1,
             "method/code text should appear in exactly one actor cell, not both"
+        );
+    }
+
+    #[test]
+    fn seq_diagram_rtp_rows_appear_before_bye_not_after() {
+        // Regression: the media flow should be shown between
+        // setup and teardown, not stacked under the BYE/200 OK to
+        // BYE exchange. The renderer has to push the RTP rows
+        // BEFORE the BYE row to keep the timeline ordering.
+        let mut invite = mk_msg("INVITE", 0, 0.0);
+        invite.src_ip_str = "10.0.0.1".into();
+        invite.dst_ip_str = "10.0.0.2".into();
+        let mut ok = mk_msg("", 200, 0.5);
+        ok.src_ip_str = "10.0.0.2".into();
+        ok.dst_ip_str = "10.0.0.1".into();
+        let mut ack = mk_msg("ACK", 0, 0.6);
+        ack.src_ip_str = "10.0.0.1".into();
+        ack.dst_ip_str = "10.0.0.2".into();
+        let mut bye = mk_msg("BYE", 0, 5.0);
+        bye.src_ip_str = "10.0.0.1".into();
+        bye.dst_ip_str = "10.0.0.2".into();
+        let mut bye_ok = mk_msg("", 200, 5.1);
+        bye_ok.src_ip_str = "10.0.0.2".into();
+        bye_ok.dst_ip_str = "10.0.0.1".into();
+        let html = render_sngrep_flow(
+            &[invite, ok, ack, bye, bye_ok],
+            Some(6739),
+            Some("PCMA (G.711 A-law)".into()),
+            "10.0.0.1",
+            "10.0.0.2",
+            Some(6763),
+            Some("PCMA (G.711 A-law)".into()),
+            "10.0.0.2",
+            "10.0.0.1",
+        );
+        // The compact codec form (no parenthetical) is what lands
+        // in the rendered HTML — make sure both the long form's
+        // tail ("G.711 A-law)") is stripped AND the row layout
+        // puts RTP before BYE.
+        assert!(
+            html.contains("PCMA 6739 pkts"),
+            "RTP row should use compact 'PCMA 6739 pkts' form"
+        );
+        assert!(
+            !html.contains("PCMA (G.711 A-law)"),
+            "RTP row should NOT include the parenthetical codec description"
+        );
+        let rtp_pos = html.find("seq-row-rtp").expect("RTP row missing");
+        let bye_pos = html
+            .find(">BYE<")
+            .or_else(|| html.find("&gt;BYE&lt;"))
+            .expect("BYE row missing");
+        assert!(
+            rtp_pos < bye_pos,
+            "RTP row must appear BEFORE the BYE row in the timeline"
         );
     }
 }
