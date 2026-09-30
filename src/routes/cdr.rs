@@ -715,8 +715,12 @@ fn render_sngrep_flow(
     // Time axis: relative to the first message's timestamp.
     let t_min = messages.iter().map(|m| m.calldate).min().unwrap();
 
-    // Build the column header row with one <th> per actor.
-    let actor_headers: Vec<String> = actors
+    // Build the actor box HTML used at the top AND bottom of the
+    // diagram. Each box shows the actor's letter label (A/B/C…)
+    // plus its IP below — matches the classic UML sequence-diagram
+    // idiom from sip-diagrams.netlify.app where the actor has a
+    // small box at both ends of its lifeline.
+    let actor_boxes: Vec<String> = actors
         .iter()
         .enumerate()
         .map(|(i, ip)| {
@@ -727,12 +731,47 @@ fn render_sngrep_flow(
             } else {
                 "media"
             };
+            // Letter label: A, B, C, … (skip I/O for legibility).
+            let letter = ((b'A' + i as u8) as char).to_string();
             format!(
-                "<th class=\"seq-actor\" data-role=\"{role}\">{role}<br><small>{ip}</small></th>",
+                "<div class=\"seq-actor-box\" data-role=\"{role}\">\
+                   <div class=\"seq-actor-letter\">{letter}</div>\
+                   <div class=\"seq-actor-ip\">{ip}</div>\
+                 </div>",
                 ip = html_escape(ip)
             )
         })
         .collect();
+
+    // Build the top + bottom actor rows. Each row has one
+    // `<td class="seq-actor-cell">` per actor, with the actor box
+    // sitting on top of the lifeline. The cell's CSS draws the
+    // lifeline as a centered vertical line via `::before`, which
+    // is masked behind the actor box (box has opaque background).
+    let actor_top_row = format!(
+        "<tr class=\"seq-actor-row seq-actor-top\">\
+           <td class=\"seq-time-cell\"></td>{}\
+         </tr>",
+        (0..actors.len())
+            .map(|i| format!(
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\">{}</td>",
+                actor_boxes[i]
+            ))
+            .collect::<Vec<_>>()
+            .join("")
+    );
+    let actor_bottom_row = format!(
+        "<tr class=\"seq-actor-row seq-actor-bottom\">\
+           <td class=\"seq-time-cell\"></td>{}\
+         </tr>",
+        (0..actors.len())
+            .map(|i| format!(
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\">{}</td>",
+                actor_boxes[i]
+            ))
+            .collect::<Vec<_>>()
+            .join("")
+    );
 
     // Walk messages, emitting one <tr> per row. Each row's cells are
     //   time | actor[0] arrow | actor[1] arrow | ... | actor[N-1] arrow
@@ -779,55 +818,84 @@ fn render_sngrep_flow(
             m.calldate.format("%H:%M:%S%.3f"),
         );
 
-        // Per-actor cells: just the arrow at the source side, and
-        // the arrow + method/code text at the destination side.
-        // Cells in between are empty (they exist for visual symmetry
-        // and vertical column separators). Splitting arrow from
-        // text avoids the previous "duplicate message" rendering
-        // where the same `INVITE` appeared in both the caller and
-        // callee columns.
+        // Build the message row in the new UML sequence-diagram
+        // format: time | actor cell (lifeline only) | ... | actor
+        // cell (lifeline only). The arrow + method/code label live
+        // in a single cell that spans the entire message lane,
+        // with the arrow drawn via CSS so it spans from the source
+        // lifeline to the destination lifeline.
         let src_idx = actor_idx(&m.src_ip_str);
         let dst_idx = actor_idx(&m.dst_ip_str);
-        let mut cells: Vec<String> = Vec::with_capacity(actors.len() + 2);
-        cells.push(format!("<td class=\"seq-time\">{}</td>", rel_time));
-        // Single-char arrows for SIP messages. With arrows at both
-        // lifelines and the method/code in the destination cell, the
-        // visual gap between the two arrow tips reads as a single
-        // "expanded" arrow spanning the row — same idiom as sngrep /
-        // Wireshark's Telephony > SIP Flows view.
-        let arrow_char = if is_out { "►" } else { "◄" };
-        let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
-        let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
-        let arrow_html = format!(
-            "<span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span>"
-        );
-        // The method/code text always goes in the dst actor's cell
-        // so the arrow at the src cell points TO it.
-        let text_html = format!(
-            "<span class=\"seq-msg-body {msg_class}\">{method_disp}{code_disp}</span>"
-        );
-        for (i, _) in actors.iter().enumerate() {
-            let cell = if Some(i) == src_idx && Some(i) == dst_idx {
-                // Self-loop (rare): method/code only, no arrow.
-                format!("<td class=\"seq-actor-cell\">{text_html}</td>")
-            } else if Some(i) == src_idx {
-                // Source cell: arrow only, pointing toward dst.
-                format!("<td class=\"seq-actor-cell\">{arrow_html}</td>")
-            } else if Some(i) == dst_idx {
-                // Destination cell: arrow + method/code text.
-                // The arrow continues to point in flow direction
-                // (matches the Wireshark / sngrep "two arrows per
-                // row" idiom where each lifeline has a directional
-                // arrow showing flow direction).
-                format!("<td class=\"seq-actor-cell\">{arrow_html} {text_html}</td>")
+        // Self-loop (src == dst) renders as a self-pointing arrow
+        // on its own lifeline — same as a normal message except
+        // the arrow is shorter and doesn't cross any other
+        // lifeline.
+        let is_self_loop = Some(src_idx) == Some(dst_idx) && src_idx.is_some();
+        let arrow_dir = if is_self_loop {
+            "self"
+        } else if is_out {
+            "out"
+        } else {
+            "in"
+        };
+        let label = if m.method.is_empty() {
+            // Response code only: "100", "200 OK", "487 Request
+            // Terminated", etc.
+            if m.response_num > 0 {
+                format!(
+                    "<span class=\"seq-code {code_class}\">{}</span> {}",
+                    m.response_num,
+                    html_escape(&m.response_text)
+                )
             } else {
-                format!("<td class=\"seq-actor-cell\"></td>")
-            };
-            cells.push(cell);
+                String::new()
+            }
+        } else if m.response_num > 0 {
+            // Method + response code: "INVITE / 200 OK".
+            format!(
+                "<span class=\"seq-method {method_class}\">{}</span>\
+                 <span class=\"seq-method-sep\"> / </span>\
+                 <span class=\"seq-code {code_class}\">{}</span> {}",
+                html_escape(&m.method),
+                m.response_num,
+                html_escape(&m.response_text)
+            )
+        } else {
+            // Method only (request).
+            format!(
+                "<span class=\"seq-method {method_class}\">{}</span>",
+                html_escape(&m.method)
+            )
+        };
+        let n = actors.len();
+        let mut cells: Vec<String> = Vec::with_capacity(n + 2);
+        cells.push(format!(
+            "<td class=\"seq-time-cell\">{}</td>",
+            rel_time
+        ));
+        for i in 0..n {
+            cells.push(format!(
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\"></td>"
+            ));
         }
+        let msg_span_attr = format!("colspan=\"{n}\"");
+        let arrow_class = match arrow_dir {
+            "out" => "seq-arrow-out",
+            "in" => "seq-arrow-in",
+            _ => "seq-arrow-self",
+        };
+        let msg_cell = format!(
+            "<td class=\"seq-msg-cell\" {span} data-msg-dir=\"{arrow_dir}\">\
+               <div class=\"seq-msg-label\">{label}</div>\
+               <div class=\"seq-arrow {arrow_cls}\"></div>\
+             </td>",
+            span = msg_span_attr,
+            arrow_cls = arrow_class,
+        );
+        cells.push(msg_cell);
         let sip_row_html = format!(
             "<tr class=\"seq-row seq-row-{}\" title=\"{}\">{}</tr>",
-            if is_out { "out" } else { "in" },
+            arrow_dir,
             title,
             cells.join(""),
         );
@@ -863,7 +931,6 @@ fn render_sngrep_flow(
                 rtp_b_src,
                 rtp_b_dst,
                 actors.len(),
-                &actor_idx,
             ));
             media_inserted = true;
         }
@@ -889,7 +956,6 @@ fn render_sngrep_flow(
             rtp_b_src,
             rtp_b_dst,
             actors.len(),
-            &actor_idx,
         ));
     }
 
@@ -905,14 +971,13 @@ fn render_sngrep_flow(
          </p>\
          <div class=\"seq-diagram\">\
            <table class=\"seq-table\">\
-             <thead><tr>\
-               <th class=\"seq-time\">time</th>\
-               {actor_headers}\
-             </tr></thead>\
-             <tbody>{rows}</tbody>\
+             <tbody>\
+               {actor_top_row}\
+               {rows}\
+               {actor_bottom_row}\
+             </tbody>\
            </table>\
          </div>",
-        actor_headers = actor_headers.join(""),
         s = if n_actors == 1 { "" } else { "s" },
         rows = rows.join("\n"),
     )
@@ -920,13 +985,12 @@ fn render_sngrep_flow(
 
 /// Render the RTP-flow rows that live between the last 2xx/ACK and
 /// the first BYE. One row per direction with the actual RTP
-/// endpoints. The actor-index closure places the arrow in the
-/// cell corresponding to the RTP source actor; the codec + count
-/// + src→dst info lands in the destination actor's cell — same
-/// shape as a SIP message row, with "RTP" + codec + packet count
-/// standing in for method/response code. The time cell shows the
-/// time offset passed in (the BYE/CANCEL message's time, since
-/// that's where the RTP row is inserted).
+/// endpoints. Each row uses the same UML sequence-diagram shape as
+/// a SIP message row — a single spanning cell with the codec +
+/// packet-count label above a CSS-drawn arrow that spans from the
+/// source lifeline to the destination lifeline. The arrow's
+/// direction (left/right) and style (solid for outgoing, dashed
+/// for incoming) follows the same convention as the SIP rows.
 fn rtp_row_html(
     time_label: &str,
     a_pkts: Option<u32>,
@@ -938,7 +1002,6 @@ fn rtp_row_html(
     b_src: &str,
     b_dst: &str,
     n_actors: usize,
-    actor_idx: &dyn Fn(&str) -> Option<usize>,
 ) -> String {
     let a_codec = a_codec.unwrap_or("").trim();
     let b_codec = b_codec.unwrap_or("").trim();
@@ -967,63 +1030,85 @@ fn rtp_row_html(
         .map(|n| format!("{} pkts", n))
         .unwrap_or_else(|| "—".to_string());
 
-    // Build the actor cells for one RTP leg: arrow at the source
-    // actor's cell, codec + count + src→dst info at the destination
-    // actor's cell, empty elsewhere. Same shape as a SIP message
-    // row, so the eye reads RTP and SIP rows the same way. The
-    // rendered payload uses the compact form "PCMA 3043 pkts" (no
-    // "RTP" prefix, no parenthetical description) — matches the
-    // sngrep / Wireshark RTP-flow row idiom.
-    fn build_rtp_cells(
-        src_ip: &str,
-        dst_ip: &str,
+    fn build_rtp_row(
         codec: &str,
         count: &str,
+        src_ip: &str,
+        dst_ip: &str,
         time_label: &str,
         n_actors: usize,
-        actor_idx: &dyn Fn(&str) -> Option<usize>,
         is_out: bool,
+        title: &str,
     ) -> String {
-        let arrow_char = if is_out { "═════════►" } else { "◄═════════" };
         let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
-        let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
-        let src_idx = actor_idx(src_ip);
-        let dst_idx = actor_idx(dst_ip);
-        let mut cells = format!("<td class=\"seq-time\">{time_label}</td>");
-        let arrow_html = format!(
-            "<span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span>"
+        let dir_attr = if is_out { "out" } else { "in" };
+        let label = format!(
+            "<span class=\"seq-rtp-codec\">{codec}</span>\
+             <span class=\"seq-rtp-count\">{count}</span>\
+             <div class=\"seq-rtp-endpoints muted small\">{src} → {dst}</div>",
+            src = html_escape(src_ip),
+            dst = html_escape(dst_ip),
         );
-        let text_html = format!(
-            "<span class=\"seq-msg-body {msg_class}\">{codec} {count}</span>\
-             <br><small class=\"muted\">{src_ip} → {dst_ip}</small>",
-            src_ip = html_escape(src_ip),
-            dst_ip = html_escape(dst_ip),
+        let mut cells = format!(
+            "<td class=\"seq-time-cell\">{time_label}</td>"
         );
         for i in 0..n_actors {
-            let cell = if Some(i) == src_idx && Some(i) == dst_idx {
-                // Self-loop (rare): text only, no arrow.
-                format!("<td class=\"seq-actor-cell\">{text_html}</td>")
-            } else if Some(i) == src_idx {
-                // Source cell: arrow only, pointing toward dst.
-                format!("<td class=\"seq-actor-cell\">{arrow_html}</td>")
-            } else if Some(i) == dst_idx {
-                // Destination cell: arrow + codec/count/src→dst.
-                format!("<td class=\"seq-actor-cell\">{arrow_html} {text_html}</td>")
-            } else {
-                format!("<td class=\"seq-actor-cell\"></td>")
-            };
-            cells.push_str(&cell);
+            cells.push_str(&format!(
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\"></td>"
+            ));
         }
-        cells
+        let msg_cell = format!(
+            "<td class=\"seq-msg-cell\" colspan=\"{n}\" data-msg-dir=\"{dir}\">\
+               <div class=\"seq-msg-label\">{label}</div>\
+               <div class=\"seq-arrow {arrow_cls}\"></div>\
+             </td>",
+            n = n_actors,
+            dir = dir_attr,
+            arrow_cls = arrow_class,
+        );
+        cells.push_str(&msg_cell);
+        format!(
+            "<tr class=\"seq-row seq-row-{dir} seq-row-rtp\" title=\"{title}\">{cells}</tr>",
+            dir = dir_attr,
+            title = title,
+            cells = cells,
+        )
     }
 
-    let outgoing = format!(
-        "<tr class=\"seq-row seq-row-out seq-row-rtp\">{}</tr>",
-        build_rtp_cells(a_src, a_dst, &codec, &a_count, time_label, n_actors, actor_idx, true)
+    let outgoing_title = format!(
+        "RTP outgoing: {src} → {dst} ({codec}, {count})",
+        src = a_src,
+        dst = a_dst,
+        codec = codec,
+        count = a_count,
     );
-    let incoming = format!(
-        "<tr class=\"seq-row seq-row-in seq-row-rtp\">{}</tr>",
-        build_rtp_cells(b_src, b_dst, &codec, &b_count, time_label, n_actors, actor_idx, false)
+    let incoming_title = format!(
+        "RTP incoming: {src} → {dst} ({codec}, {count})",
+        src = b_src,
+        dst = b_dst,
+        codec = codec,
+        count = b_count,
+    );
+
+    let outgoing = build_rtp_row(
+        &codec,
+        &a_count,
+        a_src,
+        a_dst,
+        time_label,
+        n_actors,
+        true,
+        &outgoing_title,
+    );
+    let incoming = build_rtp_row(
+        &codec,
+        &b_count,
+        b_src,
+        b_dst,
+        time_label,
+        n_actors,
+        false,
+        &incoming_title,
     );
     format!("{outgoing}{incoming}")
 }
@@ -1753,6 +1838,12 @@ mod sip_render_tests {
         let mut ack = mk_msg("ACK", 0, 0.3); ack.direction = "out".into();
         let mut bye = mk_msg("BYE", 0, 5.0); bye.direction = "out".into();
         let mut r200b = mk_msg("", 200, 5.1); r200b.direction = "in".into();
+        // Set src/dst IPs so the actor list is non-empty (the new
+        // sequence-diagram layout needs at least 2 actors).
+        for m in [&mut invite, &mut r100, &mut r200a, &mut ack, &mut bye, &mut r200b] {
+            m.src_ip_str = "10.0.0.1".into();
+            m.dst_ip_str = "10.0.0.2".into();
+        }
         let msgs = vec![invite, r100, r200a, ack, bye, r200b];
         let html = render_sngrep_flow(&msgs, None, None, "", "", None, None, "", "");
         // Six message rows + two RTP-flow rows (one per direction) = 8 <tr> rows.
@@ -1858,11 +1949,10 @@ mod sip_render_tests {
 
     #[test]
     fn seq_diagram_method_text_appears_only_once_per_row() {
-        // Regression test: an earlier version put the full
-        // msg_payload (arrow + method/code) in BOTH the source and
-        // destination actor cells, so `INVITE` showed up twice per
-        // row. The fix splits msg_payload into arrow + text and
-        // puts the text only in the destination cell.
+        // In the new UML sequence-diagram layout each message row
+        // has a single spanning `seq-msg-cell` carrying the label
+        // (method/code) plus the CSS-drawn arrow. So the test
+        // asserts exactly one `seq-msg-label` per message row.
         let mut out = mk_msg("INVITE", 0, 0.0);
         out.direction = "out".into();
         out.src_ip_str = "10.0.0.1".into();
@@ -1872,13 +1962,10 @@ mod sip_render_tests {
             None, None, "", "",
             None, None, "", "",
         );
-        // Exactly one msg-body span per row (only the destination
-        // cell carries the method/code text). Pre-fix this would
-        // have been 2 (one per cell).
         assert_eq!(
-            html.matches("seq-msg-body").count(),
+            html.matches("seq-msg-label").count(),
             1,
-            "method/code text should appear in exactly one actor cell, not both"
+            "method/code label should appear in exactly one msg-cell per row"
         );
     }
 
@@ -1917,13 +2004,23 @@ mod sip_render_tests {
         // The compact codec form (no parenthetical) is what lands
         // in the rendered HTML — make sure both the long form's
         // tail ("G.711 A-law)") is stripped AND the row layout
-        // puts RTP before BYE.
+        // puts RTP before BYE. The codec and count are wrapped in
+        // separate <span>s in the new layout, so check for the
+        // codec token + count token near each other.
         assert!(
-            html.contains("PCMA 6739 pkts"),
-            "RTP row should use compact 'PCMA 6739 pkts' form"
+            html.contains("PCMA"),
+            "RTP row should include the short codec token"
         );
         assert!(
-            !html.contains("PCMA (G.711 A-law)"),
+            html.contains("6739 pkts"),
+            "RTP row should show the A-leg packet count"
+        );
+        assert!(
+            html.contains("6763 pkts"),
+            "RTP row should show the B-leg packet count"
+        );
+        assert!(
+            !html.contains("G.711 A-law"),
             "RTP row should NOT include the parenthetical codec description"
         );
         let rtp_pos = html.find("seq-row-rtp").expect("RTP row missing");

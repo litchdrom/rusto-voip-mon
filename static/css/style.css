@@ -615,64 +615,157 @@ table.sip-timeline .sip-row:hover {
   border-collapse: collapse;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
   font-size: 13px;
+  table-layout: fixed;
 }
-.seq-table th,
-.seq-table td {
-  padding: 8px 14px;
-  border-bottom: 1px solid var(--border);
-  /* Vertical column dividers — the lifeline between actors.
-     Slightly brighter than the regular --border so the actor
-     columns read as distinct lifelines even on a busy screen. */
-  border-right: 1px solid #3a4256;
-  vertical-align: middle;
-}
-.seq-table tr td:last-child,
-.seq-table tr th:last-child {
-  border-right: none;
-}
-.seq-table thead th {
-  background: var(--bg-elev);
-  font-weight: 600;
-  font-size: 12px;
-  border-bottom: 2px solid var(--border);
-}
-.seq-table thead small {
-  font-weight: 400;
-  color: var(--fg-muted);
-  font-size: 11px;
-}
-.seq-table thead th[data-role="caller"] small { color: var(--accent); }
-.seq-table thead th[data-role="callee"] small { color: #fbbf24; }
-.seq-table thead th[data-role="media"]  small { color: #4ade80; }
-.seq-time {
+/* Time column on the left — narrow, right-aligned, monospace. */
+.seq-table .seq-time-cell {
+  width: 70px;
+  padding: 8px 12px;
   text-align: right;
   color: var(--fg-muted);
   font-size: 11px;
-  width: 70px;
   font-variant-numeric: tabular-nums;
+  vertical-align: middle;
+  white-space: nowrap;
 }
-.seq-actor-cell {
-  text-align: center;
-  min-width: 110px;
+/* Each actor cell hosts a single lifeline (vertical line through
+   the middle) and optionally a top/bottom actor box. The lifeline
+   is drawn via a `::before` pseudo-element so it can extend
+   through every message row regardless of cell content. */
+.seq-table .seq-actor-cell {
+  position: relative;
+  width: 110px;
+  padding: 0;
+  vertical-align: top;
 }
-.seq-arrow-inline {
+.seq-table .seq-actor-cell::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid #3a4256;
+  z-index: 0;
+}
+/* Actor boxes at the top and bottom of the diagram. The
+   `z-index: 1` keeps the opaque box above the lifeline so the
+   line appears to terminate at the box edge. The box itself
+   follows the sngrep / sip-diagrams.netlify.app idiom: light
+   rounded rectangle with the actor letter on top and the IP
+   below in muted text. */
+.seq-table .seq-actor-box {
+  position: relative;
+  z-index: 1;
   display: inline-block;
-  margin: 0 6px;
-  font-weight: 600;
-  letter-spacing: -1px;
-  font-size: 16px;
+  margin: 12px 4px;
+  padding: 6px 10px;
+  background: var(--bg-elev-2);
+  border: 1px solid #3a4256;
+  border-radius: 6px;
+  text-align: center;
+  vertical-align: top;
+  min-width: 60px;
 }
-.seq-arrow-out { color: var(--accent); }
-.seq-arrow-in { color: #fbbf24; }
-/* RTP rows use a longer arrow to visually distinguish the
-   full-duplex media stream from single-message SIP signalling.
-   The arrow spans the full row width between the source and
-   destination lifelines — same idiom as Wireshark's
-   Telephony > RTP > Stream Analysis arrows. */
-.seq-row-rtp .seq-arrow-inline {
+.seq-table .seq-actor-letter {
+  font-weight: 700;
   font-size: 14px;
-  letter-spacing: -2px;
+  letter-spacing: 0;
 }
+.seq-table .seq-actor-ip {
+  font-size: 10px;
+  color: var(--fg-muted);
+  margin-top: 2px;
+  white-space: nowrap;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+}
+.seq-table .seq-actor-box[data-role="caller"] .seq-actor-letter { color: var(--accent); }
+.seq-table .seq-actor-box[data-role="callee"] .seq-actor-letter { color: #fbbf24; }
+.seq-table .seq-actor-box[data-role="media"]  .seq-actor-letter { color: #4ade80; }
+/* Message cells span the entire message lane between the first
+   and last lifelines. The CSS-drawn arrow lives inside this
+   cell, positioned below the method/code label. */
+.seq-table .seq-msg-cell {
+  position: relative;
+  padding: 14px 24px;
+  vertical-align: middle;
+  text-align: center;
+}
+.seq-table .seq-msg-label {
+  font-weight: 600;
+  margin-bottom: 8px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.seq-table .seq-method-sep {
+  color: var(--fg-muted);
+  margin: 0 4px;
+}
+/* The horizontal arrow. Solid blue for outgoing requests,
+   dashed amber for incoming responses. CSS-drawn so the arrow
+   spans the full cell width between the source and destination
+   lifelines — same idiom as the sngrep / sip-diagrams
+   sequence-diagram view. */
+.seq-table .seq-arrow {
+  position: relative;
+  height: 1px;
+  margin: 0 8px;
+}
+.seq-table .seq-arrow-out {
+  background-color: var(--accent);
+}
+.seq-table .seq-arrow-out::after {
+  content: '';
+  position: absolute;
+  right: -1px;
+  top: -4px;
+  width: 0;
+  height: 0;
+  border-left: 8px solid var(--accent);
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+}
+.seq-table .seq-arrow-in {
+  /* Dashed amber line — the dashed pattern uses a repeating
+     gradient so each segment is the same colour. */
+  background-image: repeating-linear-gradient(
+    to right,
+    #fbbf24 0,
+    #fbbf24 6px,
+    transparent 6px,
+    transparent 12px
+  );
+}
+.seq-table .seq-arrow-in::after {
+  content: '';
+  position: absolute;
+  left: -1px;
+  top: -4px;
+  width: 0;
+  height: 0;
+  border-right: 8px solid #fbbf24;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+}
+/* Self-loop arrow: short stub pointing right back at the same
+   lifeline. The cell is half-width so the arrow doesn't extend
+   over into the next lifeline. */
+.seq-table .seq-arrow-self {
+  width: 30%;
+  margin: 0 auto;
+  background-color: var(--fg-muted);
+}
+.seq-table .seq-arrow-self::after {
+  content: '';
+  position: absolute;
+  right: -1px;
+  top: -4px;
+  width: 0;
+  height: 0;
+  border-left: 6px solid var(--fg-muted);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+/* Method / code colour coding. */
 .seq-method { font-weight: 700; }
 .seq-method.sip-method-invite,
 .seq-method.sip-method-bye,
@@ -686,14 +779,25 @@ table.sip-timeline .sip-row:hover {
 .seq-code.sip-4xx { color: #fb923c; }
 .seq-code.sip-5xx,
 .seq-code.sip-6xx { color: #f87171; }
-.seq-msg-body {
-  font-weight: 600;
-}
+/* RTP rows: subtle green tint to flag "media flowing" + an
+   italic codec/count label. The arrow itself uses the same
+   seq-arrow-out / seq-arrow-in classes as SIP rows so the
+   visual idiom is consistent. */
 .seq-row-rtp {
   background: rgba(74, 222, 128, 0.06);
 }
-.seq-row-rtp .seq-msg-body {
+.seq-rtp-codec {
+  font-weight: 700;
   font-style: italic;
   color: #4ade80;
-  font-weight: 500;
+  margin-right: 6px;
+}
+.seq-rtp-count {
+  color: var(--fg);
+  font-style: italic;
+}
+.seq-rtp-endpoints {
+  margin-top: 2px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
+  font-size: 10px;
 }
