@@ -748,29 +748,29 @@ fn render_sngrep_flow(
     // sitting on top of the lifeline. The cell's CSS draws the
     // lifeline as a centered vertical line via `::before`, which
     // is masked behind the actor box (box has opaque background).
+    // The trailing empty msg-header cell keeps the column count
+    // consistent with the message rows (time + N actors + msg).
+    let n = actors.len();
+    let actor_cells_html = (0..n)
+        .map(|i| format!(
+            "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\">{}</td>",
+            actor_boxes[i]
+        ))
+        .collect::<Vec<_>>()
+        .join("");
     let actor_top_row = format!(
         "<tr class=\"seq-actor-row seq-actor-top\">\
-           <td class=\"seq-time-cell\"></td>{}\
+           <td class=\"seq-time-cell\"></td>{cells}\
+           <td class=\"seq-msg-cell seq-msg-header\"></td>\
          </tr>",
-        (0..actors.len())
-            .map(|i| format!(
-                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\">{}</td>",
-                actor_boxes[i]
-            ))
-            .collect::<Vec<_>>()
-            .join("")
+        cells = actor_cells_html,
     );
     let actor_bottom_row = format!(
         "<tr class=\"seq-actor-row seq-actor-bottom\">\
-           <td class=\"seq-time-cell\"></td>{}\
+           <td class=\"seq-time-cell\"></td>{cells}\
+           <td class=\"seq-msg-cell seq-msg-header\"></td>\
          </tr>",
-        (0..actors.len())
-            .map(|i| format!(
-                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\">{}</td>",
-                actor_boxes[i]
-            ))
-            .collect::<Vec<_>>()
-            .join("")
+        cells = actor_cells_html,
     );
 
     // Walk messages, emitting one <tr> per row. Each row's cells are
@@ -784,6 +784,11 @@ fn render_sngrep_flow(
     let mut rows: Vec<String> = Vec::with_capacity(messages.len() + 2);
     let mut media_started = false;
     let mut media_inserted = false;
+    // Track the time of the last 2xx/ACK — that's when media
+    // actually starts flowing. RTP rows use this as their time
+    // stamp instead of the surrounding BYE's time (which is when
+    // media STOPS, not when it's "active").
+    let mut media_start_time: Option<String> = None;
 
     for m in messages.iter() {
         let offset_ms = (m.calldate - t_min).num_milliseconds();
@@ -878,18 +883,22 @@ fn render_sngrep_flow(
                 "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\"></td>"
             ));
         }
-        let msg_span_attr = format!("colspan=\"{n}\"");
         let arrow_class = match arrow_dir {
             "out" => "seq-arrow-out",
             "in" => "seq-arrow-in",
             _ => "seq-arrow-self",
         };
+        // The msg-cell sits in its own column (the last one). The
+        // CSS-drawn arrow inside uses negative horizontal margins
+        // so it visually spans from the left-most lifeline to the
+        // right-most lifeline, not just across the cell's own
+        // width — that matches the sngrep / sip-diagrams idiom
+        // where the arrowhead lands on the destination lifeline.
         let msg_cell = format!(
-            "<td class=\"seq-msg-cell\" {span} data-msg-dir=\"{arrow_dir}\">\
+            "<td class=\"seq-msg-cell\" data-msg-dir=\"{arrow_dir}\">\
                <div class=\"seq-msg-label\">{label}</div>\
                <div class=\"seq-arrow {arrow_cls}\"></div>\
              </td>",
-            span = msg_span_attr,
             arrow_cls = arrow_class,
         );
         cells.push(msg_cell);
@@ -904,14 +913,16 @@ fn render_sngrep_flow(
         // rows are inserted at this point — between the last 2xx/ACK
         // and the first BYE/CANCEL — to show the media stream while
         // it's actually flowing, not after the call has been torn
-        // down. The time stamp for the RTP row is the BYE/CANCEL
-        // message's time offset (the moment media stops).
+        // down. The time stamp for the RTP row is the last 2xx/ACK
+        // message's time offset (the moment media starts flowing),
+        // not the BYE's time which is when media stops.
         if !media_started {
             let ack_or_2xx =
                 (!m.method.is_empty() && m.method == "ACK") ||
                 (m.response_num >= 200 && m.response_num < 300);
             if ack_or_2xx {
                 media_started = true;
+                media_start_time = Some(rel_time.clone());
             }
         }
         // Insert RTP rows right before the first BYE/CANCEL after
@@ -920,8 +931,9 @@ fn render_sngrep_flow(
         // the sngrep / Wireshark layout where the media stream is
         // shown between setup and teardown, not after teardown).
         if media_started && !media_inserted && (m.method == "BYE" || m.method == "CANCEL") {
+            let rtp_time = media_start_time.as_deref().unwrap_or(&rel_time);
             rows.push(rtp_row_html(
-                &rel_time,
+                rtp_time,
                 rtp_a_pkts,
                 rtp_a_codec.as_deref(),
                 rtp_a_src,
@@ -1058,11 +1070,10 @@ fn rtp_row_html(
             ));
         }
         let msg_cell = format!(
-            "<td class=\"seq-msg-cell\" colspan=\"{n}\" data-msg-dir=\"{dir}\">\
+            "<td class=\"seq-msg-cell\" data-msg-dir=\"{dir}\">\
                <div class=\"seq-msg-label\">{label}</div>\
                <div class=\"seq-arrow {arrow_cls}\"></div>\
              </td>",
-            n = n_actors,
             dir = dir_attr,
             arrow_cls = arrow_class,
         );

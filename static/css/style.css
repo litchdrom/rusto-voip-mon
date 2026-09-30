@@ -681,34 +681,43 @@ table.sip-timeline .sip-row:hover {
 .seq-table .seq-actor-box[data-role="caller"] .seq-actor-letter { color: var(--accent); }
 .seq-table .seq-actor-box[data-role="callee"] .seq-actor-letter { color: #fbbf24; }
 .seq-table .seq-actor-box[data-role="media"]  .seq-actor-letter { color: #4ade80; }
-/* Message cells span the entire message lane between the first
-   and last lifelines. The CSS-drawn arrow lives inside this
-   cell, positioned below the method/code label. */
+/* Message cells sit in the LAST column (after all actor cells).
+   The CSS-drawn arrow inside uses negative horizontal margins
+   to extend from the first actor's lifeline to the last actor's
+   lifeline, regardless of the cell's own width. That's the
+   sngrep / sip-diagrams idiom: arrows span the message lane
+   between lifelines, not just across one cell. */
 .seq-table .seq-msg-cell {
   position: relative;
-  padding: 14px 24px;
+  padding: 14px 0;
   vertical-align: middle;
   text-align: center;
+}
+.seq-table .seq-msg-cell.seq-msg-header {
+  padding: 0;
 }
 .seq-table .seq-msg-label {
   font-weight: 600;
   margin-bottom: 8px;
   font-size: 13px;
   white-space: nowrap;
+  /* Negative side margins pull the label out of the cell so it
+     can extend slightly beyond if the label is wide. */
+  padding: 0 8px;
 }
 .seq-table .seq-method-sep {
   color: var(--fg-muted);
   margin: 0 4px;
 }
-/* The horizontal arrow. Solid blue for outgoing requests,
-   dashed amber for incoming responses. CSS-drawn so the arrow
-   spans the full cell width between the source and destination
-   lifelines — same idiom as the sngrep / sip-diagrams
-   sequence-diagram view. */
+/* The horizontal arrow. The negative margins pull the arrow
+   line so its tips land ON the leftmost / rightmost lifelines
+   (i.e. at the centre of the first / last actor cell). For a
+   2-actor diagram that means -55px on each side (half the
+   110px actor cell width). */
 .seq-table .seq-arrow {
   position: relative;
   height: 1px;
-  margin: 0 8px;
+  margin: 0 -55px;
 }
 .seq-table .seq-arrow-out {
   background-color: var(--accent);
@@ -747,8 +756,9 @@ table.sip-timeline .sip-row:hover {
   border-bottom: 5px solid transparent;
 }
 /* Self-loop arrow: short stub pointing right back at the same
-   lifeline. The cell is half-width so the arrow doesn't extend
-   over into the next lifeline. */
+   lifeline. Override the negative margin from .seq-arrow so the
+   stub stays inside the msg-cell rather than spanning across
+   other lifelines. */
 .seq-table .seq-arrow-self {
   width: 30%;
   margin: 0 auto;
