@@ -743,34 +743,52 @@ fn render_sngrep_flow(
         })
         .collect();
 
-    // Build the top + bottom actor rows. Each row has one
-    // `<td class="seq-actor-cell">` per actor, with the actor box
-    // sitting on top of the lifeline. The cell's CSS draws the
-    // lifeline as a centered vertical line via `::before`, which
-    // is masked behind the actor box (box has opaque background).
-    // The trailing empty msg-header cell keeps the column count
-    // consistent with the message rows (time + N actors + msg).
+    // Build the top + bottom actor rows. The structure mirrors
+    // a UML sequence diagram: time | actor_A | message lane |
+    // actor_B (rather than time | actor_A | actor_B | message
+    // lane). Putting the msg cell in the MIDDLE keeps the
+    // leftmost / rightmost actors anchored to the table edges
+    // with the signaling lane between them — matching the
+    // sngrep / sip-diagrams.netlify.app layout. For N>2 actors
+    // the message lane is centred between actor 0 and actor N-1
+    // with the additional actors arranged symmetrically inside.
+    //
+    // Specifically the row order is:
+    //   time | actor_0 | msg-cell | actor_1 | actor_2 | ... | actor_{N-1}
+    // i.e. msg-cell goes right after the first actor, with the
+    // remaining actors trailing to the right. With N=1 the
+    // msg-cell goes after actor 0 and the rightmost actor
+    // coincides with the lane edge — still readable.
     let n = actors.len();
-    let actor_cells_html = (0..n)
+    let first_actor_html = if n > 0 {
+        format!(
+            "<td class=\"seq-actor-cell\" data-actor-idx=\"0\">{}</td>",
+            actor_boxes[0]
+        )
+    } else {
+        String::new()
+    };
+    let rest_actors_html: String = (1..n)
         .map(|i| format!(
             "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\">{}</td>",
             actor_boxes[i]
         ))
-        .collect::<Vec<_>>()
-        .join("");
+        .collect();
     let actor_top_row = format!(
         "<tr class=\"seq-actor-row seq-actor-top\">\
-           <td class=\"seq-time-cell\"></td>{cells}\
-           <td class=\"seq-msg-cell seq-msg-header\"></td>\
+           <td class=\"seq-time-cell\"></td>{first}\
+           <td class=\"seq-msg-cell seq-msg-header\"></td>{rest}\
          </tr>",
-        cells = actor_cells_html,
+        first = first_actor_html,
+        rest = rest_actors_html,
     );
     let actor_bottom_row = format!(
         "<tr class=\"seq-actor-row seq-actor-bottom\">\
-           <td class=\"seq-time-cell\"></td>{cells}\
-           <td class=\"seq-msg-cell seq-msg-header\"></td>\
+           <td class=\"seq-time-cell\"></td>{first}\
+           <td class=\"seq-msg-cell seq-msg-header\"></td>{rest}\
          </tr>",
-        cells = actor_cells_html,
+        first = first_actor_html,
+        rest = rest_actors_html,
     );
 
     // Walk messages, emitting one <tr> per row. Each row's cells are
@@ -878,9 +896,14 @@ fn render_sngrep_flow(
             "<td class=\"seq-time-cell\">{}</td>",
             rel_time
         ));
-        for i in 0..n {
+        // Push the first actor's lifeline cell (A), then the
+        // spanning msg-cell, then the remaining actor cells (B,
+        // C, …). This keeps actor 0 anchored to the left edge
+        // and actor N-1 anchored to the right edge of the table,
+        // with the signaling lane centred between them.
+        if n > 0 {
             cells.push(format!(
-                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\"></td>"
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"0\"></td>"
             ));
         }
         let arrow_class = match arrow_dir {
@@ -888,12 +911,12 @@ fn render_sngrep_flow(
             "in" => "seq-arrow-in",
             _ => "seq-arrow-self",
         };
-        // The msg-cell sits in its own column (the last one). The
-        // CSS-drawn arrow inside uses negative horizontal margins
-        // so it visually spans from the left-most lifeline to the
-        // right-most lifeline, not just across the cell's own
-        // width — that matches the sngrep / sip-diagrams idiom
-        // where the arrowhead lands on the destination lifeline.
+        // The msg-cell sits in the middle of the table (between
+        // actor 0 and the rest). The CSS-drawn arrow inside uses
+        // negative horizontal margins so it visually spans from
+        // the left-most lifeline to the right-most lifeline —
+        // matching the sngrep / sip-diagrams idiom where the
+        // arrowhead lands on the destination lifeline.
         let msg_cell = format!(
             "<td class=\"seq-msg-cell\" data-msg-dir=\"{arrow_dir}\">\
                <div class=\"seq-msg-label\">{label}</div>\
@@ -902,6 +925,11 @@ fn render_sngrep_flow(
             arrow_cls = arrow_class,
         );
         cells.push(msg_cell);
+        for i in 1..n {
+            cells.push(format!(
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\"></td>"
+            ));
+        }
         let sip_row_html = format!(
             "<tr class=\"seq-row seq-row-{}\" title=\"{}\">{}</tr>",
             arrow_dir,
@@ -1064,9 +1092,14 @@ fn rtp_row_html(
         let mut cells = format!(
             "<td class=\"seq-time-cell\">{time_label}</td>"
         );
-        for i in 0..n_actors {
+        // Push actor 0's lifeline cell, then the spanning
+        // msg-cell, then the remaining actor cells. Keeps the
+        // leftmost actor anchored to the left edge and the
+        // rightmost actor anchored to the right edge — see the
+        // SIP-message loop for the matching structure.
+        if n_actors > 0 {
             cells.push_str(&format!(
-                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\"></td>"
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"0\"></td>"
             ));
         }
         let msg_cell = format!(
@@ -1078,6 +1111,11 @@ fn rtp_row_html(
             arrow_cls = arrow_class,
         );
         cells.push_str(&msg_cell);
+        for i in 1..n_actors {
+            cells.push_str(&format!(
+                "<td class=\"seq-actor-cell\" data-actor-idx=\"{i}\"></td>"
+            ));
+        }
         format!(
             "<tr class=\"seq-row seq-row-{dir} seq-row-rtp\" title=\"{title}\">{cells}</tr>",
             dir = dir_attr,
