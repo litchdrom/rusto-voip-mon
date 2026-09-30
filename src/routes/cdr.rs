@@ -790,7 +790,12 @@ fn render_sngrep_flow(
         let dst_idx = actor_idx(&m.dst_ip_str);
         let mut cells: Vec<String> = Vec::with_capacity(actors.len() + 2);
         cells.push(format!("<td class=\"seq-time\">{}</td>", rel_time));
-        let arrow_char = if is_out { "──►" } else { "◄──" };
+        // Single-char arrows for SIP messages. With arrows at both
+        // lifelines and the method/code in the destination cell, the
+        // visual gap between the two arrow tips reads as a single
+        // "expanded" arrow spanning the row — same idiom as sngrep /
+        // Wireshark's Telephony > SIP Flows view.
+        let arrow_char = if is_out { "►" } else { "◄" };
         let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
         let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
         let arrow_html = format!(
@@ -837,9 +842,14 @@ fn render_sngrep_flow(
             }
         }
         // Insert RTP rows right before the first BYE/CANCEL after media.
+        // Use the literal label "RTP" for the time column instead of
+        // the surrounding BYE/CANCEL's time offset — the media
+        // stream isn't a single instant, and labelling the row "RTP"
+        // makes it visually distinct from per-message SIP rows that
+        // carry their own time stamps.
         if media_started && !media_inserted && (m.method == "BYE" || m.method == "CANCEL") {
             rows.push(rtp_row_html(
-                &rel_time,
+                "RTP",
                 rtp_a_pkts,
                 rtp_a_codec.as_deref(),
                 rtp_a_src,
@@ -855,18 +865,11 @@ fn render_sngrep_flow(
         }
     }
     if media_started && !media_inserted {
-        // No teardown message (call was abandoned); label RTP rows
-        // with the time of the last media-bearing message so they
-        // still have a time stamp in the time column.
-        let fallback_time = messages
-            .last()
-            .map(|m| {
-                let offset_ms = (m.calldate - t_min).num_milliseconds();
-                format!("+{:.1}s", offset_ms as f64 / 1000.0)
-            })
-            .unwrap_or_else(|| "+0.0s".to_string());
+        // No teardown message (call was abandoned); use the literal
+        // "RTP" label anyway — same visual idiom as the
+        // teardown-present case above.
         rows.push(rtp_row_html(
-            &fallback_time,
+            "RTP",
             rtp_a_pkts,
             rtp_a_codec.as_deref(),
             rtp_a_src,
@@ -957,7 +960,7 @@ fn rtp_row_html(
         actor_idx: &dyn Fn(&str) -> Option<usize>,
         is_out: bool,
     ) -> String {
-        let arrow_char = if is_out { "═══►" } else { "◄═══" };
+        let arrow_char = if is_out { "═════════►" } else { "◄═════════" };
         let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
         let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
         let src_idx = actor_idx(src_ip);

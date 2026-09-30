@@ -620,9 +620,10 @@ table.sip-timeline .sip-row:hover {
 .seq-table td {
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
-  /* Vertical column dividers — except on the last cell of each
-     row so the table doesn't have a stray right border. */
-  border-right: 1px solid var(--border);
+  /* Vertical column dividers — the lifeline between actors.
+     Slightly brighter than the regular --border so the actor
+     columns read as distinct lifelines even on a busy screen. */
+  border-right: 1px solid #3a4256;
   vertical-align: middle;
 }
 .seq-table tr td:last-child,
@@ -659,9 +660,19 @@ table.sip-timeline .sip-row:hover {
   margin: 0 6px;
   font-weight: 600;
   letter-spacing: -1px;
+  font-size: 16px;
 }
 .seq-arrow-out { color: var(--accent); }
 .seq-arrow-in { color: #fbbf24; }
+/* RTP rows use a longer arrow to visually distinguish the
+   full-duplex media stream from single-message SIP signalling.
+   The arrow spans the full row width between the source and
+   destination lifelines — same idiom as Wireshark's
+   Telephony > RTP > Stream Analysis arrows. */
+.seq-row-rtp .seq-arrow-inline {
+  font-size: 14px;
+  letter-spacing: -2px;
+}
 .seq-method { font-weight: 700; }
 .seq-method.sip-method-invite,
 .seq-method.sip-method-bye,
