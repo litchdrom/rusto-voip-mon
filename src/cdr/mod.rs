@@ -1352,6 +1352,49 @@ fn parse_sip_method(request_content: &str) -> String {
     first.to_string()
 }
 
+/// Pull every `c=` connection-info address out of an SDP body.
+/// Returns IPs in textual form, deduplicated in order of first
+/// appearance. Both session-level `c=` and media-level `c=` lines
+/// are scanned — RFC 4566 §5.7 says media-level `c=` overrides the
+/// session-level one for the relevant m-section, so we keep both.
+///
+/// `"v=0\r\no=... c=IN IP4 10.1.2.3 ... m=audio ... c=IN IP4 10.4.5.6\r\n"`
+/// → `["10.1.2.3", "10.4.5.6"]`.
+///
+/// IPv6 (`c=IN IP6 ::1`) and hostnames (`c=IN IP4 example.com`) are
+/// also parsed — for IPv6 we keep the bracketless form, for
+/// hostnames we keep the bare name. Returns `[]` on any parse
+/// failure (malformed SDP, no `c=` lines, empty body).
+pub fn parse_sdp_c_lines(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in body.lines() {
+        // SDP lines are CRLF-terminated; `lines()` already strips
+        // both \r and \n, so we're left with the raw key=value text.
+        let trimmed = line.trim();
+        if !trimmed.starts_with("c=") {
+            continue;
+        }
+        // Format: c=<nettype> <addrtype> <connection-address>
+        // Example: "c=IN IP4 10.1.2.3" or "c=IN IP6 2001:db8::1"
+        let mut parts = trimmed[2..].split_whitespace();
+        let _nettype = parts.next();
+        let _addrtype = parts.next();
+        let addr = match parts.next() {
+            Some(a) => a,
+            None => continue,
+        };
+        // Skip placeholder / wildcard addresses which carry no
+        // operator-meaningful endpoint info.
+        if addr.is_empty() || addr == "0.0.0.0" || addr == "::" || addr == "::1" {
+            continue;
+        }
+        if !out.iter().any(|existing| existing == addr) {
+            out.push(addr.to_string());
+        }
+    }
+    out
+}
+
 /// Parse a SIP response status line into `(code, reason)`:
 /// `"SIP/2.0 200 OK\r\n..."` → `(200, "OK")`.
 /// Falls back to the `response_number` column (smallint in the schema)
@@ -1387,6 +1430,52 @@ mod sip_parse_tests {
     fn parse_method_empty_body_returns_empty_string() {
         assert_eq!(parse_sip_method(""), "");
         assert_eq!(parse_sip_method("   "), "");
+    }
+
+    #[test]
+    fn parse_sdp_extracts_session_and_media_c_lines() {
+        // Standard INVITE SDP: session-level c= + media-level c=.
+        let sdp = "v=0\r\n\
+                    o=alice 1 2 IN IP4 10.1.2.3\r\n\
+                    s=-\r\n\
+                    c=IN IP4 10.1.2.3\r\n\
+                    t=0 0\r\n\
+                    m=audio 49170 RTP/AVP 0\r\n\
+                    c=IN IP4 10.4.5.6\r\n";
+        assert_eq!(
+            parse_sdp_c_lines(sdp),
+            vec!["10.1.2.3".to_string(), "10.4.5.6".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_sdp_skips_placeholders_and_dedupes() {
+        // 0.0.0.0 / ::1 / :: are placeholders — should NOT appear.
+        let sdp = "c=IN IP4 0.0.0.0\r\nc=IN IP6 ::1\r\nc=IN IP6 ::\r\n\
+                    c=IN IP4 10.0.0.1\r\nc=IN IP4 10.0.0.1\r\n";
+        assert_eq!(parse_sdp_c_lines(sdp), vec!["10.0.0.1".to_string()]);
+    }
+
+    #[test]
+    fn parse_sdp_supports_ipv6() {
+        let sdp = "c=IN IP6 2001:db8::1\r\nm=audio 49170 RTP/AVP 0\r\n\
+                    c=IN IP6 fe80::1\r\n";
+        assert_eq!(
+            parse_sdp_c_lines(sdp),
+            vec!["2001:db8::1".to_string(), "fe80::1".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_sdp_returns_empty_on_no_c_lines() {
+        // Pure SDP without any c= (allowed but unusual).
+        let sdp = "v=0\r\no=alice 1 2 IN IP4 10.1.2.3\r\ns=-\r\nt=0 0\r\n";
+        assert!(parse_sdp_c_lines(sdp).is_empty());
+    }
+
+    #[test]
+    fn parse_sdp_returns_empty_on_empty_body() {
+        assert!(parse_sdp_c_lines("").is_empty());
     }
 
     #[test]

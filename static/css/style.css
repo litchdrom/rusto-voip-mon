@@ -586,15 +586,23 @@ table.sip-timeline .sip-row:hover {
   flex: 0 0 auto;
 }
 
-/* Call-flow sequence diagram — column layout.
-   Header row: time | caller-IP | message | callee-IP.
-   Each message row has 4 cells: time offset, caller-arrow, the
-   method/response code, callee-arrow. Outgoing messages get the
-   arrow on the caller side; incoming on the callee side. RTP rows
-   inserted between setup and teardown use the same 4-column shape
-   with bidirectional arrows (outgoing + incoming) so each leg's
-   actual endpoints are visible. Same visual idiom as Wireshark's
-   Telephony > SIP Flows view, but column-oriented for readability. */
+/* Call-flow sequence diagram — column-oriented table.
+   Header row: time | actor[0] | actor[1] | ... | actor[N-1].
+   Each actor is one detected endpoint (caller / callee / SDP-
+   discovered media relay). Rows are one per SIP message; the
+   directional arrow + method/code text lands in the cells of
+   the message's source and destination actors. RTP rows between
+   last 2xx/ACK and first BYE use the same N-actor shape with the
+   actual RTP endpoints.
+
+   Visual conventions:
+   - Vertical column dividers (border-right on every cell except
+     the last) make actor boundaries obvious.
+   - Outgoing arrows solid blue (var(--accent)), incoming dashed
+     amber (#fbbf24).
+   - The arrow + message live INSIDE the actor's cell, so the eye
+     can follow the conversation flow row-by-row without
+     cross-referencing two columns. */
 .seq-diagram {
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -612,8 +620,14 @@ table.sip-timeline .sip-row:hover {
 .seq-table td {
   padding: 8px 14px;
   border-bottom: 1px solid var(--border);
-  text-align: center;
+  /* Vertical column dividers — except on the last cell of each
+     row so the table doesn't have a stray right border. */
+  border-right: 1px solid var(--border);
   vertical-align: middle;
+}
+.seq-table tr td:last-child,
+.seq-table tr th:last-child {
+  border-right: none;
 }
 .seq-table thead th {
   background: var(--bg-elev);
@@ -626,6 +640,9 @@ table.sip-timeline .sip-row:hover {
   color: var(--fg-muted);
   font-size: 11px;
 }
+.seq-table thead th[data-role="caller"] small { color: var(--accent); }
+.seq-table thead th[data-role="callee"] small { color: #fbbf24; }
+.seq-table thead th[data-role="media"]  small { color: #4ade80; }
 .seq-time {
   text-align: right;
   color: var(--fg-muted);
@@ -633,18 +650,18 @@ table.sip-timeline .sip-row:hover {
   width: 70px;
   font-variant-numeric: tabular-nums;
 }
-.seq-actor { width: 22%; }
-.seq-msg-col { width: 30%; }
-.seq-arrow-cell {
-  width: 12%;
-  font-size: 16px;
+.seq-actor-cell {
+  text-align: center;
+  min-width: 110px;
+}
+.seq-arrow-inline {
+  display: inline-block;
+  margin: 0 6px;
+  font-weight: 600;
   letter-spacing: -1px;
 }
 .seq-arrow-out { color: var(--accent); }
 .seq-arrow-in { color: #fbbf24; }
-.seq-msg-cell {
-  font-weight: 600;
-}
 .seq-method { font-weight: 700; }
 .seq-method.sip-method-invite,
 .seq-method.sip-method-bye,
@@ -658,13 +675,14 @@ table.sip-timeline .sip-row:hover {
 .seq-code.sip-4xx { color: #fb923c; }
 .seq-code.sip-5xx,
 .seq-code.sip-6xx { color: #f87171; }
+.seq-msg-body {
+  font-weight: 600;
+}
 .seq-row-rtp {
   background: rgba(74, 222, 128, 0.06);
 }
-.seq-row-rtp .seq-msg-cell {
+.seq-row-rtp .seq-msg-body {
   font-style: italic;
   color: #4ade80;
   font-weight: 500;
 }
-
-

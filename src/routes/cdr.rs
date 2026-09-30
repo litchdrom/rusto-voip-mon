@@ -580,7 +580,7 @@ pub async fn cdr_detail(
     <tr><th>digest_username</th><td><code>{digest_username}</code></td></tr>
     <tr><th>GeoPosition</th><td>{geo_position}</td></tr>
     <tr><th>hold</th><td>{hold}</td></tr>
-    <tr><th>spool_index</th><td>{spool_index} <span class="muted small">(tar.zst type bucket: 0=SIP, 1=RTP, вЂ¦)</span></td></tr>
+    <tr><th>spool_index</th><td>{spool_index} <span class="muted small">(tar.zst type bucket: 0=SIP, 1=RTP, …)</span></td></tr>
   </table>
   {custom_headers_html}
   {branches_html}
@@ -682,22 +682,66 @@ fn render_sngrep_flow(
         return String::new();
     }
 
-    // Caller / callee endpoint labels — derived from the first
-    // outgoing message we see (its src/dst IPs are the two endpoints).
+    // Build the actor list. Start with caller + callee from the
+    // first observed outgoing message's src/dst IPs, then add any
+    // SDP-discovered media IPs (c= lines) that aren't already in
+    // the list. This makes proxy / RTPEngine scenarios visible as
+    // additional columns — e.g. caller → proxy → callee with the
+    // proxy's IP showing up in SDP.
     let first = messages.iter().find(|m| !m.src_ip_str.is_empty());
     let (caller_ip, callee_ip) = first.map_or((String::new(), String::new()), |m| {
         (m.src_ip_str.clone(), m.dst_ip_str.clone())
     });
+    let mut actors: Vec<String> = Vec::new();
+    for ip in [&caller_ip, &callee_ip] {
+        if !ip.is_empty() && !actors.iter().any(|a| a == ip) {
+            actors.push(ip.clone());
+        }
+    }
+    // Discover additional media endpoints from SDP bodies.
+    for m in messages.iter() {
+        for sdp_ip in cdr::parse_sdp_c_lines(&m.content) {
+            if !actors.iter().any(|a| a == &sdp_ip) {
+                actors.push(sdp_ip);
+            }
+        }
+    }
+    // Cap at 6 actors — beyond that the table becomes unreadable.
+    actors.truncate(6);
+    let actor_idx = |ip: &str| -> Option<usize> {
+        actors.iter().position(|a| a == ip)
+    };
 
     // Time axis: relative to the first message's timestamp.
     let t_min = messages.iter().map(|m| m.calldate).min().unwrap();
 
-    // Walk messages, emitting one <tr> per row. Each row has four
-    // cells: time, caller-arrow, message, callee-arrow. Outgoing
-    // messages get an outgoing arrow on the caller side; incoming
-    // messages get an incoming arrow on the callee side. RTP rows
-    // (inserted between last 2xx/ACK and first BYE) use the same
-    // 4-column shape with bidirectional arrows.
+    // Build the column header row with one <th> per actor.
+    let actor_headers: Vec<String> = actors
+        .iter()
+        .enumerate()
+        .map(|(i, ip)| {
+            let role = if i == 0 {
+                "caller"
+            } else if i == actors.len() - 1 {
+                "callee"
+            } else {
+                "media"
+            };
+            format!(
+                "<th class=\"seq-actor\" data-role=\"{role}\">{role}<br><small>{ip}</small></th>",
+                ip = html_escape(ip)
+            )
+        })
+        .collect();
+
+    // Walk messages, emitting one <tr> per row. Each row's cells are
+    //   time | actor[0] arrow | actor[1] arrow | ... | actor[N-1] arrow
+    // For an outgoing message from src→dst, we put a small "──►"
+    // in the cell of the actor closest to src, and the "method/code"
+    // in the LAST actor's cell (the destination side). Incoming
+    // messages are mirrored. The arrow's color (blue for out,
+    // amber for in) matches the conventional caller/callee
+    // styling.
     let mut rows: Vec<String> = Vec::with_capacity(messages.len() + 2);
     let mut media_started = false;
     let mut media_inserted = false;
@@ -725,44 +769,54 @@ fn render_sngrep_flow(
                 m.response_num
             )
         };
-        let src_esc = html_escape(&m.src_ip_str);
-        let dst_esc = html_escape(&m.dst_ip_str);
+
         let title = format!(
             "{} {} {} → {} @ {}",
             m.method,
             m.response_text,
-            src_esc,
-            dst_esc,
+            html_escape(&m.src_ip_str),
+            html_escape(&m.dst_ip_str),
             m.calldate.format("%H:%M:%S%.3f"),
         );
 
-        // Build the 4 cells: time | caller-arrow | message | callee-arrow.
-        // Outgoing: caller side shows "►───", callee side empty.
-        // Incoming: caller side empty, callee side shows "───◄".
-        let caller_cell = if is_out {
-            r#"<td class="seq-arrow-cell seq-arrow-out">►───</td>"#
-        } else {
-            r#"<td class="seq-arrow-cell"></td>"#
-        };
-        let callee_cell = if is_out {
-            r#"<td class="seq-arrow-cell"></td>"#
-        } else {
-            r#"<td class="seq-arrow-cell seq-arrow-in">───◄</td>"#
-        };
+        // Per-actor cells: an arrow at the source side and the
+        // method/code text at the destination side. Cells in
+        // between are empty (they exist for visual symmetry and
+        // vertical column separators).
+        let src_idx = actor_idx(&m.src_ip_str);
+        let dst_idx = actor_idx(&m.dst_ip_str);
+        let mut cells: Vec<String> = Vec::with_capacity(actors.len() + 2);
+        cells.push(format!("<td class=\"seq-time\">{}</td>", rel_time));
+        let arrow_char = if is_out { "──►" } else { "◄──" };
+        let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
+        let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
+        // The method/code text always goes in the dst actor's cell
+        // so the arrow points to it from the src actor's cell.
+        let msg_payload = format!(
+            "<span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span> \
+             <span class=\"seq-msg-body {msg_class}\">{method_disp}{code_disp}</span>"
+        );
+        for (i, _) in actors.iter().enumerate() {
+            let cell = if Some(i) == src_idx && Some(i) == dst_idx {
+                // Self-loop (rare): method/code only, no arrow.
+                format!("<td class=\"seq-actor-cell\">{msg_payload}</td>")
+            } else if Some(i) == src_idx {
+                // Outgoing source cell: arrow points right.
+                format!("<td class=\"seq-actor-cell\">{msg_payload}</td>")
+            } else if Some(i) == dst_idx {
+                // Destination cell: arrow points in (left for in,
+                // right for out).
+                format!("<td class=\"seq-actor-cell\">{msg_payload}</td>")
+            } else {
+                format!("<td class=\"seq-actor-cell\"></td>")
+            };
+            cells.push(cell);
+        }
         rows.push(format!(
-            "<tr class=\"seq-row seq-row-{}\" title=\"{}\">\
-             <td class=\"seq-time\">{}</td>\
-             {}\
-             <td class=\"seq-msg-cell\">{}{}</td>\
-             {}\
-             </tr>",
+            "<tr class=\"seq-row seq-row-{}\" title=\"{}\">{}</tr>",
             if is_out { "out" } else { "in" },
             title,
-            rel_time,
-            caller_cell,
-            method_disp,
-            code_disp,
-            callee_cell,
+            cells.join(""),
         ));
 
         // Mark media_started at first 2xx or ACK.
@@ -785,6 +839,8 @@ fn render_sngrep_flow(
                 rtp_b_codec.as_deref(),
                 rtp_b_src,
                 rtp_b_dst,
+                actors.len(),
+                &actor_idx,
             ));
             media_inserted = true;
         }
@@ -799,41 +855,40 @@ fn render_sngrep_flow(
             rtp_b_codec.as_deref(),
             rtp_b_src,
             rtp_b_dst,
+            actors.len(),
+            &actor_idx,
         ));
     }
 
     let total = messages.len();
+    let n_actors = actors.len();
 
     format!(
         "<h2>Call flow</h2>\
          <p class=\"muted small\">\
-           {total} SIP messages, time top-to-bottom. \
-           Arrows in the caller / callee columns point in the message direction; \
-           RTP rows show the negotiated codec and packet counts per direction.\
+           {total} SIP messages across {n_actors} actor{s}, time top-to-bottom. \
+           Outgoing solid blue arrows, incoming dashed amber arrows. \
+           Additional actors discovered from SDP c= lines (proxy / media relay).\
          </p>\
          <div class=\"seq-diagram\">\
            <table class=\"seq-table\">\
              <thead><tr>\
                <th class=\"seq-time\">time</th>\
-               <th class=\"seq-actor\">caller<br><small>{caller_ip}</small></th>\
-               <th class=\"seq-msg-col\">message</th>\
-               <th class=\"seq-actor\">callee<br><small>{callee_ip}</small></th>\
+               {actor_headers}\
              </tr></thead>\
              <tbody>{rows}</tbody>\
            </table>\
          </div>",
+        actor_headers = actor_headers.join(""),
+        s = if n_actors == 1 { "" } else { "s" },
         rows = rows.join("\n"),
     )
 }
 
 /// Render the RTP-flow rows that live between the last 2xx/ACK and
-/// the first BYE. Each row is a `<tr>` matching the column layout
-/// in `render_sngrep_flow` (time | caller-arrow | message |
-/// callee-arrow). We emit ONE row per direction (caller→callee and
-/// callee→caller) rather than collapsing both into one — RTP can
-/// take a different network path than SIP (proxy scenarios, NAT
-/// pinholes, media relays), so each leg needs its own row showing
-/// the actual RTP endpoints and packet count.
+/// the first BYE. One row per direction with the actual RTP
+/// endpoints. The actor-index closure places the arrow + payload
+/// in the cell corresponding to the RTP source actor.
 fn rtp_row_html(
     a_pkts: Option<u32>,
     a_codec: Option<&str>,
@@ -843,6 +898,8 @@ fn rtp_row_html(
     b_codec: Option<&str>,
     b_src: &str,
     b_dst: &str,
+    n_actors: usize,
+    actor_idx: &dyn Fn(&str) -> Option<usize>,
 ) -> String {
     let a_codec = a_codec.unwrap_or("").trim();
     let b_codec = b_codec.unwrap_or("").trim();
@@ -860,30 +917,50 @@ fn rtp_row_html(
         .map(|n| format!("{} pkts", n))
         .unwrap_or_else(|| "—".to_string());
 
-    // Two table rows: outgoing (caller → callee) and incoming
-    // (callee → caller). Each shows its actual RTP endpoints, which
-    // can differ from the SIP endpoints when RTP traverses a relay
-    // / NAT.
-    let a_esc = html_escape(a_src);
-    let a_dst_esc = html_escape(a_dst);
-    let b_esc = html_escape(b_src);
-    let b_dst_esc = html_escape(b_dst);
+    // Build the actor cells for the outgoing RTP leg: arrow at
+    // a_src's actor cell, payload at a_dst's, empty elsewhere.
+    // RTP payload collapses src + dst + codec + count onto a single
+    // line in the destination cell; the source cell gets just the
+    // arrow + "RTP" label.
+    fn build_rtp_cells(
+        src_ip: &str,
+        dst_ip: &str,
+        codec: &str,
+        count: &str,
+        n_actors: usize,
+        actor_idx: &dyn Fn(&str) -> Option<usize>,
+        is_out: bool,
+    ) -> String {
+        let arrow_char = if is_out { "═══►" } else { "◄═══" };
+        let arrow_class = if is_out { "seq-arrow-out" } else { "seq-arrow-in" };
+        let msg_class = if is_out { "seq-msg-out" } else { "seq-msg-in" };
+        let mut cells = String::from("<td class=\"seq-time\">RTP</td>");
+        for i in 0..n_actors {
+            let cell = if actor_idx(src_ip) == Some(i) {
+                format!(
+                    "<td class=\"seq-actor-cell\">\
+                     <span class=\"seq-arrow-inline {arrow_class}\">{arrow_char}</span> \
+                     <span class=\"seq-msg-body {msg_class}\">RTP {codec} ({count})</span>\
+                     <br><small class=\"muted\">{src_ip} → {dst_ip}</small>\
+                     </td>",
+                    src_ip = html_escape(src_ip),
+                    dst_ip = html_escape(dst_ip),
+                )
+            } else {
+                "<td class=\"seq-actor-cell\"></td>".to_string()
+            };
+            cells.push_str(&cell);
+        }
+        cells
+    }
 
     let outgoing = format!(
-        "<tr class=\"seq-row seq-row-out seq-row-rtp\">\
-         <td class=\"seq-time\">RTP</td>\
-         <td class=\"seq-arrow-cell seq-arrow-out\">═══►</td>\
-         <td class=\"seq-msg-cell\">RTP {codec} ({a_count})<br><small class=\"muted\">{a_esc} → {a_dst_esc}</small></td>\
-         <td class=\"seq-arrow-cell\"></td>\
-         </tr>",
+        "<tr class=\"seq-row seq-row-out seq-row-rtp\">{}</tr>",
+        build_rtp_cells(a_src, a_dst, &codec, &a_count, n_actors, actor_idx, true)
     );
     let incoming = format!(
-        "<tr class=\"seq-row seq-row-in seq-row-rtp\">\
-         <td class=\"seq-time\">RTP</td>\
-         <td class=\"seq-arrow-cell\"></td>\
-         <td class=\"seq-msg-cell\">RTP {codec} ({b_count})<br><small class=\"muted\">{b_esc} → {b_dst_esc}</small></td>\
-         <td class=\"seq-arrow-cell seq-arrow-in\">◄═══</td>\
-         </tr>",
+        "<tr class=\"seq-row seq-row-in seq-row-rtp\">{}</tr>",
+        build_rtp_cells(b_src, b_dst, &codec, &b_count, n_actors, actor_idx, false)
     );
     format!("{outgoing}{incoming}")
 }
@@ -1640,16 +1717,26 @@ mod sip_render_tests {
     #[test]
     fn seq_diagram_rtp_row_includes_codec_and_packet_counts() {
         // When the caller passes rtp_a / rtp_b info, the RTP row
-        // surfaces it inline.
-        let msgs = vec![
-            mk_msg("INVITE", 0, 0.0),
-            mk_msg("", 200, 0.5),
-            mk_msg("ACK", 0, 0.6),
-            mk_msg("BYE", 0, 5.0),
-            mk_msg("", 200, 5.1),
-        ];
+        // surfaces it inline. Need src/dst IPs on the messages so
+        // the renderer can build the actor list — the codec + packet
+        // count live inside the per-actor cells.
+        let mut invite = mk_msg("INVITE", 0, 0.0);
+        invite.src_ip_str = "10.101.1.1".into();
+        invite.dst_ip_str = "10.101.1.112".into();
+        let mut ok = mk_msg("", 200, 0.5);
+        ok.src_ip_str = "10.101.1.112".into();
+        ok.dst_ip_str = "10.101.1.1".into();
+        let mut ack = mk_msg("ACK", 0, 0.6);
+        ack.src_ip_str = "10.101.1.1".into();
+        ack.dst_ip_str = "10.101.1.112".into();
+        let mut bye = mk_msg("BYE", 0, 5.0);
+        bye.src_ip_str = "10.101.1.1".into();
+        bye.dst_ip_str = "10.101.1.112".into();
+        let mut bye_ok = mk_msg("", 200, 5.1);
+        bye_ok.src_ip_str = "10.101.1.112".into();
+        bye_ok.dst_ip_str = "10.101.1.1".into();
         let html = render_sngrep_flow(
-            &msgs,
+            &[invite, ok, ack, bye, bye_ok],
             Some(6739),
             Some("G.722".into()),
             "10.101.1.1",
@@ -1687,11 +1774,16 @@ mod sip_render_tests {
     fn seq_diagram_arrow_direction_matches_message_direction() {
         // Outgoing messages get the right-arrow class; incoming get
         // the left-arrow class. The CSS uses this to colour and
-        // style the arrow differently.
+        // style the arrow differently. Need src/dst IPs set so the
+        // renderer can place the arrow in the right actor cell.
         let mut out = mk_msg("INVITE", 0, 0.0);
         out.direction = "out".into();
+        out.src_ip_str = "10.0.0.1".into();
+        out.dst_ip_str = "10.0.0.2".into();
         let mut inc = mk_msg("", 200, 0.5);
         inc.direction = "in".into();
+        inc.src_ip_str = "10.0.0.2".into();
+        inc.dst_ip_str = "10.0.0.1".into();
         let html = render_sngrep_flow(
             &[out, inc],
             None, None, "", "",
