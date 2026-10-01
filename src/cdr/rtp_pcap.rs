@@ -15,7 +15,14 @@
 //!
 //! * **Jitter** — RFC 3550 §6.4.1 smoothed interarrival jitter,
 //!   `J(i) = J(i-1) + (|D(i-1,i)| - J(i-1)) / 16`, where
-//!   `D(i,j) = |(Rj - Ri) - (Sj - Si)|`.
+//!   `D(i,j) = |(Rj - Ri) - (Sj - Si)|`. The RTP-clock rate
+//!   for converting sample-deltas to milliseconds is **estimated
+//!   from the data** (median samples-per-ms over the first
+//!   ~30 packets of the dominant SSRC) instead of being
+//!   hardcoded — the stream is almost always 8 kHz (PCMA/PCMU/
+//!   G.729) or 48 kHz (Opus), but 16 kHz (G.722) and 32 kHz
+//!   (G.722.1) exist and a hardcoded 8 kHz produces 2×–4×
+//!   off-scale jitter values for them.
 //! * **MOS** — Simplified E-model. `R = 93.2 - 2.5*loss_pct -
 //!   jitter_ms/10`. Clamped to [1, 5]. This isn't a full
 //!   ITU-T G.107 implementation (no latency, no codec-specific
@@ -24,11 +31,30 @@
 //!   experience, and the relationship is roughly linear at the
 //!   scales that matter for an operator eyeballing a chart.
 //!
+//! Both directions are filtered to their **dominant SSRC**
+//! before jitter is computed — a SIP call typically carries
+//! audio + DTMF `telephone-event` + comfort noise as separate
+//! streams from the same sender, each with its own clock and
+//! timestamps. Mixing streams into a single jitter calculation
+//! produces garbage `D(i,j)` values that the 1/16 smoother
+//! absorbs slowly and corrupts the running jitter for many
+//! seconds after the offending packet.
+//!
+//! Out-of-order packets (RTP timestamp went backwards relative
+//! to the previous accepted packet on the same stream) are
+//! **skipped from jitter calculation** rather than being
+//! absorbed. `wrapping_sub` produces a huge negative `D` value
+//! for these; without the skip, RFC 3550's 1/16 smoother
+//! multiplies that into the running jitter for ~16 subsequent
+//! packets before settling back down.
+//!
 //! Output is bucketed by 1-second windows by default. For a
 //! typical 60-second call that's 60 buckets × 2 directions
 //! ≈ 240 floats — comfortably within JS chart data size limits.
 
 use etherparse::SlicedPacket;
+use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 /// One RTP packet as decoded from the wire. Holds just enough
@@ -234,9 +260,44 @@ pub fn compute_rtp_stats(
     RtpStatsByDirection { a_to_b: a, b_to_a: b }
 }
 
+/// Estimate the RTP clock rate (Hz) from a sorted-by-arrival
+/// packet sequence. Computes `d_rtp_samples / d_arrival_ms`
+/// for each consecutive pair over the first ~30 packets and
+/// returns the median in Hz. Falls back to 8000 Hz (safe
+/// narrowband default) if no usable deltas are found.
+///
+/// The median is what makes this robust against a noisy start
+/// of stream — the first packet of a sender often has no
+/// established pacing, and a single reorder event would skew
+/// a mean badly.
+fn estimate_clock_rate_hz(packets: &[RtpPacket]) -> f64 {
+    let sample_window = packets.len().min(30).max(2);
+    let mut rates: Vec<f64> = Vec::new();
+    for w in packets[..sample_window].windows(2) {
+        let d_arr_ms = (w[1].arrival_secs - w[0].arrival_secs) * 1000.0;
+        let d_rtp = (w[1].rtp_ts as i64).wrapping_sub(w[0].rtp_ts as i64) as f64;
+        // Reject obviously bogus deltas: zero/negative arrival
+        // gaps (out-of-order pair), backwards RTP timestamps
+        // (reorder), or implausibly large samples-per-ms
+        // (> 50 samples/ms = > 50 kHz clock — catches us
+        // accidentally capturing two unrelated streams).
+        if d_arr_ms > 0.0 && d_rtp > 0.0 && d_rtp < 50_000.0 {
+            rates.push(d_rtp / d_arr_ms);
+        }
+    }
+    if rates.is_empty() {
+        return 8000.0;
+    }
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    // rates is in samples-per-ms; convert to Hz.
+    rates[rates.len() / 2] * 1000.0
+}
+
 /// Compute per-second jitter / loss / MOS for one direction's
-/// packets (already sorted by arrival). The arrival time of
-/// the first packet becomes `time_offset_secs = 0` for that
+/// packets. Filters to the dominant SSRC, estimates the clock
+/// rate from the data, and skips reorder events before
+/// computing RFC 3550 jitter. The arrival time of the first
+/// remaining packet becomes `time_offset_secs = 0` for that
 /// direction.
 fn bucket_one_direction(
     mut packets: Vec<RtpPacket>,
@@ -247,13 +308,33 @@ fn bucket_one_direction(
     }
     // Sort by wall-clock arrival — pcap record headers are
     // mostly monotonic but not guaranteed across SSRCs.
-    packets.sort_by(|a, b| a.arrival_secs.partial_cmp(&b.arrival_secs).unwrap());
-    let t0 = packets[0].arrival_secs;
+    packets.sort_by(|a, b| a.arrival_secs.partial_cmp(&b.arrival_secs).unwrap_or(Ordering::Equal));
 
-    // RFC 3550 jitter state.
-    let mut prev_arrival: Option<f64> = None;
-    let mut prev_rtp_ts: Option<u32> = None;
-    let mut jitter_ms: f64 = 0.0;
+    // Dominant SSRC selection. Jitter must be computed on a
+    // single clock stream — a SIP call typically carries audio
+    // + DTMF `telephone-event` + comfort noise as separate
+    // streams from the same sender, each with its own clock
+    // and timestamps. Mixing them produces garbage `D(i,j)`
+    // values (one packet from stream A followed by one from
+    // stream B has no meaningful |Δr - Δs|) that RFC 3550's
+    // 1/16 smoother absorbs slowly and corrupts the running
+    // jitter for many seconds.
+    let mut ssrc_counts: HashMap<u32, u32> = HashMap::new();
+    for p in &packets {
+        *ssrc_counts.entry(p.ssrc).or_insert(0) += 1;
+    }
+    let dominant_ssrc = ssrc_counts
+        .into_iter()
+        .max_by_key(|&(_, n)| n)
+        .map(|(s, _)| s)
+        .unwrap_or(0);
+    packets.retain(|p| p.ssrc == dominant_ssrc);
+    if packets.is_empty() {
+        return Vec::new();
+    }
+
+    let clock_hz = estimate_clock_rate_hz(&packets);
+    let t0 = packets[0].arrival_secs;
 
     // Group packets by bucket index.
     let mut buckets: Vec<Vec<&RtpPacket>> = Vec::new();
@@ -265,6 +346,11 @@ fn bucket_one_direction(
         }
         buckets[idx].push(p);
     }
+
+    // RFC 3550 jitter state.
+    let mut prev_arrival: Option<f64> = None;
+    let mut prev_rtp_ts: Option<i64> = None;
+    let mut jitter_ms: f64 = 0.0;
 
     // Per-bucket aggregation.
     let mut out = Vec::with_capacity(buckets.len());
@@ -278,23 +364,36 @@ fn bucket_one_direction(
         let mut bucket_jitter_sum = 0.0;
         let mut bucket_jitter_n = 0u32;
         for p in group {
-            if let (Some(r0), Some(s0)) = (prev_arrival, prev_rtp_ts) {
+            // Reorder / wrap guard: skip packets whose RTP
+            // timestamp went backwards relative to the previous
+            // *accepted* packet on the same stream. RFC 3550's
+            // `wrapping_sub` produces a huge negative `D` for
+            // these; after |·| that's a huge positive diff that
+            // the 1/16 smoother multiplies into the running
+            // jitter for ~16 subsequent packets. By skipping
+            // the offending packet entirely (and not advancing
+            // `prev_rtp_ts`), the next in-order packet picks up
+            // exactly where the last accepted one left off.
+            let accepted = if let (Some(r0), Some(s0)) = (prev_arrival, prev_rtp_ts) {
                 let d_arrival_ms = (p.arrival_secs - r0) * 1000.0;
-                // Wrap-around safe subtraction: RTP timestamps
-                // are 32-bit unsigned with wrap at 2^32.
-                let d_rtp = (p.rtp_ts as i64).wrapping_sub(s0 as i64) as f64;
-                // Assume 8 kHz clock (the common case for
-                // narrowband codecs). For wideband (16 kHz)
-                // the jitter value is 2x off — acceptable
-                // noise for a timeline visualisation.
-                let d_rtp_ms = d_rtp / 8.0;
-                let diff = (d_arrival_ms - d_rtp_ms).abs();
-                jitter_ms += (diff - jitter_ms) / 16.0;
+                let d_rtp = (p.rtp_ts as i64).wrapping_sub(s0) as f64;
+                if d_rtp < 0.0 {
+                    false
+                } else {
+                    let d_rtp_ms = d_rtp * (1000.0 / clock_hz);
+                    let diff = (d_arrival_ms - d_rtp_ms).abs();
+                    jitter_ms += (diff - jitter_ms) / 16.0;
+                    true
+                }
+            } else {
+                true
+            };
+            if accepted {
+                prev_arrival = Some(p.arrival_secs);
+                prev_rtp_ts = Some(p.rtp_ts as i64);
+                bucket_jitter_sum += jitter_ms;
+                bucket_jitter_n += 1;
             }
-            prev_arrival = Some(p.arrival_secs);
-            prev_rtp_ts = Some(p.rtp_ts);
-            bucket_jitter_sum += jitter_ms;
-            bucket_jitter_n += 1;
         }
 
         let avg_jitter_ms = if bucket_jitter_n > 0 {
@@ -549,5 +648,104 @@ mod tests {
         let stats = compute_rtp_stats(Vec::new(), |_| RtpDirection::AtoB, 1);
         assert!(stats.a_to_b.is_empty());
         assert!(stats.b_to_a.is_empty());
+    }
+
+    /// Regression: a SIP call's dominant SSRC (audio) gets mixed
+    /// with sparse DTMF (`telephone-event`) packets on a
+    /// different SSRC. Jitter must be computed on the dominant
+    /// stream only — the DTMF packets have wildly different
+    /// timestamps and sparse pacing that would otherwise corrupt
+    /// the running jitter for many seconds.
+    #[test]
+    fn ssrc_filter_keeps_only_dominant_stream() {
+        let mut packets = Vec::new();
+        // 50 audio packets on SSRC 0x1, regular 20ms cadence.
+        for i in 0..50u32 {
+            packets.push(mk_pkt(
+                i as f64 * 0.020,
+                i * 160,
+                0x1,
+                [10, 0, 0, 1],
+            ));
+        }
+        // 5 DTMF packets on SSRC 0x2, sparse + weird timestamps.
+        for i in 0..5u32 {
+            packets.push(mk_pkt(
+                0.5 + i as f64 * 0.1,
+                100_000 + i * 8000,
+                0x2,
+                [10, 0, 0, 1],
+            ));
+        }
+        let pcap = build_rtp_pcap(&packets);
+        let parsed = parse_rtp_packets_from_pcap(&pcap);
+        let stats = compute_rtp_stats(parsed, |_| RtpDirection::AtoB, 1);
+        assert_eq!(stats.a_to_b.len(), 1);
+        assert_eq!(
+            stats.a_to_b[0].packet_count, 50,
+            "DTMF packets must be filtered out"
+        );
+        assert!(
+            stats.a_to_b[0].jitter_ms.abs() < 1.0,
+            "regular audio stream should have ~0 jitter even with DTMF mixed in, got {}",
+            stats.a_to_b[0].jitter_ms
+        );
+    }
+
+    /// Regression: Opus / G.722 / G.722.1 use non-8 kHz clocks.
+    /// Hardcoding 8 kHz produces 2×–6× off jitter values.
+    /// Verifies the clock-rate estimator picks up the correct
+    /// rate from the data.
+    #[test]
+    fn wideband_clock_rate_estimated_correctly() {
+        // Opus at 48 kHz, 20ms ptime: 960 samples per packet.
+        let packets: Vec<RtpPacket> = (0..50)
+            .map(|i| {
+                mk_pkt(
+                    i as f64 * 0.020,
+                    i * 960,
+                    0xABCD,
+                    [10, 0, 0, 1],
+                )
+            })
+            .collect();
+        let pcap = build_rtp_pcap(&packets);
+        let parsed = parse_rtp_packets_from_pcap(&pcap);
+        let stats = compute_rtp_stats(parsed, |_| RtpDirection::AtoB, 1);
+        assert!(
+            stats.a_to_b[0].jitter_ms.abs() < 1.0,
+            "Opus at 48 kHz should be jitter-free with correct clock rate estimate, got {}",
+            stats.a_to_b[0].jitter_ms
+        );
+    }
+
+    /// Regression: out-of-order packets must not corrupt jitter.
+    /// Without the skip, `wrapping_sub` produces a huge negative
+    /// `D`, which after |·| becomes a huge positive diff that
+    /// RFC 3550's 1/16 smoother multiplies into the running
+    /// jitter for ~16 subsequent packets.
+    #[test]
+    fn reorder_packets_do_not_corrupt_jitter() {
+        let mut packets: Vec<RtpPacket> = (0..30u32)
+            .map(|i| {
+                mk_pkt(
+                    i as f64 * 0.020,
+                    i * 160,
+                    0x1,
+                    [10, 0, 0, 1],
+                )
+            })
+            .collect();
+        // A late packet that belongs at arrival 0.02 (rtp_ts 160)
+        // shows up at arrival 0.6 instead.
+        packets.push(mk_pkt(0.6, 160, 0x1, [10, 0, 0, 1]));
+        let pcap = build_rtp_pcap(&packets);
+        let parsed = parse_rtp_packets_from_pcap(&pcap);
+        let stats = compute_rtp_stats(parsed, |_| RtpDirection::AtoB, 1);
+        assert!(
+            stats.a_to_b[0].jitter_ms < 5.0,
+            "reorder should not corrupt jitter, got {}",
+            stats.a_to_b[0].jitter_ms
+        );
     }
 }
