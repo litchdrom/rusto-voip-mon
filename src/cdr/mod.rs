@@ -239,10 +239,23 @@ impl RtpLeg {
     /// "21.0%" alone is meaningless without a denominator; "5 / 23
     /// (21.0%)" reads as "5 packets lost out of 23 total". Falls back
     /// gracefully when only some fields are populated.
+    ///
+    /// Percent scaling: VoIPmonitor stores the value as `*_mult1000`,
+    /// i.e. percent × 1000 — so 4.7% comes back as 4700, 0.047% as
+    /// 47. We divide by 1000 to recover the fraction, then format
+    /// with adaptive precision (2 decimals below 1%, 1 decimal at or
+    /// above) so a 2/4250 = 0.047% loss renders as "(0.05%)" rather
+    /// than the misleading "(0.0%)" a fixed 1-decimal format would
+    /// produce.
     pub fn loss_str(&self) -> String {
-        let pct = self
-            .loss_perc_mult1000
-            .map(|p| format!(" ({:.1}%)", p as f32 / 10.0));
+        let pct = self.loss_perc_mult1000.map(|p| {
+            let frac = p as f32 / 1000.0;
+            if frac < 1.0 {
+                format!(" ({:.2}%)", frac)
+            } else {
+                format!(" ({:.1}%)", frac)
+            }
+        });
         match (self.lost, self.received) {
             // Both unset — show percent only (no count to precede it).
             (None, None) => pct
@@ -1641,7 +1654,7 @@ mod rtp_leg_tests {
         let leg = RtpLeg {
             lost: Some(5),
             received: Some(18),
-            loss_perc_mult1000: Some(217), // 21.7%
+            loss_perc_mult1000: Some(21700), // 21.7%
             ..Default::default()
         };
         assert_eq!(leg.loss_str(), "5 / 23 (21.7%)");
@@ -1655,7 +1668,7 @@ mod rtp_leg_tests {
         // Lost only, no received — fall back to "N (P.P%)" form.
         let leg = RtpLeg {
             lost: Some(42),
-            loss_perc_mult1000: Some(100), // 10.0%
+            loss_perc_mult1000: Some(10000), // 10.0%
             ..Default::default()
         };
         assert_eq!(leg.loss_str(), "42 (10.0%)");
@@ -1664,20 +1677,53 @@ mod rtp_leg_tests {
         assert_eq!(leg.loss_str(), "42");
         // Percent only — show "(P.P%)".
         let leg = RtpLeg {
-            loss_perc_mult1000: Some(50),
+            loss_perc_mult1000: Some(5000),
             ..Default::default()
         };
         assert_eq!(leg.loss_str(), "(5.0%)");
         // Received only, with percent (degraded but VoIPmonitor stored it).
         let leg = RtpLeg {
             received: Some(500),
-            loss_perc_mult1000: Some(35), // 3.5%
+            loss_perc_mult1000: Some(3500), // 3.5%
             ..Default::default()
         };
         assert_eq!(leg.loss_str(), "500 (3.5%)");
         // Neither.
         let leg = RtpLeg::default();
         assert_eq!(leg.loss_str(), "");
+    }
+
+    #[test]
+    fn rtp_leg_loss_str_small_percent_uses_two_decimals() {
+        // Regression for the 2/4250 = 0.047% case. VoIPmonitor
+        // stores this as `loss_perc_mult1000 = 47`; a 1-decimal
+        // format would round to "(0.0%)", a 100×-wrong divisor
+        // would show "(4.7%)". The fix uses /1000 and 2 decimals
+        // below 1%, so the analyst sees "(0.05%)" — matches
+        // reality.
+        let leg = RtpLeg {
+            lost: Some(2),
+            received: Some(4250),
+            loss_perc_mult1000: Some(47), // 0.047%
+            ..Default::default()
+        };
+        assert_eq!(leg.loss_str(), "2 / 4252 (0.05%)");
+        // 0.5% — still under 1, so 2 decimals.
+        let leg = RtpLeg {
+            lost: Some(20),
+            received: Some(4000),
+            loss_perc_mult1000: Some(500), // 0.5%
+            ..Default::default()
+        };
+        assert_eq!(leg.loss_str(), "20 / 4020 (0.50%)");
+        // 1.0% exactly — flips back to 1 decimal at the threshold.
+        let leg = RtpLeg {
+            lost: Some(40),
+            received: Some(4000),
+            loss_perc_mult1000: Some(1000), // 1.0%
+            ..Default::default()
+        };
+        assert_eq!(leg.loss_str(), "40 / 4040 (1.0%)");
     }
 
     #[test]
