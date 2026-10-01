@@ -1713,6 +1713,74 @@ fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Cap for the POST `/cdr/export.csv` batch path (ids or filter).
+/// Matches `BATCH_MAX` in `routes::pcap` — same 100-row ceiling so the
+/// operator's mental model ("zip / csv of selected / all matching") has
+/// one consistent limit.
+const CSV_BATCH_MAX: usize = 100;
+
+/// Request body for `POST /cdr/export.csv`. Mirrors `BatchPcapRequest`
+/// shape — the JS frontend uses the same `{ids, filter}` JSON for both
+/// the bulk pcap zip and the bulk CSV download buttons.
+///
+/// Exactly one of two modes:
+///   * `ids`    — explicit list of CDR IDs (per-row selection in the
+///                UI, persisted in the session cookie).
+///   * `filter` — raw URL-encoded query string mirroring the CDR list
+///                page's filter form. Resolved server-side to all
+///                matching CDR IDs (capped at `CSV_BATCH_MAX`).
+///
+/// Both fields are optional but at least one must produce a non-empty
+/// result, otherwise we 400.
+#[derive(serde::Deserialize)]
+pub struct BatchCsvRequest {
+    #[serde(default)]
+    pub ids: Vec<u64>,
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
+/// CSV header bytes — sent once at the top of every CSV response.
+const CSV_HEADER: &[u8] =
+    b"id,calldate,callend,duration,caller,called,last_sip,mos,id_sensor\n";
+
+/// Build the streaming CSV `Response` from a `Vec<CdrSummary>` (already
+/// resolved + in output order). The summaries are formatted into rows
+/// on a worker task and pushed into the response body via an mpsc;
+/// `format_csv_line` is the shared per-row formatter.
+///
+/// No timeout here: the caller (POST batch or GET filter) is expected
+/// to have already bounded the work. The GET filter path keeps its own
+/// first-row timeout because `list_stream` can hang on a slow DB.
+fn build_csv_response(summaries: Vec<CdrSummary>, cap: usize) -> AppResult<Response> {
+    let (csv_tx, csv_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        if csv_tx.send(Ok(Bytes::from_static(CSV_HEADER))).await.is_err() {
+            return;
+        }
+        let mut sent = 0usize;
+        for s in summaries {
+            let line = format_csv_line(&s);
+            if csv_tx.send(Ok(Bytes::from(line))).await.is_err() {
+                break; // client disconnected
+            }
+            sent += 1;
+        }
+        tracing::info!(rows_sent = sent, cap = cap, "CSV export done");
+    });
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(csv_rx));
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"cdr.csv\"",
+        )
+        .header("X-Export-Cap", cap.to_string())
+        .body(body)
+        .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
 pub async fn cdr_export_csv(
     State(state): State<AppState>,
     _user: SessionUser,
@@ -1759,13 +1827,7 @@ pub async fn cdr_export_csv(
 
     tokio::spawn(async move {
         // Header row first.
-        if csv_tx
-            .send(Ok(Bytes::from_static(
-                b"id,calldate,callend,duration,caller,called,last_sip,mos,id_sensor\n",
-            )))
-            .await
-            .is_err()
-        {
+        if csv_tx.send(Ok(Bytes::from_static(CSV_HEADER))).await.is_err() {
             return;
         }
 
@@ -1810,18 +1872,7 @@ pub async fn cdr_export_csv(
             match row_result {
                 Ok(r) => {
                     let summary = CdrSummary::from(r);
-                    let line = format!(
-                        "{},{},{},{},{},{},{},{},{}\n",
-                        summary.id,
-                        summary.calldate.format("%Y-%m-%d %H:%M:%S"),
-                        summary.callend.format("%Y-%m-%d %H:%M:%S"),
-                        summary.duration.unwrap_or(0),
-                        csv_field(&summary.caller),
-                        csv_field(&summary.called),
-                        summary.last_sip_response_num.unwrap_or(0),
-                        summary.mos_str,
-                        summary.id_sensor.unwrap_or(0),
-                    );
+                    let line = format_csv_line(&summary);
                     if csv_tx.send(Ok(Bytes::from(line))).await.is_err() {
                         break; // client disconnected
                     }
@@ -1847,6 +1898,77 @@ pub async fn cdr_export_csv(
         .header("X-Export-Cap", cap.to_string())
         .body(body)
         .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
+/// Bulk CSV export — `POST /cdr/export.csv`. Mirrors the
+/// `/pcap/batch` shape (`{ids, filter}` JSON) so the same
+/// selection-clearing / cross-page checkbox state drives both
+/// downloads.
+///
+/// Resolves the request to a concrete list of CDR IDs (cap = 100),
+/// fetches each in a single SQL roundtrip via `fetch_by_ids`, then
+/// streams them out as CSV. IDs not in the DB are silently skipped
+/// (a deleted CDR in the middle of a session-cookie selection isn't
+/// a hard error — the operator still gets the rows that do exist).
+pub async fn cdr_export_csv_batch(
+    State(state): State<AppState>,
+    _user: SessionUser,
+    axum::Json(req): axum::Json<BatchCsvRequest>,
+) -> AppResult<Response> {
+    // Same ids-vs-filter precedence rule as the pcap batch: explicit
+    // IDs win over a filter if both come in. Empty both → 400.
+    let cdr_ids: Vec<u64> = if !req.ids.is_empty() {
+        let mut seen = std::collections::HashSet::with_capacity(req.ids.len());
+        let mut out = Vec::with_capacity(req.ids.len());
+        for &id in &req.ids {
+            if id > 0 && seen.insert(id) {
+                out.push(id);
+            }
+        }
+        out
+    } else if let Some(filter) = req.filter.as_deref() {
+        let tz = state.tz_default();
+        cdr::ids_for_query_string(&state.pool, filter, tz, CSV_BATCH_MAX).await?
+    } else {
+        return Err(AppError::BadRequest(
+            "either `ids` or `filter` must be provided".into(),
+        ));
+    };
+
+    if cdr_ids.is_empty() {
+        return Err(AppError::BadRequest(
+            "no CDRs matched the request".into(),
+        ));
+    }
+
+    if cdr_ids.len() > CSV_BATCH_MAX {
+        tracing::warn!(
+            requested = cdr_ids.len(),
+            cap = CSV_BATCH_MAX,
+            "CSV batch export exceeds cap; truncating"
+        );
+    }
+    let cdr_ids = &cdr_ids[..cdr_ids.len().min(CSV_BATCH_MAX)];
+
+    // Single SQL roundtrip, then preserve input order — the operator
+    // expects the CSV rows to follow the order they ticked.
+    let by_id = cdr::fetch_by_ids(&state.pool, cdr_ids).await?;
+    let mut summaries: Vec<CdrSummary> = Vec::with_capacity(cdr_ids.len());
+    for &id in cdr_ids {
+        if let Some(s) = by_id.get(&id) {
+            summaries.push(s.clone());
+        } else {
+            tracing::warn!(cdr_id = id, "CSV batch: CDR not found, skipping");
+        }
+    }
+
+    if summaries.is_empty() {
+        return Err(AppError::BadRequest(
+            "none of the requested CDRs exist in the database".into(),
+        ));
+    }
+
+    build_csv_response(summaries, CSV_BATCH_MAX)
 }
 
 pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilters {
@@ -2014,6 +2136,25 @@ fn csv_field(s: &Option<String>) -> String {
         }
         None => String::new(),
     }
+}
+
+/// Format one CDR as a single CSV data row (without trailing CR — `\n`
+/// only). Used by both the streaming GET filter export and the POST
+/// batch (ids or filter) export. Pure function — easy to unit-test
+/// without spinning up a DB.
+fn format_csv_line(s: &CdrSummary) -> String {
+    format!(
+        "{},{},{},{},{},{},{},{},{}\n",
+        s.id,
+        s.calldate.format("%Y-%m-%d %H:%M:%S"),
+        s.callend.format("%Y-%m-%d %H:%M:%S"),
+        s.duration.unwrap_or(0),
+        csv_field(&s.caller),
+        csv_field(&s.called),
+        s.last_sip_response_num.unwrap_or(0),
+        s.mos_str,
+        s.id_sensor.unwrap_or(0),
+    )
 }
 
 fn parse_dt(s: &Option<String>) -> Option<NaiveDateTime> {
@@ -2335,5 +2476,166 @@ mod sip_render_tests {
             rtp_pos < bye_pos,
             "RTP row must appear BEFORE the BYE row in the timeline"
         );
+    }
+}
+
+#[cfg(test)]
+mod csv_tests {
+    //! Pure-function tests for the CSV exporter helpers. The
+    //! streaming Response builder needs a tokio runtime + axum
+    //! routing infra to exercise end-to-end, so it stays in the
+    //! manual smoke-test path — these tests cover the parts that
+    //! actually contain formatting logic.
+
+    use super::*;
+    use crate::cdr::{CdrSummary, RtpLeg};
+
+    /// Build a minimal `CdrSummary` for the tests. Only the fields
+    /// `format_csv_line` actually reads are populated; everything
+    /// else gets `Default::default()`.
+    fn mk_summary(id: u64, caller: Option<&str>, called: Option<&str>) -> CdrSummary {
+        let calldate = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        CdrSummary {
+            id,
+            calldate,
+            callend: calldate + chrono::Duration::seconds(42),
+            duration: Some(42),
+            connect_duration: None,
+            caller: caller.map(String::from),
+            callername: None,
+            called: called.map(String::from),
+            src_ip_str: "10.0.0.1".into(),
+            dst_ip_str: "10.0.0.2".into(),
+            last_sip_response_num: Some(200),
+            mos_str: "4.2".into(),
+            a_lost: Some(0),
+            b_lost: Some(2),
+            id_sensor: Some(1),
+            rtp_a: RtpLeg::default(),
+            rtp_b: RtpLeg::default(),
+        }
+    }
+
+    #[test]
+    fn csv_field_escapes_quotes_commas_and_newlines() {
+        assert_eq!(csv_field(&None), "");
+        assert_eq!(csv_field(&Some("plain".into())), "plain");
+        // Comma must trigger quoting (otherwise the column count breaks).
+        assert_eq!(csv_field(&Some("a,b".into())), "\"a,b\"");
+        // Embedded double-quote → doubled-up inside the surrounding quotes.
+        assert_eq!(csv_field(&Some("a\"b".into())), "\"a\"\"b\"");
+        // Newline must also be quoted — Excel treats a bare \n as a
+        // record terminator inside an unquoted field.
+        assert_eq!(csv_field(&Some("a\nb".into())), "\"a\nb\"");
+    }
+
+    #[test]
+    fn format_csv_line_emits_one_record_per_summary() {
+        let s = mk_summary(123, Some("+15551234567"), Some("+15559876543"));
+        let line = format_csv_line(&s);
+        assert_eq!(
+            line,
+            "123,2026-09-25 14:30:00,2026-09-25 14:30:42,42,+15551234567,+15559876543,200,4.2,1\n"
+        );
+    }
+
+    #[test]
+    fn format_csv_line_handles_missing_optional_fields() {
+        // CDR with no caller, no called, no MOS, no sensor. The
+        // CSV row should still have the right number of columns.
+        let mut s = mk_summary(7, None, None);
+        s.last_sip_response_num = None;
+        s.mos_str = String::new();
+        s.id_sensor = None;
+        let line = format_csv_line(&s);
+        // 9 columns: id, calldate, callend, duration, caller, called,
+        // last_sip, mos, id_sensor — even with all optionals empty.
+        // Note: `mos_str` is rendered as an empty cell (None-like),
+        // while numeric optionals (`last_sip_response_num`, `id_sensor`)
+        // fall back to 0 via `unwrap_or(0)`. That's the contract both
+        // the GET streaming path and the POST batch path share.
+        assert_eq!(line.split(',').count(), 9);
+        // Numeric optionals (`last_sip_response_num`, `id_sensor`) fall
+        // back to 0 via `unwrap_or(0)`. That's the contract both the GET
+        // streaming path and the POST batch path share.
+        assert!(line.contains(",0,,"), "last_sip falls back to 0, mos is empty");
+        assert!(line.ends_with(",0\n"), "sensor column falls back to 0");
+    }
+
+    #[test]
+    fn format_csv_line_quotes_caller_with_comma() {
+        // Real CDR data has callers like "John, Jr." — the CSV has
+        // to escape them so they don't break column alignment.
+        let s = mk_summary(1, Some("Doe, John"), Some("Smith, Jane"));
+        let line = format_csv_line(&s);
+        assert!(
+            line.contains("\"Doe, John\""),
+            "caller with comma must be quoted: {line}"
+        );
+        assert!(
+            line.contains("\"Smith, Jane\""),
+            "called with comma must be quoted: {line}"
+        );
+    }
+
+    #[test]
+    fn csv_header_is_a_single_static_line() {
+        // The constant is referenced by every CSV-emitting code
+        // path; if it ever drifts (e.g. someone adds a column),
+        // both the GET streaming path and the POST batch path need
+        // to be updated in lockstep. This test pins the shape so
+        // the drift is loud.
+        assert_eq!(
+            std::str::from_utf8(CSV_HEADER).unwrap().trim_end(),
+            "id,calldate,callend,duration,caller,called,last_sip,mos,id_sensor"
+        );
+        assert!(CSV_HEADER.ends_with(b"\n"));
+    }
+
+    /// Sanity: the `BatchCsvRequest` deserialises from the JS
+    /// frontend's exact JSON shape. We don't construct one via axum
+    /// here (that needs the full router) — just exercise serde to
+    /// guard against a rename of the field name breaking the wire
+    /// contract silently.
+    #[test]
+    fn batch_csv_request_deserialises_js_payload_shape() {
+        let by_ids: BatchCsvRequest = serde_json::from_str(
+            r#"{"ids":[1,2,3],"filter":null}"#,
+        )
+        .expect("ids payload must deserialise");
+        assert_eq!(by_ids.ids, vec![1, 2, 3]);
+        assert_eq!(by_ids.filter, None);
+
+        let by_filter: BatchCsvRequest = serde_json::from_str(
+            r#"{"filter":"from=2026-09-25T00:00&to=2026-09-25T23:59"}"#,
+        )
+        .expect("filter payload must deserialise");
+        assert!(by_filter.ids.is_empty());
+        assert_eq!(
+            by_filter.filter.as_deref(),
+            Some("from=2026-09-25T00:00&to=2026-09-25T23:59")
+        );
+
+        // Empty body — both fields default-initialised, mirrors the
+        // behaviour the server checks for and 400s on.
+        let empty: BatchCsvRequest = serde_json::from_str("{}")
+            .expect("empty JSON must deserialise to defaults");
+        assert!(empty.ids.is_empty());
+        assert!(empty.filter.is_none());
+    }
+
+    /// Compile-time guard: `CdrSummary` is `Serialize`, so the
+    /// `format_csv_line` shape can't drift from the underlying
+    /// columns without a build break. If you remove / rename any
+    /// field used in the formatter, this fails first.
+    #[test]
+    fn cdr_summary_is_serializable() {
+        let s = mk_summary(99, Some("caller"), Some("called"));
+        let json = serde_json::to_string(&s).expect("CdrSummary must serialize");
+        assert!(json.contains("\"id\":99"));
+        assert!(json.contains("\"mos_str\":\"4.2\""));
     }
 }

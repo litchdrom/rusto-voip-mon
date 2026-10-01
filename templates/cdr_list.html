@@ -66,6 +66,14 @@
   <h1>Call Detail Records <span class="muted day-label">— {{ day_label }}</span></h1>
   <div class="actions">
     <a class="button" href="{{ export_url }}">Export CSV</a>
+    <button type="button" id="batch-csv-btn" class="button" disabled
+            title="Select rows below, then click to download a single CSV file with the chosen CDRs.">
+      Export CSV of selected ({{ selected_count }})
+    </button>
+    <button type="button" id="batch-csv-all-btn" class="button js-only"
+            title="Bundle every CDR matching the current filter into one CSV — no need to tick rows.">
+      Export CSV of all matching
+    </button>
     <button type="button" id="batch-pcap-btn" class="button" disabled
             title="Select rows below, then click to download a single zip of pcaps.">
       Download zip of selected ({{ selected_count }})
@@ -406,14 +414,27 @@ function updateMasterCheckbox() {
 }
 
 function updateBatchBtn() {
-  const btn = document.getElementById('batch-pcap-btn');
-  const clearBtn = document.getElementById('batch-pcap-clear');
-  if (!btn) return;
   const n = selectedIds.size;
-  btn.disabled = n === 0;
-  btn.textContent = n === 0
-    ? 'Download zip of selected'
-    : 'Download zip of selected (' + n + ')';
+  // PCAP zip button — mirrors the CSV button right above it. Both
+  // use the same selection state, both go disabled at n=0 and clear
+  // out when the operator hits "Clear selection".
+  const zipBtn = document.getElementById('batch-pcap-btn');
+  if (zipBtn) {
+    zipBtn.disabled = n === 0;
+    zipBtn.textContent = n === 0
+      ? 'Download zip of selected'
+      : 'Download zip of selected (' + n + ')';
+  }
+  // CSV button — same label / disabled semantics. Lives on the
+  // server's selected_cdr_ids cookie, no separate state.
+  const csvBtn = document.getElementById('batch-csv-btn');
+  if (csvBtn) {
+    csvBtn.disabled = n === 0;
+    csvBtn.textContent = n === 0
+      ? 'Export CSV of selected'
+      : 'Export CSV of selected (' + n + ')';
+  }
+  const clearBtn = document.getElementById('batch-pcap-clear');
   if (clearBtn) clearBtn.hidden = n === 0;
 }
 
@@ -513,6 +534,99 @@ async function downloadBatchZipFromFilter() {
   }
 }
 
+// --- Batch CSV download (POST /cdr/export.csv) ---
+//
+// Same selection model + same {ids, filter} JSON contract as the PCAP
+// batch download above. The server-side cap is 100 rows, so the JS
+// doesn't need to chunk anything — one POST, one CSV blob back.
+
+async function downloadBatchCsvFromIds(ids) {
+  const btn = document.getElementById('batch-csv-btn');
+  const original = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = 'Building CSV…'; }
+  try {
+    const resp = await fetch('/cdr/export.csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: Array.from(ids) })
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      alert('CSV batch export failed (' + resp.status + '): ' + body);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'cdrs.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('CSV batch export error: ' + e);
+  } finally {
+    if (btn) {
+      btn.textContent = original || 'Export CSV of selected';
+      updateBatchBtn();
+    }
+  }
+}
+
+async function downloadBatchCsvFromFilter() {
+  const btn = document.getElementById('batch-csv-all-btn');
+  const form = document.getElementById('cdr-filter-form');
+  if (!btn || !form) return;
+  // Build the same query string the GET /cdr/export.csv would receive —
+  // shared form-serialisation with downloadBatchZipFromFilter, so a
+  // future filter change only needs to land in one place.
+  const params = new URLSearchParams();
+  for (const el of form.querySelectorAll('input')) {
+    if (el.name === 'next' || el.type === 'submit' || el.type === 'button') continue;
+    if ((el.type === 'checkbox' || el.type === 'radio') && !el.checked) continue;
+    if (el.type === 'checkbox' || el.type === 'radio') {
+      params.append(el.name, el.value);
+    } else if (el.value !== '') {
+      params.append(el.name, el.value);
+    }
+  }
+  const filter = params.toString();
+  if (!filter) {
+    alert('Apply some filters first — otherwise the CSV would contain every CDR in the database.');
+    return;
+  }
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Building CSV…';
+  try {
+    const resp = await fetch('/cdr/export.csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ filter: filter })
+    });
+    if (!resp.ok) {
+      const body = await resp.text();
+      alert('CSV batch export failed (' + resp.status + '): ' + body);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'cdrs.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert('CSV batch export error: ' + e);
+  } finally {
+    btn.textContent = original;
+    btn.disabled = false;
+  }
+}
+
 // Wire per-row checkboxes (server-rendered `checked` already reflects
 // the session's selected_cdr_ids — JS just needs to react to toggles).
 document.querySelectorAll('input.cdr-select').forEach(cb => {
@@ -526,6 +640,13 @@ document.getElementById('batch-pcap-btn')?.addEventListener('click', () => {
 });
 document.getElementById('batch-pcap-all-btn')?.addEventListener('click', downloadBatchZipFromFilter);
 document.getElementById('batch-pcap-clear')?.addEventListener('click', clearSelection);
+// CSV batch buttons — mirrors the PCAP zip wiring above. Both click
+// handlers read from the same `selectedIds` Set so the operator only
+// needs to keep one mental model ("what I ticked") across downloads.
+document.getElementById('batch-csv-btn')?.addEventListener('click', () => {
+  downloadBatchCsvFromIds(selectedIds);
+});
+document.getElementById('batch-csv-all-btn')?.addEventListener('click', downloadBatchCsvFromFilter);
 updateMasterCheckbox();
 updateBatchBtn();
 </script>

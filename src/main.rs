@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(routes::cdr::cdr_list))
         .route("/cdr/:id", get(routes::cdr::cdr_detail))
         .route("/cdr/:id/rtp-chart.json", get(routes::cdr::rtp_chart_json))
-        .route("/cdr/export.csv", get(routes::cdr::cdr_export_csv))
+        .route("/cdr/export.csv", get(routes::cdr::cdr_export_csv).post(routes::cdr::cdr_export_csv_batch))
         .route("/cdr/select", post(routes::login::select_cdrs))
         .route("/pcap/:cdr_id", get(routes::pcap::download_single))
         // POST /pcap/batch  — JSON body, used by the JS frontend

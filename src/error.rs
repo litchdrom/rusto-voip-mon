@@ -9,6 +9,13 @@ pub enum AppError {
     #[error("not found")]
     NotFound,
 
+    /// 400 Bad Request — the caller sent something the server can prove
+    /// is wrong without touching the DB (empty selection, malformed
+    /// query parameter, etc). Distinct from `Internal` (500) so the
+    /// client can tell "you sent bad input" from "the server broke".
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
     /// Reserved for future endpoints that want a 401 rather than redirect.
     /// Currently the auth middleware bounces unauthenticated requests to
     /// `/login` so this variant isn't constructed yet.
@@ -44,6 +51,7 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, msg) = match &self {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            AppError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             AppError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".to_string()),
             AppError::Sqlx(e) => {
