@@ -585,6 +585,7 @@ pub async fn cdr_detail(
   {custom_headers_html}
   {branches_html}
   {rtp_html}
+  {rtp_chart_html}
   {flow_html}
   {sip_html}
 
@@ -635,10 +636,108 @@ pub async fn cdr_detail(
         ),
         sip_html = render_sip_timeline(&sip_messages),
         rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
+        rtp_chart_html = render_rtp_chart_panel(id),
     );
     Ok((
         [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
         body,
+    )
+        .into_response())
+}
+
+/// JSON endpoint that drives the MOS / jitter timeline chart on
+/// the CDR detail page. The chart's JS fetches this once on
+/// page load, then renders two datasets (A→B leg, B→A leg)
+/// with jitter on the left y-axis and MOS on the right.
+///
+/// The pcap extraction is the same pipeline that the SIP
+/// timeline fallback uses — locate the tar.zst, decompress,
+/// concat the SIP and RTP inner pcaps, parse RTP packets out
+/// of the merged stream, bucket per second per direction,
+/// return as JSON. We deliberately keep this endpoint
+/// separate from `cdr_detail` so the chart's render isn't
+/// coupled to the main page load — and a parse failure here
+/// degrades gracefully (returns an empty chart) rather than
+/// blanking the whole detail page.
+pub async fn rtp_chart_json(
+    State(state): State<crate::state::AppState>,
+    _user: SessionUser,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+) -> AppResult<Response> {
+    // Fetch just the two IPs we need to split A→B from B→A.
+    // Avoids a full CDR deserialise for what is essentially a
+    // single-column lookup.
+    let row = sqlx::query_as::<_, cdr::CdrRow>(
+        &format!(
+            "SELECT {} FROM cdr WHERE ID = ? LIMIT 1",
+            cdr::CDR_FULL_SELECT_COLUMNS
+        ),
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(crate::error::AppError::from)?;
+    let row = match row {
+        Some(r) => r,
+        None => {
+            // CDR not found — return empty payload so the
+            // chart JS doesn't choke. 404 would be more
+            // correct but the chart treats this as "no data"
+            // and degrades gracefully.
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"a_to_b":[],"b_to_a":[]}"#,
+            )
+                .into_response());
+        }
+    };
+
+    // Pull the pcap bytes; on failure return empty chart
+    // (same reasoning as above — better than blanking the
+    // whole page).
+    let pcap_bytes = match crate::routes::pcap::build_pcap_bytes(&state, id).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(cdr_id = id, error = ?e, "rtp chart pcap extract failed");
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"a_to_b":[],"b_to_a":[]}"#,
+            )
+                .into_response());
+        }
+    };
+
+    // Extract RTP packets, then bucket by direction and time.
+    // Direction split: a packet belongs to A→B when its
+    // source IP matches the CDR's sipcallerip (the A leg in
+    // VoIPmonitor's convention), otherwise B→A.
+    let packets = cdr::rtp_pcap::parse_rtp_packets_from_pcap(&pcap_bytes);
+    let caller_ip_str = row.sipcallerip.map(cdr::int_to_ipv4);
+    let called_ip_str = row.sipcalledip.map(cdr::int_to_ipv4);
+    let caller_ip: Option<std::net::IpAddr> = caller_ip_str
+        .as_deref()
+        .and_then(|s| s.parse().ok());
+    let stats = cdr::rtp_pcap::compute_rtp_stats(
+        packets,
+        |src| {
+            if Some(src.to_string()) == caller_ip_str {
+                cdr::rtp_pcap::RtpDirection::AtoB
+            } else {
+                cdr::rtp_pcap::RtpDirection::BtoA
+            }
+        },
+        1, // 1-second buckets
+    );
+
+    let json = serde_json::json!({
+        "a_to_b": stats.a_to_b,
+        "b_to_a": stats.b_to_a,
+        "a_leg_label": caller_ip_str.unwrap_or_default(),
+        "b_leg_label": called_ip_str.unwrap_or_default(),
+    });
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        json.to_string(),
     )
         .into_response())
 }
@@ -1340,8 +1439,163 @@ fn render_branches(branches: &[cdr::CdrNextBranch]) -> String {
 /// out-of-dialog BYE without a matching request) render as a single
 /// row with no request block.
 ///
-/// The cap is enforced server-side (500 in `fetch_sip_messages`); if
-/// we hit it the heading shows "+ more not shown — check the pcap".
+/// Render the MOS / jitter timeline chart panel — a server-
+/// rendered container with a `<canvas>` and a tiny inline
+/// `<script>` that fetches the chart data and draws it via
+/// Chart.js. Lazy-loads Chart.js itself from a CDN on first
+/// use so the chart's bytes don't block the rest of the page
+/// on every detail view (the call flow + RTP stats panels
+/// above render server-side and don't depend on JS).
+///
+/// The chart has two y-axes: jitter (ms) on the left, MOS
+/// (1.0..=5.0) on the right. Per-direction (A→B, B→A)
+/// rendered as two datasets so the operator can compare
+/// upstream vs downstream behaviour at a glance — the
+/// classic "is it the network or the codec?" question.
+///
+/// The JS body is held as a module-level const so the
+/// format!() call only has to interpolate the one CDR ID,
+/// not the whole script — easier to read in the source AND
+/// dodges the `{` / `}` escaping mess of inlining JS in
+/// format!().
+const RTP_CHART_JS: &str = r#"
+(function() {
+  const cdrId = __CDR_ID__;
+  const canvas = document.getElementById('rtp-chart');
+  const empty = document.getElementById('rtp-chart-empty');
+  function loadChartJs() {
+    return new Promise(function(resolve, reject) {
+      if (window.Chart) return resolve();
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/chart.js@4';
+      s.onload = resolve;
+      s.onerror = reject;
+      document.head.appendChild(s);
+    });
+  }
+  function bucketSeries(buckets, key) {
+    return buckets.map(function(b) {
+      return { x: b.time_offset_secs, y: b[key] };
+    });
+  }
+  loadChartJs()
+    .then(function() { return fetch('/cdr/' + cdrId + '/rtp-chart.json'); })
+    .then(function(r) { return r.ok ? r.json() : null; })
+    .then(function(data) {
+      if (!data || (!data.a_to_b.length && !data.b_to_a.length)) {
+        canvas.hidden = true;
+        empty.hidden = false;
+        return;
+      }
+      new Chart(canvas, {
+        type: 'line',
+        data: {
+          datasets: [
+            {
+              label: 'Jitter A->B (ms)',
+              data: bucketSeries(data.a_to_b, 'jitter_ms'),
+              borderColor: '#60a5fa',
+              backgroundColor: 'rgba(96,165,250,0.1)',
+              yAxisID: 'y',
+              tension: 0.2,
+              pointRadius: 0,
+            },
+            {
+              label: 'Jitter B->A (ms)',
+              data: bucketSeries(data.b_to_a, 'jitter_ms'),
+              borderColor: '#fbbf24',
+              backgroundColor: 'rgba(251,191,36,0.1)',
+              yAxisID: 'y',
+              borderDash: [4, 3],
+              tension: 0.2,
+              pointRadius: 0,
+            },
+            {
+              label: 'MOS A->B',
+              data: bucketSeries(data.a_to_b, 'mos'),
+              borderColor: '#4ade80',
+              yAxisID: 'y1',
+              tension: 0.2,
+              pointRadius: 0,
+            },
+            {
+              label: 'MOS B->A',
+              data: bucketSeries(data.b_to_a, 'mos'),
+              borderColor: '#a3e635',
+              yAxisID: 'y1',
+              borderDash: [4, 3],
+              tension: 0.2,
+              pointRadius: 0,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: { mode: 'index', intersect: false },
+          scales: {
+            x: {
+              type: 'linear',
+              title: { display: true, text: 'time (s from call start)' },
+            },
+            y: {
+              position: 'left',
+              title: { display: true, text: 'jitter (ms)' },
+              beginAtZero: true,
+            },
+            y1: {
+              position: 'right',
+              title: { display: true, text: 'MOS LQO' },
+              min: 1,
+              max: 5,
+              grid: { drawOnChartArea: false },
+            },
+          },
+          plugins: {
+            legend: { labels: { color: '#e6e9ef' } },
+            tooltip: {
+              callbacks: {
+                title: function(items) {
+                  const t = items[0].parsed.x;
+                  return '+' + t.toFixed(1) + 's';
+                },
+              },
+            },
+          },
+        },
+      });
+    })
+    .catch(function(e) {
+      console.warn('rtp chart load failed', e);
+      canvas.hidden = true;
+      empty.hidden = false;
+      empty.textContent = 'Chart load failed — see browser console.';
+    });
+})();
+"#;
+
+fn render_rtp_chart_panel(cdr_id: u64) -> String {
+    let js = RTP_CHART_JS.replace("__CDR_ID__", &cdr_id.to_string());
+    format!(
+        "<h2>Media timeline</h2>\
+         <p class=\"muted small\">\
+           Per-second jitter (RFC 3550 smoothed) and MOS estimate\
+           computed from the on-disk RTP pcap. Fetched lazily — no\
+           blocking cost on initial page load.\
+         </p>\
+         <div class=\"rtp-chart-container\">\
+           <canvas id=\"rtp-chart\" height=\"240\" aria-label=\"RTP jitter / MOS timeline\"></canvas>\
+           <p id=\"rtp-chart-empty\" class=\"muted small\" hidden>\
+             No RTP packets found in the on-disk pcap archive.\
+           </p>\
+         </div>\
+         <script>{js}</script>",
+        js = js,
+    )
+}
+
+/// Render the SIP message timeline as a collapsible list. Each row:
 fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
     if messages.is_empty() {
         return String::new();

@@ -17,6 +17,7 @@ use sqlx::{FromRow, MySqlPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+pub mod rtp_pcap;
 pub mod sip_pcap;
 
 /// Per-leg RTP stats from the `cdr` table. A leg = "caller side"

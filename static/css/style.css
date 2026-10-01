@@ -811,3 +811,14 @@ table.sip-timeline .sip-row:hover {
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
   font-size: 10px;
 }
+
+/* Media-timeline chart panel (MOS + jitter line graph). */
+.rtp-chart-container {
+  position: relative;
+  height: 260px;
+  margin: 12px 0;
+}
+.rtp-chart-container canvas {
+  background: var(--bg);
+  border-radius: 6px;
+}

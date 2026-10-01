@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
     let protected = Router::new()
         .route("/", get(routes::cdr::cdr_list))
         .route("/cdr/:id", get(routes::cdr::cdr_detail))
+        .route("/cdr/:id/rtp-chart.json", get(routes::cdr::rtp_chart_json))
         .route("/cdr/export.csv", get(routes::cdr::cdr_export_csv))
         .route("/cdr/select", post(routes::login::select_cdrs))
         .route("/pcap/:cdr_id", get(routes::pcap::download_single))
