@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}{{ mode.title() }} — rusto-voip-mon{% endblock %}
+
+{% block content %}
+
+<section class="page-header">
+  <h1>{{ mode.title() }}</h1>
+  <div class="actions">
+    <a class="link-btn" href="/admin/users">← back to list</a>
+  </div>
+</section>
+
+{% if let Some(err) = error %}
+<p class="error-banner">{{ err }}</p>
+{% endif %}
+
+{% if is_self %}
+<p class="warn-banner">
+  You're editing your own account. <strong>is_admin</strong>, <strong>blocked</strong>,
+  and <strong>password_expired</strong> are locked here to prevent you from
+  accidentally locking yourself out. Use a separate admin account to manage
+  these settings.
+</p>
+{% endif %}
+
+<form method="post" action="{{ mode.action_path(id) }}" class="form-grid">
+  <fieldset>
+    <legend>Identity</legend>
+
+    <label>
+      <span>username</span>
+      <input type="text" name="username" value="{{ username }}"
+             required maxlength="64" pattern="[A-Za-z0-9._@-]+"
+             placeholder="e.g. alice, ci-deploy, ops@example.com">
+      <small class="muted">
+        Letters, digits, '.', '_', '-', '@'. Up to 64 chars.
+      </small>
+    </label>
+
+    <label>
+      <span>
+        {% if mode == FormMode::New %}
+          password <em class="muted">(required; bcrypt-hashed on save)</em>
+        {% else %}
+          new password <em class="muted">(leave blank to keep the current one; bcrypt-hashed on save)</em>
+        {% endif %}
+      </span>
+      <input type="password" name="new_password"
+             {% if mode == FormMode::New %}required{% endif %}
+             minlength="8" maxlength="256"
+             autocomplete="new-password"
+             placeholder="{% if mode == FormMode::Edit %}leave blank to keep current{% else %}min 8 chars{% endif %}">
+      {% if mode == FormMode::Edit %}
+      <small class="muted">
+        Current stored hash format: <code>{{ password_format_label }}</code>.
+        Setting a new password here will upgrade legacy MD5 hashes to bcrypt.
+      </small>
+      {% endif %}
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Role &amp; permissions</legend>
+
+    <label class="checkbox-row">
+      <input type="checkbox" name="is_admin" value="1"
+             {% if is_admin %}checked{% endif %}
+             {% if is_self %}disabled{% endif %}>
+      <span>
+        admin
+        <em class="muted">(full access to /admin/* — required for sensor + user management)</em>
+        {% if is_self %}<em class="muted">— locked (your own account)</em>{% endif %}
+      </span>
+    </label>
+
+    <label class="checkbox-row">
+      <input type="checkbox" name="can_cdr" value="1"
+             {% if can_cdr %}checked{% endif %}>
+      <span>can_cdr <em class="muted">(browse / export CDR list + CSV)</em></span>
+    </label>
+
+    <label class="checkbox-row">
+      <input type="checkbox" name="can_pcap" value="1"
+             {% if can_pcap %}checked{% endif %}>
+      <span>can_pcap <em class="muted">(download pcap / wav files)</em></span>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Status <em class="muted">(use sparingly — prefer password resets)</em></legend>
+
+    <label class="checkbox-row">
+      <input type="checkbox" name="blocked" value="1"
+             {% if blocked %}checked{% endif %}
+             {% if is_self %}disabled{% endif %}>
+      <span>
+        blocked
+        <em class="muted">(rejects all logins; reversible)</em>
+        {% if is_self %}<em class="muted">— locked (your own account)</em>{% endif %}
+      </span>
+    </label>
+
+    <label class="checkbox-row">
+      <input type="checkbox" name="password_expired" value="1"
+             {% if password_expired %}checked{% endif %}
+             {% if is_self %}disabled{% endif %}>
+      <span>
+        password_expired
+        <em class="muted">(forces a password change on next login)</em>
+        {% if is_self %}<em class="muted">— locked (your own account)</em>{% endif %}
+      </span>
+    </label>
+  </fieldset>
+
+  <div class="form-actions">
+    <button type="submit" class="button primary">{{ mode.submit_label() }}</button>
+    <a class="link-btn" href="/admin/users">cancel</a>
+  </div>
+</form>
+
+{% endblock %}

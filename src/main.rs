@@ -19,6 +19,7 @@ mod middleware;
 mod routes;
 mod sensors;
 mod state;
+mod users;
 
 use crate::auth::session::CookieSecret;
 use crate::config::Config;
@@ -120,6 +121,27 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/sensors/:id_sensor/delete",
             post(routes::sensors::delete),
+        )
+        // /admin/users — admin-only CRUD over VoIPmonitor's users
+        // table. Same gating pattern as /admin/sensors: each handler
+        // enforces `is_admin` itself, with self-protection rules
+        // blocking accidental self-lockout at the route layer.
+        .route("/admin/users", get(routes::users::list))
+        .route(
+            "/admin/users/new",
+            get(routes::users::new_form).post(routes::users::create),
+        )
+        .route(
+            "/admin/users/:id/edit",
+            get(routes::users::edit_form).post(routes::users::update),
+        )
+        .route(
+            "/admin/users/:id/reset-password",
+            post(routes::users::reset_password),
+        )
+        .route(
+            "/admin/users/:id/delete",
+            post(routes::users::delete),
         )
         .route("/tz", post(routes::login::set_tz))
         .route_layer(axum_middleware::from_fn(require_login));

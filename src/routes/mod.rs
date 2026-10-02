@@ -3,3 +3,4 @@ pub mod cdr;
 pub mod login;
 pub mod pcap;
 pub mod sensors;
+pub mod users;
