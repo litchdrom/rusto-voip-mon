@@ -20,6 +20,9 @@
       {% block topbar_tools %}{% endblock %}
     </div>
     <div class="user">
+      {% if u.is_admin %}
+      <a href="/admin/sensors" class="admin-link" title="Admin: manage sensors">admin</a>
+      {% endif %}
       <span>{{ u.username }}</span>
       <form method="post" action="/logout" style="display:inline">
         <button type="submit" class="link-button">Logout</button>

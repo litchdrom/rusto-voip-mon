@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Sensors — rusto-voip-mon{% endblock %}
+
+{% block content %}
+
+<section class="page-header">
+  <h1>Sensors <span class="muted">— VoIPmonitor probe instances</span></h1>
+  <div class="actions">
+    <a class="button" href="/admin/sensors/new">+ New sensor</a>
+  </div>
+</section>
+
+{% if let Some(err) = error %}
+<p class="error-banner">{{ err }}</p>
+{% endif %}
+{% if let Some(msg) = info %}
+<p class="info-banner">{{ msg }}</p>
+{% endif %}
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>id_sensor</th>
+      <th>name</th>
+      <th>host:port</th>
+      <th>local_spool</th>
+      <th>CDR / 7d</th>
+      <th>status</th>
+      <th class="actions-col">actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in sensors %}
+    <tr class="{% if row.sensor.disable %}row-disabled{% endif %}">
+      <td class="num">{{ row.sensor.id_sensor }}</td>
+      <td>
+        {% match row.sensor.name %}
+          {% when Some with (n) %}{{ n }}
+          {% when None %}<span class="muted">— unnamed —</span>
+        {% endmatch %}
+      </td>
+      <td>
+        {% match row.sensor.host %}
+          {% when Some with (h) %}{{ h }}{% match row.sensor.port %}{% when Some with (p) %}:{{ p }}{% when None %}{% endmatch %}
+          {% when None %}<span class="muted">—</span>
+        {% endmatch %}
+      </td>
+      <td class="path">
+        {% match row.sensor.local_spool %}
+          {% when Some with (s) %}<code>{{ s }}</code>
+          {% when None %}<span class="muted">—</span>
+        {% endmatch %}
+      </td>
+      <td class="num">{{ row.cdr_count }}</td>
+      <td>
+        {% if row.sensor.disable %}
+          <span class="badge badge-disabled">disabled</span>
+        {% else %}
+          <span class="badge badge-active">active</span>
+        {% endif %}
+      </td>
+      <td class="actions-col">
+        <a class="link-btn" href="/admin/sensors/{{ row.sensor.id_sensor }}/edit">edit</a>
+        <form method="post" action="/admin/sensors/{{ row.sensor.id_sensor }}/delete"
+              style="display:inline"
+              onsubmit="return confirm('Delete sensor {{ row.sensor.id_sensor }}? Old CDR rows will retain the orphaned id.');">
+          <button type="submit" class="link-btn danger">delete</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    {% if sensors.is_empty() %}
+    <tr><td colspan="7" class="muted">No sensors yet — click <strong>+ New sensor</strong> above.</td></tr>
+    {% endif %}
+  </tbody>
+</table>
+
+<p class="muted small">
+  Sensor rows are auto-created (with no name) on every visit when CDR
+  traffic mentions an <code>id_sensor</code> we haven't seen before, so
+  freshly-installed probes show up here without manual registration.
+</p>
+
+{% endblock %}

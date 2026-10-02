@@ -17,6 +17,7 @@ mod db;
 mod error;
 mod middleware;
 mod routes;
+mod sensors;
 mod state;
 
 use crate::auth::session::CookieSecret;
@@ -102,6 +103,24 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/auth/tokens", post(routes::auth::create_token).get(routes::auth::list_tokens))
         .route("/auth/tokens/:id", axum::routing::delete(routes::auth::revoke_token))
+        // /admin/* — admin-only CRUD over VoIPmonitor entities. Each
+        // handler enforces `is_admin` itself; the protected router
+        // middleware only checks that a session exists. We keep the
+        // admin gate close to the SQL so future refactors can't
+        // accidentally expose a privileged path.
+        .route("/admin/sensors", get(routes::sensors::list))
+        .route(
+            "/admin/sensors/new",
+            get(routes::sensors::new_form).post(routes::sensors::create),
+        )
+        .route(
+            "/admin/sensors/:id_sensor/edit",
+            get(routes::sensors::edit_form).post(routes::sensors::update),
+        )
+        .route(
+            "/admin/sensors/:id_sensor/delete",
+            post(routes::sensors::delete),
+        )
         .route("/tz", post(routes::login::set_tz))
         .route_layer(axum_middleware::from_fn(require_login));
 
