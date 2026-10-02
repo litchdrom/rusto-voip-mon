@@ -40,9 +40,19 @@ use crate::error::AppResult;
 /// read-only "Advanced" view can show them without us having to type
 /// out every column. They're never written through this struct —
 /// `update()` only touches the focused fields.
+///
+/// ## `id_sensor` is `u32`, not `u16`
+///
+/// `sensors.id_sensor` is `INT UNSIGNED` in the VoIPmonitor schema
+/// (capacity ~4 billion); the `cdr.id_sensor` it joins to is
+/// `SMALLINT UNSIGNED` (capacity ~65k). The smaller type lives on
+/// the FK side because VoIPmonitor assigns probe IDs from a tiny
+/// range — but the parent table reserves the wider type for
+/// future-proofing. We mirror that split: Sensor.id_sensor is u32
+/// (matches the table), and the cdr-side join casts through u16.
 #[derive(Debug, Clone, Serialize)]
 pub struct Sensor {
-    pub id_sensor: u16,
+    pub id_sensor: u32,
     pub name: Option<String>,
     pub host: Option<String>,
     pub port: Option<i32>,
@@ -167,7 +177,7 @@ pub async fn list_all(pool: &MySqlPool) -> AppResult<Vec<Sensor>> {
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let id_sensor: u16 = r.try_get("id_sensor")?;
+        let id_sensor: u32 = r.try_get("id_sensor")?;
         out.push(Sensor {
             id_sensor,
             name: r.try_get("name").ok(),
@@ -189,7 +199,7 @@ pub async fn list_all(pool: &MySqlPool) -> AppResult<Vec<Sensor>> {
 /// Fetch one sensor by its `id_sensor`, including the full row
 /// (used to populate the "advanced" context in the edit form).
 /// Returns `Ok(None)` if no row matches.
-pub async fn get_by_id_sensor(pool: &MySqlPool, id_sensor: u16) -> AppResult<Option<Sensor>> {
+pub async fn get_by_id_sensor(pool: &MySqlPool, id_sensor: u32) -> AppResult<Option<Sensor>> {
     let row = sqlx::query("SELECT * FROM sensors WHERE id_sensor = ? LIMIT 1")
         .bind(id_sensor)
         .fetch_optional(pool)
@@ -203,7 +213,7 @@ pub async fn get_by_id_sensor(pool: &MySqlPool, id_sensor: u16) -> AppResult<Opt
 /// Create a new sensor row. `id_sensor` must be unique (VoIPmonitor
 /// enforces a UNIQUE index on it) — we don't pre-check, MySQL will
 /// surface the dup-key error which `sqlx` maps to `sqlx::Error`.
-pub async fn create(pool: &MySqlPool, id_sensor: u16, edit: &ParsedSensorEdit) -> AppResult<()> {
+pub async fn create(pool: &MySqlPool, id_sensor: u32, edit: &ParsedSensorEdit) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO sensors \
             (id_sensor, name, host, port, disable, local_spool) \
@@ -225,7 +235,7 @@ pub async fn create(pool: &MySqlPool, id_sensor: u16, edit: &ParsedSensorEdit) -
 /// and surface a 404.
 pub async fn update(
     pool: &MySqlPool,
-    id_sensor: u16,
+    id_sensor: u32,
     edit: &ParsedSensorEdit,
 ) -> AppResult<u64> {
     let res = sqlx::query(
@@ -247,7 +257,7 @@ pub async fn update(
 /// Hard-delete a sensor row. CDR rows reference `id_sensor` but
 /// without a FK constraint (it's a plain integer column), so this
 /// won't cascade — old CDRs will just display an orphaned sensor id.
-pub async fn delete(pool: &MySqlPool, id_sensor: u16) -> AppResult<u64> {
+pub async fn delete(pool: &MySqlPool, id_sensor: u32) -> AppResult<u64> {
     let res = sqlx::query("DELETE FROM sensors WHERE id_sensor = ?")
         .bind(id_sensor)
         .execute(pool)
@@ -279,7 +289,7 @@ pub async fn backfill_from_cdr(pool: &MySqlPool) -> AppResult<u64> {
 /// column we don't surface explicitly. Kept alphabetical for stable
 /// "Advanced" rendering.
 fn row_to_sensor(row: &sqlx::mysql::MySqlRow) -> AppResult<Sensor> {
-    let id_sensor: u16 = row.try_get("id_sensor")?;
+    let id_sensor: u32 = row.try_get("id_sensor")?;
     let extras = collect_extras(row);
 
     Ok(Sensor {

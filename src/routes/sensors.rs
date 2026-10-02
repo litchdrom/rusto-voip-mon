@@ -64,7 +64,7 @@ pub struct SensorListRow {
 pub struct SensorFormTemplate {
     pub user: Option<SessionUser>,
     pub mode: FormMode,
-    pub id_sensor: u16,
+    pub id_sensor: u32,
     pub name: String,
     pub host: String,
     pub port: String,
@@ -86,7 +86,7 @@ pub enum FormMode {
 }
 
 impl FormMode {
-    fn action_path(&self, id_sensor: &u16) -> String {
+    fn action_path(&self, id_sensor: &u32) -> String {
         match self {
             FormMode::New => "/admin/sensors/new".into(),
             FormMode::Edit => format!("/admin/sensors/{id_sensor}/edit"),
@@ -158,7 +158,7 @@ pub async fn list(
     let rows: Vec<SensorListRow> = sensors
         .into_iter()
         .map(|s| {
-            let cdr_count = *cdr_counts.get(&(s.id_sensor as i32)).unwrap_or(&0);
+            let cdr_count = *cdr_counts.get(&s.id_sensor).unwrap_or(&0);
             SensorListRow { sensor: s, cdr_count }
         })
         .collect();
@@ -253,7 +253,7 @@ pub async fn create(
 pub async fn edit_form(
     State(state): State<AppState>,
     user: SessionUser,
-    Path(id_sensor): Path<u16>,
+    Path(id_sensor): Path<u32>,
 ) -> AppResult<Response> {
     require_admin(&user)?;
     let sensor = sensors::get_by_id_sensor(&state.pool, id_sensor)
@@ -280,7 +280,7 @@ pub async fn edit_form(
 pub async fn update(
     State(state): State<AppState>,
     user: SessionUser,
-    Path(id_sensor): Path<u16>,
+    Path(id_sensor): Path<u32>,
     Form(body): Form<SensorFormBody>,
 ) -> AppResult<Response> {
     require_admin(&user)?;
@@ -316,7 +316,7 @@ pub async fn update(
 pub async fn delete(
     State(state): State<AppState>,
     user: SessionUser,
-    Path(id_sensor): Path<u16>,
+    Path(id_sensor): Path<u32>,
 ) -> AppResult<Response> {
     require_admin(&user)?;
     let affected = sensors::delete(&state.pool, id_sensor).await?;
@@ -364,7 +364,17 @@ fn render<T: Template>(tmpl: T) -> AppResult<Response> {
 /// Returned as `id_sensor → count` so the list view can do an
 /// in-memory lookup per row. Limited to the last 7 days of traffic
 /// so a sensor that's been silent for a month doesn't dominate.
-async fn count_cdrs_by_sensor(pool: &sqlx::MySqlPool) -> AppResult<std::collections::HashMap<i32, i64>> {
+///
+/// ## Why the cast from u16 → u32 here
+///
+/// `cdr.id_sensor` is `SMALLINT UNSIGNED` (VoIPmonitor assigns probe
+/// IDs from a tight range), but `sensors.id_sensor` is `INT UNSIGNED`
+/// (the parent table reserves a wider type for future-proofing). We
+/// join the two on `id_sensor` so the in-memory map needs the wider
+/// type to match `Sensor.id_sensor`. A u16 value > u16::MAX from the
+/// cdr column can't happen in practice — VoIPmonitor caps at 65535
+/// — but the `unwrap_or` keeps the join defensive anyway.
+async fn count_cdrs_by_sensor(pool: &sqlx::MySqlPool) -> AppResult<std::collections::HashMap<u32, i64>> {
     let rows = sqlx::query(
         "SELECT id_sensor, COUNT(*) AS n FROM cdr \
           WHERE calldate >= (NOW() - INTERVAL 7 DAY) \
@@ -375,9 +385,9 @@ async fn count_cdrs_by_sensor(pool: &sqlx::MySqlPool) -> AppResult<std::collecti
     .await?;
     let mut out = std::collections::HashMap::with_capacity(rows.len());
     for r in rows {
-        let id: i32 = r.try_get("id_sensor")?;
+        let id_small: u16 = r.try_get("id_sensor")?;
         let n: i64 = r.try_get("n")?;
-        out.insert(id, n);
+        out.insert(u32::from(id_small), n);
     }
     Ok(out)
 }
@@ -406,12 +416,12 @@ async fn missing_id_sensors(pool: &sqlx::MySqlPool) -> AppResult<Vec<u16>> {
 
 /// Parse the `id_sensor` field from the new-sensor form. Accepts a
 /// leading/trailing whitespace tolerance for hand-typed inputs.
-fn parse_id_sensor(raw: Option<&str>) -> Result<u16, String> {
+fn parse_id_sensor(raw: Option<&str>) -> Result<u32, String> {
     let s = raw.unwrap_or("").trim();
     if s.is_empty() {
         return Err("id_sensor is required".into());
     }
-    s.parse::<u16>()
+    s.parse::<u32>()
         .map_err(|e| format!("id_sensor: {e}"))
 }
 
@@ -423,7 +433,7 @@ async fn render_form_with_error(
     state: &AppState,
     user: SessionUser,
     mode: FormMode,
-    id_sensor: u16,
+    id_sensor: u32,
     body: &SensorFormBody,
     error: String,
 ) -> AppResult<Response> {

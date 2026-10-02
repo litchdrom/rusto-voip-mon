@@ -21,7 +21,7 @@
     <label>
       <span>id_sensor <em class="muted">(matches cdr.id_sensor; required on new)</em></span>
       {% if mode == FormMode::New %}
-        <input type="number" name="id_sensor" min="1" max="65535" required
+        <input type="number" name="id_sensor" min="1" max="4294967295" required
                value="{{ id_sensor }}" placeholder="e.g. 2">
         {% if !missing_id_sensors.is_empty() %}
         <small class="muted">
