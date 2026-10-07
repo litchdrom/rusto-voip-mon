@@ -85,25 +85,30 @@ pub struct DistinctItem {
 impl DistinctView {
     fn from(
         d: cdr::DistinctValues,
-        selected_src_ips: &[u32],
-        selected_dst_ips: &[u32],
+        selected_src_ips: &[String],
+        selected_dst_ips: &[String],
         selected_sip_codes: &[u16],
         selected_sensor_ids: &[u16],
     ) -> Self {
+        // The selected-set comparison is by textual IP representation
+        // (`"1.2.3.4"` or `"2001:db8::1"`) so the same string the
+        // filter form submits matches the rendered distinct chip
+        // regardless of which storage shape (legacy INT UNSIGNED vs
+        // post-ipv6 VARBINARY) the DB has.
         let src_ips: Vec<DistinctItem> = d
             .src_ips
             .iter()
-            .map(|&v| DistinctItem {
-                value: cdr::int_to_ipv4(v),
-                is_checked: selected_src_ips.contains(&v),
+            .map(|v| DistinctItem {
+                value: v.to_dotted_decimal(),
+                is_checked: selected_src_ips.contains(&v.to_dotted_decimal()),
             })
             .collect();
         let dst_ips: Vec<DistinctItem> = d
             .dst_ips
             .iter()
-            .map(|&v| DistinctItem {
-                value: cdr::int_to_ipv4(v),
-                is_checked: selected_dst_ips.contains(&v),
+            .map(|v| DistinctItem {
+                value: v.to_dotted_decimal(),
+                is_checked: selected_dst_ips.contains(&v.to_dotted_decimal()),
             })
             .collect();
         let sip_codes: Vec<DistinctItem> = d
@@ -298,7 +303,10 @@ pub async fn cdr_list(
     // Fetch the rows + distinct values for the dropdowns in parallel,
     // each capped at `timeout` so a slow scan doesn't lock up the page.
     let (page_result, distinct_result) = tokio::join!(
-        crate::error::with_query_timeout(timeout, cdr::list(&state.pool, &normalized)),
+        crate::error::with_query_timeout(
+            timeout,
+            cdr::list(&state.pool, &normalized, *state.ip_shape),
+        ),
         crate::error::with_query_timeout(timeout, cdr::distinct_values(&state.pool, 7, 100, tz)),
     );
     let page = page_result?;
@@ -452,7 +460,7 @@ pub async fn cdr_detail(
         crate::error::with_query_timeout(timeout, cdr::fetch_cdr_branches(&state.pool, id)),
         crate::error::with_query_timeout(
             timeout,
-            cdr::fetch_sip_messages(&state.pool, id, sipcallerip, 500),
+            cdr::fetch_sip_messages(&state.pool, id, sipcallerip, 500, *state.ip_shape),
         ),
     );
     let next = next?;
@@ -504,11 +512,15 @@ pub async fn cdr_detail(
     // `parse_sip_messages_from_pcap` doesn't know the CDR's caller IP
     // (it's outside the cdr module), so we set direction here based
     // on the message's source IP matching the CDR's sipcallerip.
+    //
+    // Both sides are `IpAddr` now; compare by their canonical textual
+    // representation so the dual-shape storage (legacy INT UNSIGNED
+    // vs post-ipv6 VARBINARY) doesn't matter at the comparison site.
     if let Some(marker) = sipcallerip {
+        let marker_str = marker.to_dotted_decimal();
         for m in sip_messages.iter_mut() {
             if m.direction.is_empty() {
-                let src_int = cdr::ipv4_to_int(&m.src_ip_str);
-                m.direction = if src_int == Some(marker) {
+                m.direction = if m.src_ip_str == marker_str {
                     "out".to_string()
                 } else {
                     "in".to_string()
@@ -711,9 +723,22 @@ pub async fn rtp_chart_json(
     // Direction split: a packet belongs to A→B when its
     // source IP matches the CDR's sipcallerip (the A leg in
     // VoIPmonitor's convention), otherwise B→A.
+    //
+    // Both sides are now `IpAddr` (handles legacy `INT UNSIGNED` and
+    // post-ipv6-alter `VARBINARY(16)` from the same code). Compare
+    // by canonical textual form so the dual shape doesn't matter
+    // at this site.
     let packets = cdr::rtp_pcap::parse_rtp_packets_from_pcap(&pcap_bytes);
-    let caller_ip_str = row.sipcallerip.map(cdr::int_to_ipv4);
-    let called_ip_str = row.sipcalledip.map(cdr::int_to_ipv4);
+    let caller_ip_str = row
+        .sipcallerip
+        .as_ref()
+        .filter(|ip| !ip.is_unspecified_v4() && !ip.is_unspecified_v6())
+        .map(|ip| ip.to_dotted_decimal());
+    let called_ip_str = row
+        .sipcalledip
+        .as_ref()
+        .filter(|ip| !ip.is_unspecified_v4() && !ip.is_unspecified_v6())
+        .map(|ip| ip.to_dotted_decimal());
     let caller_ip: Option<std::net::IpAddr> = caller_ip_str
         .as_deref()
         .and_then(|s| s.parse().ok());
@@ -1820,7 +1845,7 @@ pub async fn cdr_export_csv(
     // seconds, we 504 and drop the channel. Once rows start flowing, the
     // stream runs as long as needed (a 100k-row export shouldn't trip a
     // 30s cap).
-    let mut row_stream = cdr::list_stream(&state.pool, &normalized, cap);
+    let mut row_stream = cdr::list_stream(&state.pool, &normalized, cap, *state.ip_shape);
 
     // Channel of formatted CSV byte chunks for the HTTP response.
     let (csv_tx, csv_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
@@ -1928,7 +1953,7 @@ pub async fn cdr_export_csv_batch(
         out
     } else if let Some(filter) = req.filter.as_deref() {
         let tz = state.tz_default();
-        cdr::ids_for_query_string(&state.pool, filter, tz, CSV_BATCH_MAX).await?
+        cdr::ids_for_query_string(&state.pool, filter, tz, CSV_BATCH_MAX, *state.ip_shape).await?
     } else {
         return Err(AppError::BadRequest(
             "either `ids` or `filter` must be provided".into(),

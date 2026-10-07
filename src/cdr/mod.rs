@@ -17,8 +17,12 @@ use sqlx::{FromRow, MySqlPool, Row};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::db::IpColumnShape;
+pub mod ip;
 pub mod rtp_pcap;
 pub mod sip_pcap;
+
+pub use ip::IpAddr;
 
 /// Per-leg RTP stats from the `cdr` table. A leg = "caller side"
 /// (`a_*` columns) or "callee side" (`b_*` columns).
@@ -127,8 +131,13 @@ pub struct CdrRow {
     pub caller: Option<String>,
     pub callername: Option<String>,
     pub called: Option<String>,
-    pub sipcallerip: Option<u32>,
-    pub sipcalledip: Option<u32>,
+    /// SIP-signalling caller IP. `IpAddr` decodes both the legacy
+    /// `INT UNSIGNED` shape and the post-ipv6-alter `VARBINARY(16)`
+    /// shape — see `cdr::ip::IpAddr::decode` for the dispatch.
+    pub sipcallerip: Option<IpAddr>,
+    /// SIP-signalling callee IP. Same dual-shape handling as
+    /// `sipcallerip`.
+    pub sipcalledip: Option<IpAddr>,
     pub last_sip_response_num: Option<u16>,
     pub mos_min_mult10: Option<u8>,
     pub a_lost: Option<u32>,
@@ -164,10 +173,10 @@ pub struct CdrRow {
     /// Stored as `a_saddr` in cdr; we render it as a dotted-quad in
     /// the RTP panel so the analyst can see at a glance which leg
     /// corresponds to which endpoint IP.
-    pub a_saddr: Option<u32>,
+    pub a_saddr: Option<IpAddr>,
     /// Source IP of leg B (the callee's side). Same purpose as
     /// `a_saddr` but for the B leg.
-    pub b_saddr: Option<u32>,
+    pub b_saddr: Option<IpAddr>,
 }
 
 /// All `cdr` columns that `CdrRow` expects via `FromRow`. Every
@@ -335,16 +344,25 @@ impl From<CdrRow> for CdrSummary {
             .map(|m| format!("{:.1}", m as f32 / 10.0))
             .unwrap_or_default();
         // SIP-signalling endpoints (used by the SIP flow table).
-        let src_ip_str = row.sipcallerip.map(int_to_ipv4).unwrap_or_default();
-        let dst_ip_str = row.sipcalledip.map(int_to_ipv4).unwrap_or_default();
+        // `IpAddr::Display` renders both V4 (`"1.2.3.4"`) and V6
+        // (`"2001:db8::1"`) — see `cdr::ip::IpAddr`. The unspecified
+        // address (0.0.0.0 or ::) renders to an empty string instead
+        // of `"0.0.0.0"`, matching the prior behaviour.
+        let ip_to_str = |ip: Option<IpAddr>| -> String {
+            ip.filter(|ip| !ip.is_unspecified_v4() && !ip.is_unspecified_v6())
+                .map(|ip| ip.to_dotted_decimal())
+                .unwrap_or_default()
+        };
+        let src_ip_str = ip_to_str(row.sipcallerip);
+        let dst_ip_str = ip_to_str(row.sipcalledip);
         // RTP-level endpoints: a_saddr is the host that sent RTP to
         // us in the caller direction; b_saddr is the host that sent
         // RTP to us in the callee direction. They can differ from the
         // SIP endpoints when the call is behind a media relay
         // (RTPEngine, SBC). Pre-format both legs so the template can
         // show "from X.X.X.X → Y.Y.Y.Y" without re-encoding.
-        let a_saddr_str = row.a_saddr.map(int_to_ipv4).unwrap_or_default();
-        let b_saddr_str = row.b_saddr.map(int_to_ipv4).unwrap_or_default();
+        let a_saddr_str = ip_to_str(row.a_saddr);
+        let b_saddr_str = ip_to_str(row.b_saddr);
         let rtp_a = RtpLeg {
             mos_lqo_mult10: row.a_mos_lqo_mult10,
             lost: row.a_lost,
@@ -574,7 +592,7 @@ mod in_clause_tests {
             vec!["alice".into(), "bob".into(), "carol".into()],
             vec![],
         )
-        .to_where();
+        .to_where(IpColumnShape::LegacyInt);
         assert_eq!(sql, "WHERE caller IN (?,?,?)");
         let got: Vec<String> = binds
             .into_iter()
@@ -592,7 +610,7 @@ mod in_clause_tests {
             vec![],
             vec![491234567, 491234568],
         )
-        .to_where();
+        .to_where(IpColumnShape::LegacyInt);
         assert_eq!(sql, "WHERE called IN (?,?)");
         let got: Vec<String> = binds
             .into_iter()
@@ -606,7 +624,7 @@ mod in_clause_tests {
 
     #[test]
     fn empty_in_lists_add_no_clause() {
-        let (sql, binds) = f(vec![], vec![]).to_where();
+        let (sql, binds) = f(vec![], vec![]).to_where(IpColumnShape::LegacyInt);
         assert_eq!(sql, "");
         assert!(binds.is_empty());
     }
@@ -615,11 +633,69 @@ mod in_clause_tests {
     fn caller_substring_and_in_list_are_anded() {
         let mut f = f(vec!["alice".into(), "bob".into()], vec![]);
         f.caller = Some("a".into());
-        let (sql, _) = f.to_where();
-        // Substring LIKE first, then IN, joined with AND. Order matters
-        // because callers may write tools that grep on the SQL string —
+        let (sql, _) = f.to_where(IpColumnShape::LegacyInt);
         // keep the existing LIKE clause position.
         assert_eq!(sql, "WHERE caller LIKE ? AND caller IN (?,?)");
+    }
+
+    /// Regression for the legacy `INT UNSIGNED` shape: the WHERE
+    /// clause wraps each IP placeholder with `INET_ATON(?)` (not
+    /// `INET6_ATON`) because the column can't store IPv6.
+    #[test]
+    fn src_ips_use_inet_aton_for_legacy_shape() {
+        let mut f = f(vec![], vec![]);
+        f.src_ips = vec!["1.2.3.4".into(), "5.6.7.8".into()];
+        let (sql, binds) = f.to_where(IpColumnShape::LegacyInt);
+        assert_eq!(sql, "WHERE sipcallerip IN (INET_ATON(?),INET_ATON(?))");
+        let got: Vec<String> = binds
+            .into_iter()
+            .map(|b| match b {
+                FilterBind::Str(s) => s,
+                _ => panic!("expected Str bind for IP filter"),
+            })
+            .collect();
+        assert_eq!(got, vec!["1.2.3.4", "5.6.7.8"]);
+    }
+
+    /// Regression for the post-ipv6-alter `VARBINARY(16)` shape: the
+    /// WHERE clause wraps each IP placeholder with `INET6_ATON(?)`
+    /// (not `INET_ATON`) because `INET_ATON` returns a u32 and won't
+    /// compare against `VARBINARY(16)`. `INET6_ATON` accepts both
+    /// dotted-quad and IPv6 strings.
+    #[test]
+    fn src_ips_use_inet6_aton_for_varbinary_shape() {
+        let mut f = f(vec![], vec![]);
+        f.src_ips = vec!["1.2.3.4".into(), "2001:db8::1".into()];
+        let (sql, binds) = f.to_where(IpColumnShape::Varbinary);
+        assert_eq!(
+            sql,
+            "WHERE sipcallerip IN (INET6_ATON(?),INET6_ATON(?))"
+        );
+        let got: Vec<String> = binds
+            .into_iter()
+            .map(|b| match b {
+                FilterBind::Str(s) => s,
+                _ => panic!("expected Str bind for IP filter"),
+            })
+            .collect();
+        assert_eq!(got, vec!["1.2.3.4", "2001:db8::1"]);
+    }
+
+    /// Both legs of an IP filter use the same function — no
+    /// mismatched-shape failure where `sipcallerip` uses one
+    /// function and `sipcalledip` uses the other.
+    #[test]
+    fn src_and_dst_ips_use_same_inet_function() {
+        let mut f = f(vec![], vec![]);
+        f.src_ips = vec!["1.2.3.4".into()];
+        f.dst_ips = vec!["5.6.7.8".into()];
+        let (sql, _) = f.to_where(IpColumnShape::Varbinary);
+        assert!(sql.contains("sipcallerip IN (INET6_ATON(?)"));
+        assert!(sql.contains("sipcalledip IN (INET6_ATON(?)"));
+        // And vice versa for legacy.
+        let (sql, _) = f.to_where(IpColumnShape::LegacyInt);
+        assert!(sql.contains("sipcallerip IN (INET_ATON(?)"));
+        assert!(sql.contains("sipcalledip IN (INET_ATON(?)"));
     }
 }
 
@@ -637,8 +713,16 @@ pub struct NormalizedFilters {
     /// (not, say, a SIP URI) and lets us dedupe cheaply. We stringify
     /// on bind because the column type is VARCHAR.
     pub called_in: Vec<u64>,
-    pub src_ips: Vec<u32>,
-    pub dst_ips: Vec<u32>,
+    /// Caller-side IPs as raw strings (e.g. `"1.2.3.4"` or `"2001:db8::1"`).
+    /// Stored as strings so the same `WHERE sipcallerip IN (INET*_ATON(?), ...)`
+    /// shape works against either legacy `INT UNSIGNED` (via `INET_ATON`)
+    /// or post-ipv6-alter `VARBINARY(16)` (via `INET6_ATON`) — both
+    /// functions accept dotted-quad strings and INET6_ATON additionally
+    /// accepts IPv6. The actual conversion is selected at `to_where()`
+    /// time via the cached `IpColumnShape` on `AppState`.
+    pub src_ips: Vec<String>,
+    /// Same idea as `src_ips`, for the callee side.
+    pub dst_ips: Vec<String>,
     pub sip_codes: Vec<u16>,
     pub sensor_ids: Vec<u16>,
     pub mos_min_mult10: Option<u16>,
@@ -655,7 +739,13 @@ impl NormalizedFilters {
     }
 
     /// Build the WHERE-clause SQL fragment + matching bind values.
-    pub fn to_where(&self) -> (String, Vec<FilterBind>) {
+    ///
+    /// `ip_shape` is passed in (rather than read from `AppState`)
+    /// so this function stays pure — easy to unit-test, no global
+    /// state. The caller is responsible for plumbing the cached
+    /// shape through.
+    pub fn to_where(&self, ip_shape: IpColumnShape) -> (String, Vec<FilterBind>) {
+        let shape = ip_shape;
         let mut parts: Vec<String> = Vec::new();
         let mut binds: Vec<FilterBind> = Vec::new();
 
@@ -694,21 +784,32 @@ impl NormalizedFilters {
             }
         }
         if !self.src_ips.is_empty() {
-            parts.push(format!(
-                "sipcallerip IN ({})",
-                placeholders(self.src_ips.len())
-            ));
+            // Wrap each placeholder with the right INET_*_ATON
+            // function for the live column shape:
+            //   * LegacyInt → INET_ATON(?)       (dotted-quad only)
+            //   * Varbinary → INET6_ATON(?)      (dotted-quad OR IPv6)
+            // The bind values themselves are strings (parsed IP
+            // entries from the form), so the SQL function does the
+            // conversion at execute time.
+            let fn_name = shape.inet_function();
+            let expr = (0..self.src_ips.len())
+                .map(|_| format!("{}(?)", fn_name))
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!("sipcallerip IN ({expr})"));
             for v in &self.src_ips {
-                binds.push(FilterBind::U32(*v));
+                binds.push(FilterBind::Str(v.clone()));
             }
         }
         if !self.dst_ips.is_empty() {
-            parts.push(format!(
-                "sipcalledip IN ({})",
-                placeholders(self.dst_ips.len())
-            ));
+            let fn_name = shape.inet_function();
+            let expr = (0..self.dst_ips.len())
+                .map(|_| format!("{}(?)", fn_name))
+                .collect::<Vec<_>>()
+                .join(",");
+            parts.push(format!("sipcalledip IN ({expr})"));
             for v in &self.dst_ips {
-                binds.push(FilterBind::U32(*v));
+                binds.push(FilterBind::Str(v.clone()));
             }
         }
         if !self.sip_codes.is_empty() {
@@ -769,14 +870,21 @@ fn placeholders(n: usize) -> String {
         .join(",")
 }
 
-/// Parse a comma-separated list of IPv4 strings, dropping invalid/empty
-/// entries. Returns an empty Vec when no valid IPs are present.
-fn parse_ip_list(s: Option<&str>) -> Vec<u32> {
+/// Parse a comma-separated list of IP strings (IPv4 or IPv6), dropping
+/// invalid/empty entries. Returns an empty Vec when no valid IPs are
+/// present. Strings pass through verbatim — the actual conversion to
+/// the column's native type happens in SQL via `INET_ATON(?)` or
+/// `INET6_ATON(?)`, picked at `to_where()` time based on
+/// `IpColumnShape`. We accept any non-empty token here; the SQL
+/// function will reject malformed IPs at query time (which is
+/// exactly the right place — we want the filter chip to error
+/// visibly, not to silently drop the user's typed value).
+fn parse_ip_list(s: Option<&str>) -> Vec<String> {
     let Some(s) = s else { return Vec::new() };
     s.split(',')
         .map(str::trim)
         .filter(|p| !p.is_empty())
-        .filter_map(ipv4_to_int)
+        .map(String::from)
         .collect()
 }
 
@@ -800,8 +908,19 @@ pub struct CdrPage {
 
 /// Fetch a single page of CDRs. We over-fetch by one row beyond the page
 /// size to cheaply detect "there's a next page" without a separate COUNT.
-pub async fn list(pool: &MySqlPool, f: &NormalizedFilters) -> Result<CdrPage, sqlx::Error> {
-    let (where_sql, binds) = f.to_where();
+///
+/// `ip_shape` is the cached `IpColumnShape` from `AppState`. Used by
+/// `to_where()` to pick `INET_ATON(?)` vs `INET6_ATON(?)` for the
+/// `sipcallerip` / `sipcalledip` filters. Pass through the live
+/// shape every time the app boots (or every request, if you prefer)
+/// — we don't cache per-request because the schema doesn't change
+/// mid-process.
+pub async fn list(
+    pool: &MySqlPool,
+    f: &NormalizedFilters,
+    ip_shape: IpColumnShape,
+) -> Result<CdrPage, sqlx::Error> {
+    let (where_sql, binds) = f.to_where(ip_shape);
     let limit = f.page_size + 1;
     // Use the shared `CDR_FULL_SELECT_COLUMNS` so `query_as::<CdrRow>`
     // never trips `ColumnNotFound` when the struct gains a field.
@@ -842,8 +961,9 @@ pub fn list_stream(
     pool: &MySqlPool,
     f: &NormalizedFilters,
     limit: usize,
+    ip_shape: IpColumnShape,
 ) -> ReceiverStream<Result<CdrRow, sqlx::Error>> {
-    let (where_sql, binds) = f.to_where();
+    let (where_sql, binds) = f.to_where(ip_shape);
     // Shared with `list` — keeps `query_as::<CdrRow>` satisfied even
     // after the struct gains columns.
     let sql = format!(
@@ -884,8 +1004,9 @@ pub async fn list_ids_matching(
     pool: &MySqlPool,
     f: &NormalizedFilters,
     limit: usize,
+    ip_shape: IpColumnShape,
 ) -> Result<Vec<u64>, sqlx::Error> {
-    let (where_sql, binds) = f.to_where();
+    let (where_sql, binds) = f.to_where(ip_shape);
     let sql = format!(
         "SELECT ID FROM cdr {where_sql} \
          ORDER BY calldate DESC, ID DESC \
@@ -961,6 +1082,7 @@ pub async fn ids_for_query_string(
     raw_query: &str,
     tz: chrono::FixedOffset,
     limit: usize,
+    ip_shape: IpColumnShape,
 ) -> Result<Vec<u64>, crate::error::AppError> {
     let params = crate::routes::cdr::parse_query_params(raw_query);
     let q = crate::routes::cdr::SingleParams {
@@ -977,7 +1099,7 @@ pub async fn ids_for_query_string(
     };
     let filters = crate::routes::cdr::build_filters(&q, &params);
     let normalized = filters.normalized(tz);
-    crate::error::with_query_timeout(0, list_ids_matching(pool, &normalized, limit))
+    crate::error::with_query_timeout(0, list_ids_matching(pool, &normalized, limit, ip_shape))
         .await
         .map_err(crate::error::AppError::from)
 }
@@ -1217,8 +1339,9 @@ pub fn parse_cseq(body: &str) -> Option<(u32, String)> {
 pub async fn fetch_sip_messages(
     pool: &MySqlPool,
     cdr_id: u64,
-    direction_marker_ip: Option<u32>,
+    direction_marker_ip: Option<IpAddr>,
     limit: u32,
+    ip_column_shape: IpColumnShape,
 ) -> Result<Vec<SipMessage>, sqlx::Error> {
     use sqlx::Row;
     // Load the CDR's anchor fields first — calldate/callend/caller/
@@ -1275,19 +1398,32 @@ pub async fn fetch_sip_messages(
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
-        let src_ip_int: Option<u32> = row.try_get("ip_src").ok().flatten();
-        let dst_ip_int: Option<u32> = row.try_get("ip_dst").ok().flatten();
-        let src_ip_str = src_ip_int
-            .map(int_to_ipv4)
+        // Decode ip_src / ip_dst as `IpAddr` so the same code works
+        // against legacy `INT UNSIGNED` AND post-ipv6-alter
+        // `VARBINARY(16)`. The Decode impl inspects the column type
+        // tag at runtime. Unspecified addresses (0.0.0.0 / ::) are
+        // skipped so the template renders an empty string instead
+        // of `"0.0.0.0"`.
+        let src_ip = ip::IpAddr::from_row(&row, "ip_src", ip_column_shape).ok().flatten();
+        let dst_ip = ip::IpAddr::from_row(&row, "ip_dst", ip_column_shape).ok().flatten();
+        let src_ip_str = src_ip
+            .as_ref()
+            .filter(|ip| !ip.is_unspecified_v4() && !ip.is_unspecified_v6())
+            .map(|ip| ip.to_dotted_decimal())
             .unwrap_or_default();
-        let dst_ip_str = dst_ip_int
-            .map(int_to_ipv4)
+        let dst_ip_str = dst_ip
+            .as_ref()
+            .filter(|ip| !ip.is_unspecified_v4() && !ip.is_unspecified_v6())
+            .map(|ip| ip.to_dotted_decimal())
             .unwrap_or_default();
         // Direction heuristic: a request is "out" if the sensor's
         // known direction-marker IP (the CDR's `sipcallerip`) is the
         // source of THIS message. Falls back to "in" if we have no
         // marker — better than guessing wrong with empty data.
-        let direction = match (direction_marker_ip, src_ip_int) {
+        // Compare by string representation so the dual-shape IP
+        // values (V4 u32 OR V4/V6 bytes) match without needing
+        // shape-aware equality.
+        let direction = match (direction_marker_ip, src_ip) {
             (Some(marker), Some(src)) if src == marker => "out".to_string(),
             _ => "in".to_string(),
         };
@@ -1526,12 +1662,17 @@ mod sip_parse_tests {
 /// Distinct values from the last N days, used to populate the filter
 /// `<datalist>` pickers so users can choose from observed values OR type
 /// custom ones (the text input + datalist combo).
+///
+/// `src_ips` / `dst_ips` are `Vec<IpAddr>` so the same struct works
+/// against both legacy `INT UNSIGNED` and post-ipv6-alter
+/// `VARBINARY(16)` — the `IpAddr::decode` impl inspects the column
+/// type tag and dispatches accordingly.
 #[derive(Debug, Clone)]
 pub struct DistinctValues {
     pub sip_codes: Vec<u16>,
     pub sensor_ids: Vec<u16>,
-    pub src_ips: Vec<u32>,
-    pub dst_ips: Vec<u32>,
+    pub src_ips: Vec<IpAddr>,
+    pub dst_ips: Vec<IpAddr>,
 }
 
 /// Returns up to `limit` distinct values per field, scoped to the last
@@ -1564,7 +1705,7 @@ pub async fn distinct_values(
     .fetch_all(pool)
     .await?;
 
-    let src_ips: Vec<u32> = sqlx::query_scalar(
+    let src_ips: Vec<IpAddr> = sqlx::query_scalar(
         "SELECT DISTINCT sipcallerip FROM cdr \
           WHERE calldate >= ? AND sipcallerip IS NOT NULL \
           ORDER BY sipcallerip DESC LIMIT ?",
@@ -1574,7 +1715,7 @@ pub async fn distinct_values(
     .fetch_all(pool)
     .await?;
 
-    let dst_ips: Vec<u32> = sqlx::query_scalar(
+    let dst_ips: Vec<IpAddr> = sqlx::query_scalar(
         "SELECT DISTINCT sipcalledip FROM cdr \
           WHERE calldate >= ? AND sipcalledip IS NOT NULL \
           ORDER BY sipcalledip DESC LIMIT ?",
@@ -1594,7 +1735,8 @@ pub async fn distinct_values(
 
 /// Parse an IPv4 string ("1.2.3.4") into VoIPmonitor's int representation
 /// (host byte order). Returns None on invalid input.
-pub fn ipv4_to_int(ip: &str) -> Option<u32> {
+#[allow(dead_code)]
+pub(crate) fn ipv4_to_int_legacy(ip: &str) -> Option<u32> {
     let parts: Vec<&str> = ip.split('.').collect();
     if parts.len() != 4 {
         return None;
@@ -1607,16 +1749,6 @@ pub fn ipv4_to_int(ip: &str) -> Option<u32> {
         return None;
     }
     Some((a << 24) | (b << 16) | (c << 8) | d)
-}
-
-pub fn int_to_ipv4(n: u32) -> String {
-    format!(
-        "{}.{}.{}.{}",
-        (n >> 24) & 0xff,
-        (n >> 16) & 0xff,
-        (n >> 8) & 0xff,
-        n & 0xff
-    )
 }
 
 #[cfg(test)]
@@ -1812,8 +1944,8 @@ mod rtp_leg_tests {
             caller: Some("+1".into()),
             callername: None,
             called: Some("+2".into()),
-            sipcallerip: Some(0x0a00_0001), // 10.0.0.1
-            sipcalledip: Some(0x0a00_0002), // 10.0.0.2
+            sipcallerip: Some(IpAddr::V4(0x0a00_0001)), // 10.0.0.1
+            sipcalledip: Some(IpAddr::V4(0x0a00_0002)), // 10.0.0.2
             last_sip_response_num: Some(200),
             mos_min_mult10: None,
             a_lost: None,
@@ -1839,8 +1971,8 @@ mod rtp_leg_tests {
             b_payload: None,
             a_rtp_ptime: None,
             b_rtp_ptime: None,
-            a_saddr: Some(0x0a00_0001),
-            b_saddr: Some(0x0a00_0002),
+            a_saddr: Some(IpAddr::V4(0x0a00_0001)),
+            b_saddr: Some(IpAddr::V4(0x0a00_0002)),
         };
         let s = CdrSummary::from(row);
         // SIP-level IPs stay where they were.

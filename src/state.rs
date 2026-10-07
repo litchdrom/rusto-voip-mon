@@ -5,6 +5,7 @@ use sqlx::MySqlPool;
 use crate::auth::session::SessionUser;
 use crate::auth::token::TokenStore;
 use crate::config::Config;
+use crate::db::IpColumnShape;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -13,6 +14,10 @@ pub struct AppState {
     /// In-memory registry of API bearer tokens. See
     /// [`crate::auth::token`] for the design + lifetime notes.
     pub tokens: Arc<TokenStore>,
+    /// Cached at boot via [`crate::db::detect_ip_column_shape`].
+    /// Drives the read/write SQL for every IP-shaped column in
+    /// `cdr` / `sip_msg` — see `cdr::ip::IpAddr` for the Rust side.
+    pub ip_shape: Arc<IpColumnShape>,
 }
 
 impl AppState {

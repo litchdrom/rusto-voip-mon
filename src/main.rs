@@ -81,10 +81,17 @@ async fn main() -> anyhow::Result<()> {
     let pool = db::create_pool(&config.database_url).await?;
     tracing::info!("connected to MySQL");
 
+    // Detect IP column shape (legacy INT UNSIGNED vs post-ipv6-alter
+    // VARBINARY(16)). Cached on AppState and used by every IP-shaped
+    // query in cdr / sip_msg to pick the right SQL + Rust types.
+    let ip_shape = db::detect_ip_column_shape(&pool).await;
+    tracing::info!(?ip_shape, "ip column shape detected");
+
     let state = AppState {
         config: config.clone(),
         pool,
         tokens: std::sync::Arc::new(crate::auth::token::TokenStore::new()),
+        ip_shape: std::sync::Arc::new(ip_shape),
     };
 
     // Routes that require an authenticated session.
