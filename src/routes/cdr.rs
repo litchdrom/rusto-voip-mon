@@ -602,7 +602,12 @@ pub async fn cdr_detail(
   {sip_html}
 
   <p><a class="button" href="/pcap/{id}">Download PCAP</a></p>
-</main></body></html>"#,
+</main>
+<footer class="footer">
+  <img src="/static/img/logo.svg" alt="" class="footer-logo">
+  <span class="footer-text">rusto-voip-mon</span>
+</footer>
+</body></html>"#,
         id = cdr.id,
         calldate = cdr.calldate.format("%Y-%m-%d %H:%M:%S"),
         callend = cdr.callend.format("%Y-%m-%d %H:%M:%S"),

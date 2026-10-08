@@ -259,6 +259,31 @@ table.cdrs input[type="checkbox"] {
 }
 .login-card button[type=submit]:hover { background: var(--accent-hover); }
 
+/* Compact brand mark in the page footer. Smaller than the topbar
+   logo (28px) and the login hero (200px) so it reads as a quiet
+   signature rather than a focal point. Centered below the content
+   area on every page (logged in or not). */
+.footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  margin-top: 48px;
+  padding: 20px 24px 28px;
+  color: var(--fg-muted);
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+}
+.footer-logo {
+  height: 24px;
+  width: auto;
+  display: block;
+  opacity: 0.7;
+}
+.footer-text {
+  letter-spacing: 0.04em;
+}
+
 .day-label {
   font-weight: normal;
   font-size: 14px;
