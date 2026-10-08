@@ -202,9 +202,28 @@ table.cdrs input[type="checkbox"] {
   margin-bottom: 12px;
 }
 
+.login-hero {
+  /* Centered logo block above the login form. Pulls the brand out
+     of the topbar (where it sits at 28px) into a hero-sized mark
+     so the login screen reads as "an app you're signing into"
+     rather than "a tab you're in". */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  margin: 56px auto 0;
+}
+.login-logo {
+  /* Sized larger than the topbar logo (28px) so it reads as a
+     centered hero mark. Width-bound with a height-auto aspect
+     ratio so the SVG scales without distortion. */
+  width: 200px;
+  height: auto;
+  display: block;
+}
+
 .login-card {
   max-width: 360px;
-  margin: 80px auto;
+  margin: 32px auto 80px;
   background: var(--bg-elev);
   border: 1px solid var(--border);
   border-radius: var(--radius);
