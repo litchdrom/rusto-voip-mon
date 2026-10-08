@@ -481,8 +481,21 @@ impl CdrFilters {
             to,
             caller: self.caller.clone(),
             called: self.called.clone(),
-            caller_in: self.caller_in.clone(),
-            called_in: self.called_in.clone(),
+            // Comma-separated caller values (e.g. "145,165,167") route
+            // to the existing `caller IN (...)` path. The original
+            // typed value stays in `caller` so the filter form can
+            // re-render what the operator actually entered — but
+            // `to_where()` will only emit the IN clause in that
+            // case (a `caller LIKE '%145,165,167%'` substring would
+            // be a useless surprise). Same pattern for `called`.
+            caller_in: split_csv_string_list(self.caller.as_deref())
+                .into_iter()
+                .chain(self.caller_in.iter().cloned())
+                .collect(),
+            called_in: split_csv_u64_list(self.called.as_deref())
+                .into_iter()
+                .chain(self.called_in.iter().copied())
+                .collect(),
             src_ips: parse_ip_list(self.src_ip.as_deref()),
             dst_ips: parse_ip_list(self.dst_ip.as_deref()),
             sip_codes: parse_u16_list(self.sip_code.as_deref()),
@@ -630,12 +643,17 @@ mod in_clause_tests {
     }
 
     #[test]
-    fn caller_substring_and_in_list_are_anded() {
+    fn caller_in_takes_precedence_over_caller_substring() {
+        // When `caller_in` is non-empty, the `caller LIKE` branch is
+        // dropped. A comma-separated `caller` from the form is
+        // already routed into `caller_in` by `CdrFilters::normalized()`,
+        // so emitting both would be double-filtering and would
+        // also produce a useless `LIKE '%145,165,167%'` substring
+        // when the operator meant exact-match.
         let mut f = f(vec!["alice".into(), "bob".into()], vec![]);
         f.caller = Some("a".into());
         let (sql, _) = f.to_where(IpColumnShape::LegacyInt);
-        // keep the existing LIKE clause position.
-        assert_eq!(sql, "WHERE caller LIKE ? AND caller IN (?,?)");
+        assert_eq!(sql, "WHERE caller IN (?,?)");
     }
 
     /// Regression for the legacy `INT UNSIGNED` shape: the WHERE
@@ -697,6 +715,99 @@ mod in_clause_tests {
         assert!(sql.contains("sipcallerip IN (INET_ATON(?)"));
         assert!(sql.contains("sipcalledip IN (INET_ATON(?)"));
     }
+
+    /// Comma-separated caller input from the form (`?caller=145,165,167`)
+    /// is routed into `caller_in` by `CdrFilters::normalized()` and
+    /// emits a single `caller IN (...)` clause.
+    #[test]
+    fn comma_separated_caller_emits_in_clause() {
+        let mut raw = CdrFilters::default();
+        raw.caller = Some("145,165,167".into());
+        let normalized = raw.normalized(FixedOffset::east_opt(0).unwrap());
+        assert_eq!(normalized.caller_in, vec!["145", "165", "167"]);
+        // The original typed value stays in `caller` so the form can
+        // re-render it. The IN clause is what the SQL uses.
+        assert_eq!(normalized.caller.as_deref(), Some("145,165,167"));
+        // Hand-build the same NormalizedFilters the test cares about
+        // (skipping the today-window default that normalized() adds)
+        // so the SQL shape is unambiguous.
+        let mut nf = f(normalized.caller_in.clone(), vec![]);
+        nf.caller = normalized.caller.clone();
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt);
+        assert_eq!(sql, "WHERE caller IN (?,?,?)");
+        assert_eq!(binds.len(), 3);
+    }
+
+    /// Comma-separated called input is parsed as u64 (matches the
+    /// `Vec<u64>` shape of `called_in`) and emitted as `called IN (?,?)`.
+    #[test]
+    fn comma_separated_called_emits_in_clause() {
+        let mut raw = CdrFilters::default();
+        raw.called = Some("491234567, 491234568, 491234569".into());
+        let normalized = raw.normalized(FixedOffset::east_opt(0).unwrap());
+        assert_eq!(normalized.called_in, vec![491234567, 491234568, 491234569]);
+        let mut nf = f(vec![], normalized.called_in.clone());
+        nf.called = normalized.called.clone();
+        let (sql, _) = nf.to_where(IpColumnShape::LegacyInt);
+        assert_eq!(sql, "WHERE called IN (?,?,?)");
+    }
+
+    /// A single caller value (no comma) still goes through the LIKE
+    /// substring branch — preserves the existing
+    /// "contains…" behavior for fuzzy "show me anything with this
+    /// digit sequence" lookups.
+    #[test]
+    fn single_caller_value_still_uses_like() {
+        let mut raw = CdrFilters::default();
+        raw.caller = Some("145".into());
+        let normalized = raw.normalized(FixedOffset::east_opt(0).unwrap());
+        assert!(normalized.caller_in.is_empty());
+        let mut nf = f(vec![], vec![]);
+        nf.caller = normalized.caller.clone();
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt);
+        assert_eq!(sql, "WHERE caller LIKE ?");
+        let got: Vec<String> = binds
+            .into_iter()
+            .map(|b| match b {
+                FilterBind::Str(s) => s,
+                _ => panic!("expected Str bind for caller LIKE"),
+            })
+            .collect();
+        assert_eq!(got, vec!["%145%"]);
+    }
+
+    /// Non-numeric called values can't be parsed as u64, so they
+    /// fall back to the LIKE branch instead of breaking the whole
+    /// filter. (E.g. `called="sip:alice@example.com"` is a valid
+    /// shape if someone is debugging SIP URIs by hand.)
+    #[test]
+    fn non_numeric_called_falls_back_to_like() {
+        let mut raw = CdrFilters::default();
+        raw.called = Some("sip:alice@example.com,bob".into());
+        let normalized = raw.normalized(FixedOffset::east_opt(0).unwrap());
+        // u64 parse fails on the whole string when any entry is
+        // non-numeric, so called_in stays empty and the LIKE
+        // branch handles the comma-joined string. The operator
+        // gets a substring search instead of an error.
+        assert!(normalized.called_in.is_empty());
+        let mut nf = f(vec![], vec![]);
+        nf.called = normalized.called.clone();
+        let (sql, _) = nf.to_where(IpColumnShape::LegacyInt);
+        assert_eq!(sql, "WHERE called LIKE ?");
+    }
+
+    /// Comma-separated input with empty entries (",,,") and
+    /// duplicates ("145,145,165") is cleaned up: deduped, no
+    /// empty strings.
+    #[test]
+    fn csv_dedupes_and_drops_empty() {
+        let mut raw = CdrFilters::default();
+        raw.caller = Some("145, 145 ,, 165, 165".into());
+        raw.called = Some("1, 1, , 2".into());
+        let normalized = raw.normalized(FixedOffset::east_opt(0).unwrap());
+        assert_eq!(normalized.caller_in, vec!["145", "165"]);
+        assert_eq!(normalized.called_in, vec![1, 2]);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -757,14 +868,13 @@ impl NormalizedFilters {
             parts.push("calldate <= ?".into());
             binds.push(FilterBind::DateTime(to));
         }
-        if let Some(c) = &self.caller {
-            parts.push("caller LIKE ?".into());
-            binds.push(FilterBind::Str(format!("%{c}%")));
-        }
-        if let Some(c) = &self.called {
-            parts.push("called LIKE ?".into());
-            binds.push(FilterBind::Str(format!("%{c}%")));
-        }
+        // `caller` and `caller_in` are mutually exclusive: a
+        // comma-separated `caller` value gets routed into
+        // `caller_in` by `CdrFilters::normalized()` (so the
+        // operator gets the OR-of-exact-matches they asked for,
+        // not a useless `LIKE '%145,165,167%'` substring on the
+        // whole comma-joined string). Single-value `caller`
+        // without a comma still goes through the LIKE branch.
         if !self.caller_in.is_empty() {
             parts.push(format!(
                 "caller IN ({})",
@@ -772,6 +882,11 @@ impl NormalizedFilters {
             ));
             for v in &self.caller_in {
                 binds.push(FilterBind::Str(v.clone()));
+            }
+        } else if let Some(c) = &self.caller {
+            if !c.is_empty() {
+                parts.push("caller LIKE ?".into());
+                binds.push(FilterBind::Str(format!("%{c}%")));
             }
         }
         if !self.called_in.is_empty() {
@@ -781,6 +896,11 @@ impl NormalizedFilters {
             ));
             for v in &self.called_in {
                 binds.push(FilterBind::Str(v.to_string()));
+            }
+        } else if let Some(c) = &self.called {
+            if !c.is_empty() {
+                parts.push("called LIKE ?".into());
+                binds.push(FilterBind::Str(format!("%{c}%")));
             }
         }
         if !self.src_ips.is_empty() {
@@ -895,6 +1015,43 @@ fn parse_u16_list(s: Option<&str>) -> Vec<u16> {
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .filter_map(|p| p.parse::<u16>().ok())
+        .collect()
+}
+
+/// Split a single-value filter into a list for the `*_in` IN-clause
+/// path. Returns an empty Vec when the input doesn't contain a comma
+/// — the single-value case still goes through the `caller LIKE ?`
+/// branch in `to_where()`. Empty entries (",,") are dropped and
+/// duplicates are removed (preserving first-seen order).
+fn split_csv_string_list(s: Option<&str>) -> Vec<String> {
+    let Some(s) = s else { return Vec::new() };
+    if !s.contains(',') {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter(|p| seen.insert(p.to_string()))
+        .map(String::from)
+        .collect()
+}
+
+/// Same as `split_csv_string_list` but parses each entry as a u64.
+/// Malformed entries are silently dropped — `caller="sip:alice"`
+/// for example falls back to the LIKE branch instead of failing
+/// the whole filter.
+fn split_csv_u64_list(s: Option<&str>) -> Vec<u64> {
+    let Some(s) = s else { return Vec::new() };
+    if !s.contains(',') {
+        return Vec::new();
+    }
+    let mut seen = std::collections::HashSet::new();
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .filter_map(|p| p.parse::<u64>().ok())
+        .filter(|&n| seen.insert(n))
         .collect()
 }
 
