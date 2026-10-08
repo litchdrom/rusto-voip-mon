@@ -1,14 +1,17 @@
 {% extends "base.html" %}
 {% block title %}CDR list · rusto-voip-mon{% endblock %}
 {% block topbar_tools %}
-  {# Timezone override. Submits to POST /tz, which re-encodes the session
-     cookie and bounces back here so the new TZ sticks across navigation.
-     The onchange="this.form.submit()" handles auto-submit without
-     relying on an external listener; the <noscript> button covers
-     environments where JS is disabled. #}
+  {# Timezone override. The dropdown is wired to a JS handler in the
+     {% block scripts %} block below: changing the TZ issues a fetch
+     POST to /tz that updates the session cookie in place. No page
+     reload, no search re-run, filters preserved. The Set-Cookie
+     header is still applied so the new TZ sticks for subsequent
+     navigations. The <noscript> button falls back to a regular form
+     submit (which does redirect + re-run the search, but at least
+     the JS-disabled path is covered). #}
   <form method="post" action="/tz" class="tz-form" id="tz-form">
     <label for="tz-select" class="muted small">TZ</label>
-    <select name="tz_offset_hours" id="tz-select" onchange="this.form.submit()">
+    <select name="tz_offset_hours" id="tz-select">
       {% for h in -12..=14 %}
         <option value="{{ h }}" {% if h == tz_offset_hours %}selected{% endif %}>
           {% if h == 0 %}UTC{% else if h > 0 %}UTC+{{ h }}{% else %}UTC{{ h }}{% endif %}
@@ -17,6 +20,7 @@
       {% endfor %}
     </select>
     <input type="hidden" name="next" value="" id="tz-next">
+    <span id="tz-status" class="tz-status" aria-live="polite"></span>
     <noscript><button type="submit">Apply</button></noscript>
   </form>
 {% endblock %}
@@ -35,12 +39,69 @@
 {% endblock %}
 {% block scripts %}
   <script>
-    // Pre-populate the TZ form's `next` hidden field with the current URL
-    // (path + query) so the server redirects back to where the user was,
-    // filters preserved. The onchange handler on the <select> itself does
-    // the auto-submit; this is just the URL capture.
-    document.querySelector('#tz-form #tz-next')?.setAttribute('value',
-      window.location.pathname + window.location.search);
+    (function() {
+      const select = document.getElementById('tz-select');
+      const form   = document.getElementById('tz-form');
+      const next   = document.getElementById('tz-next');
+      const status = document.getElementById('tz-status');
+      if (!select || !form) return;
+
+      // Pre-populate the `next` field so the <noscript> fallback
+      // also preserves the operator's URL. (The JS path doesn't
+      // submit the form, so this only matters when JS is disabled
+      // or the fetch fails.)
+      if (next && !next.value) {
+        next.value = window.location.pathname + window.location.search;
+      }
+
+      select.addEventListener('change', async function() {
+        const value = select.value;
+        const formData = new FormData();
+        formData.set('tz_offset_hours', value);
+        if (status) {
+          status.textContent = 'applying…';
+          status.className = 'tz-status tz-status-pending';
+        }
+        try {
+          const resp = await fetch('/tz', {
+            method: 'POST',
+            body: formData,
+            // The server still responds with a 303 See Other
+            // redirect; `redirect: 'manual'` keeps the browser
+            // from following it. The Set-Cookie header is still
+            // applied, so the new TZ sticks for subsequent
+            // navigations. We treat the opaque redirect response
+            // as success.
+            redirect: 'manual',
+            credentials: 'same-origin',
+          });
+          if (resp.type === 'opaqueredirect' || resp.ok) {
+            if (status) {
+              status.textContent = '✓ TZ saved — refresh to apply';
+              status.className = 'tz-status tz-status-ok';
+              setTimeout(() => {
+                if (status) {
+                  status.textContent = '';
+                  status.className = 'tz-status';
+                }
+              }, 2500);
+            }
+          } else {
+            throw new Error('server returned ' + resp.status);
+          }
+        } catch (e) {
+          // Fetch failed (network error, server error, or 4xx/5xx).
+          // Fall back to the form submit so the operator isn't
+          // stuck with a stale dropdown — this re-runs the search
+          // but at least the TZ is updated.
+          if (status) {
+            status.textContent = '× failed — retrying…';
+            status.className = 'tz-status tz-status-err';
+          }
+          form.submit();
+        }
+      });
+    })();
   </script>
 {% endblock %}
 {% block content %}

@@ -92,6 +92,21 @@ h2 { font-size: 18px; margin: 16px 0 12px; }
 .topbar .tz-form select:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 .topbar .tz-form label { font-size: 12px; }
 
+/* Status indicator next to the TZ dropdown. The handler in
+   cdr_list.html updates this on every change so the operator
+   sees whether the cookie write landed. Fades out after 2.5s. */
+.tz-status {
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  min-width: 0;
+  opacity: 0;
+  transition: opacity 0.2s ease-out;
+  white-space: nowrap;
+}
+.tz-status-pending { color: var(--fg-muted); opacity: 1; }
+.tz-status-ok      { color: #4ade80; opacity: 1; }
+.tz-status-err     { color: var(--danger); opacity: 1; }
+
 .link-button {
   background: none;
   border: none;
