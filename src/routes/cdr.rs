@@ -568,8 +568,8 @@ pub async fn cdr_detail(
 <html><head><meta charset="utf-8"><title>CDR #{id}</title>
 <link rel="stylesheet" href="/static/css/style.css"></head>
 <body><main class="content">
-  <h1>CDR #{id}</h1>
-  <p><a href="/">&larr; back to list</a></p>
+  <h1><img src="/static/img/logo.svg" alt="" class="page-logo">CDR #{id}</h1>
+  <p><a href="/" onclick="history.back(); return false;">&larr; back to list</a></p>
   <h2>Call</h2>
   <table class="cdrs">
     <tr><th>calldate</th><td>{calldate}</td></tr>

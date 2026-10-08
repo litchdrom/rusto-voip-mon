@@ -111,6 +111,17 @@ h2 { font-size: 18px; margin: 16px 0 12px; }
   margin-bottom: 16px;
 }
 
+/* Inline brand mark next to the page title on data-heavy screens
+   (CDR detail, sensor/user list, edit forms). Sits between the
+   topbar (28px) and the login hero (200px) so the brand presence
+   scales with the page weight without crowding the h1. */
+.page-logo {
+  height: 32px;
+  width: auto;
+  vertical-align: middle;
+  margin-right: 12px;
+}
+
 .button {
   background: var(--accent);
   color: #fff;
