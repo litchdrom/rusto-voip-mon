@@ -386,7 +386,7 @@ pub async fn cdr_list(
 
 pub async fn cdr_detail(
     State(state): State<AppState>,
-    _user: SessionUser,
+    user: SessionUser,
     axum::extract::Path(id): axum::extract::Path<u64>,
 ) -> AppResult<Response> {
     let timeout = state.config.query_timeout_secs;
@@ -567,7 +567,23 @@ pub async fn cdr_detail(
         r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>CDR #{id}</title>
 <link rel="stylesheet" href="/static/css/style.css"></head>
-<body><main class="content">
+<body>
+<nav class="topbar">
+  <div class="brand">
+    <a href="/">
+      <img src="/static/img/logo.svg" alt="rusto-voip-mon" class="brand-logo">
+      <span class="brand-text">rusto-voip-mon</span>
+    </a>
+  </div>
+  <div class="user">
+    {admin_link}
+    <span>{username}</span>
+    <form method="post" action="/logout" style="display:inline">
+      <button type="submit" class="link-button">Logout</button>
+    </form>
+  </div>
+</nav>
+<main class="content">
   <h1>CDR #{id}</h1>
   <p><a href="/" onclick="history.back(); return false;">&larr; back to list</a></p>
   <h2>Call</h2>
@@ -603,12 +619,14 @@ pub async fn cdr_detail(
 
   <p><a class="button" href="/pcap/{id}">Download PCAP</a></p>
 </main>
-<footer class="footer">
-  <img src="/static/img/logo.svg" alt="" class="footer-logo">
-  <span class="footer-text">rusto-voip-mon</span>
-</footer>
 </body></html>"#,
         id = cdr.id,
+        username = html_escape(&user.username),
+        admin_link = if user.is_admin {
+            r#"<a href="/admin/users" class="admin-link" title="Admin: manage users">admin</a>"#.to_string()
+        } else {
+            String::new()
+        },
         calldate = cdr.calldate.format("%Y-%m-%d %H:%M:%S"),
         callend = cdr.callend.format("%Y-%m-%d %H:%M:%S"),
         caller = cdr.caller.clone().unwrap_or_default(),

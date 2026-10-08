@@ -259,37 +259,6 @@ table.cdrs input[type="checkbox"] {
 }
 .login-card button[type=submit]:hover { background: var(--accent-hover); }
 
-/* Compact brand mark in the page footer. Smaller than the topbar
-   logo (28px) and the login hero (200px) so it reads as a quiet
-   signature rather than a focal point.
-
-   `position: sticky; bottom: 0` keeps the footer pinned to the
-   viewport bottom on long pages (CDR detail has a chart, sngrep
-   flow, and SIP timeline that scroll past the fold), so the brand
-   mark is always visible without having to scroll to the end of
-   the page. */
-.footer {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  gap: 10px;
-  margin-top: 48px;
-  padding: 16px 24px 20px;
-  color: var(--fg);
-  font-size: 12px;
-  letter-spacing: 0.04em;
-  background: var(--bg-elev);
-  border-top: 1px solid #3a4256;
-  position: sticky;
-  bottom: 0;
-  z-index: 10;
-}
-.footer-logo {
-  height: 24px;
-  width: auto;
-  display: block;
-}
-
 .day-label {
   font-weight: normal;
   font-size: 14px;
