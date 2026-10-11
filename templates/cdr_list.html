@@ -52,58 +52,28 @@
         next.value = window.location.pathname + window.location.search;
       }
 
-      select.addEventListener('change', async function() {
-        const value = select.value;
+      select.addEventListener('change', function() {
         if (status) {
           status.textContent = 'applying…';
           status.className = 'tz-status tz-status-pending';
         }
-        try {
-          // Use URLSearchParams (not FormData) so the body is
-          // `application/x-www-form-urlencoded` — that's what
-          // axum's `Form` extractor parses. FormData would send
-          // multipart, which the server silently rejects, leaving
-          // the cookie unset and the dropdown stuck on the old
-          // value.
-          const body = new URLSearchParams();
-          body.set('tz_offset_hours', value);
-          const resp = await fetch('/tz', {
-            method: 'POST',
-            body: body,
-            credentials: 'same-origin',
-            // `redirect: 'manual'` keeps fetch from following the
-            // 303; the Set-Cookie header is still applied, so
-            // the new TZ is saved. We then trigger a soft page
-            // reload (location.reload) so the dates render in
-            // the new TZ without losing the operator's URL /
-            // filters.
-            redirect: 'manual',
-          });
-          if (resp.type === 'opaqueredirect' || resp.ok) {
-            if (status) {
-              status.textContent = '✓ TZ applied';
-              status.className = 'tz-status tz-status-ok';
-            }
-            // Reload via location.reload so the page re-renders
-            // with the new TZ. The URL is unchanged so all
-            // filter params (caller, called, page, etc.) are
-            // preserved automatically. We use a microtask delay
-            // so the operator sees the "applied" indicator
-            // before the navigation kicks in.
-            setTimeout(() => { window.location.reload(); }, 250);
-          } else {
-            throw new Error('server returned ' + resp.status);
-          }
-        } catch (e) {
-          // Fetch failed (network error, server error, or 4xx/5xx).
-          // Fall back to the form submit so the operator isn't
-          // stuck with a stale dropdown.
-          if (status) {
-            status.textContent = '× failed — retrying…';
-            status.className = 'tz-status tz-status-err';
-          }
-          form.submit();
-        }
+        // Just submit the form. The browser handles the POST
+        // natively (urlencoded, follows the 303), the server
+        // sets the cookie, and the redirect lands back on the
+        // current URL — same filters, fresh dates in the new
+        // TZ. The 100ms delay is just enough to register the
+        // "applying…" indicator visually before the navigation
+        // kicks in.
+        //
+        // This is more reliable than a fetch() round-trip:
+        //   - no Content-Type mismatch with the server's
+        //     `Form<SetTzForm>` extractor,
+        //   - no opaque-redirect / Set-Cookie quirks,
+        //   - the page reload is the browser's job, not ours.
+        // The trade-off is a full page reload — which the
+        // operator already approved (re-running the search
+        // is fine for a TZ change).
+        setTimeout(function() { form.submit(); }, 100);
       });
     })();
   </script>
