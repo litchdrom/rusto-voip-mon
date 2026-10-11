@@ -47,9 +47,17 @@
       if (!select || !form) return;
 
       // Pre-populate the `next` field so the <noscript> fallback
-      // also preserves the operator's URL.
+      // also preserves the operator's URL. We strip `tz_offset_hours`
+      // from it because the page's TZ precedence is URL > session >
+      // env default — if the URL still has the OLD tz_offset_hours
+      // when the redirect lands, it overrides the freshly-set
+      // session cookie and the dropdown reverts to the old value.
+      // Dropping the param means the redirect lands on a "clean"
+      // URL and the cookie wins.
       if (next && !next.value) {
-        next.value = window.location.pathname + window.location.search;
+        const u = new URL(window.location.href);
+        u.searchParams.delete('tz_offset_hours');
+        next.value = u.pathname + u.search;
       }
 
       select.addEventListener('change', function() {
