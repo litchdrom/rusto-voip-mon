@@ -47,53 +47,57 @@
       if (!select || !form) return;
 
       // Pre-populate the `next` field so the <noscript> fallback
-      // also preserves the operator's URL. (The JS path doesn't
-      // submit the form, so this only matters when JS is disabled
-      // or the fetch fails.)
+      // also preserves the operator's URL.
       if (next && !next.value) {
         next.value = window.location.pathname + window.location.search;
       }
 
       select.addEventListener('change', async function() {
         const value = select.value;
-        const formData = new FormData();
-        formData.set('tz_offset_hours', value);
         if (status) {
           status.textContent = 'applying…';
           status.className = 'tz-status tz-status-pending';
         }
         try {
+          // Use URLSearchParams (not FormData) so the body is
+          // `application/x-www-form-urlencoded` — that's what
+          // axum's `Form` extractor parses. FormData would send
+          // multipart, which the server silently rejects, leaving
+          // the cookie unset and the dropdown stuck on the old
+          // value.
+          const body = new URLSearchParams();
+          body.set('tz_offset_hours', value);
           const resp = await fetch('/tz', {
             method: 'POST',
-            body: formData,
-            // The server still responds with a 303 See Other
-            // redirect; `redirect: 'manual'` keeps the browser
-            // from following it. The Set-Cookie header is still
-            // applied, so the new TZ sticks for subsequent
-            // navigations. We treat the opaque redirect response
-            // as success.
-            redirect: 'manual',
+            body: body,
             credentials: 'same-origin',
+            // `redirect: 'manual'` keeps fetch from following the
+            // 303; the Set-Cookie header is still applied, so
+            // the new TZ is saved. We then trigger a soft page
+            // reload (location.reload) so the dates render in
+            // the new TZ without losing the operator's URL /
+            // filters.
+            redirect: 'manual',
           });
           if (resp.type === 'opaqueredirect' || resp.ok) {
             if (status) {
-              status.textContent = '✓ TZ saved — refresh to apply';
+              status.textContent = '✓ TZ applied';
               status.className = 'tz-status tz-status-ok';
-              setTimeout(() => {
-                if (status) {
-                  status.textContent = '';
-                  status.className = 'tz-status';
-                }
-              }, 2500);
             }
+            // Reload via location.reload so the page re-renders
+            // with the new TZ. The URL is unchanged so all
+            // filter params (caller, called, page, etc.) are
+            // preserved automatically. We use a microtask delay
+            // so the operator sees the "applied" indicator
+            // before the navigation kicks in.
+            setTimeout(() => { window.location.reload(); }, 250);
           } else {
             throw new Error('server returned ' + resp.status);
           }
         } catch (e) {
           // Fetch failed (network error, server error, or 4xx/5xx).
           // Fall back to the form submit so the operator isn't
-          // stuck with a stale dropdown — this re-runs the search
-          // but at least the TZ is updated.
+          // stuck with a stale dropdown.
           if (status) {
             status.textContent = '× failed — retrying…';
             status.className = 'tz-status tz-status-err';
