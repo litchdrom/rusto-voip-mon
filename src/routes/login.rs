@@ -188,9 +188,25 @@ pub async fn set_tz(
         .filter(|&h| (-12..=14).contains(&h))
         .and_then(|h| if h == 0 { None } else { Some(h) });
 
+    let prev_tz = user.tz_offset_hours;
     let new_session = user.with_tz(parsed);
     let value = encode_cookie(&new_session, state.config.cookie_secret.as_bytes());
     let cookie_header = format_set_cookie(COOKIE_NAME, &value, "/", Some(TTL_SECS));
+
+    // One-line audit trail. Without this, the only way to debug "did the
+    // cookie actually get set?" is to tcpdump the response headers or
+    // pull them out of the browser devtools. The `prev -> new` pair
+    // makes it obvious whether the change took effect (or whether the
+    // form submitted an empty value, which collapses to None and clears
+    // the cookie).
+    tracing::info!(
+        user_id = new_session.user_id,
+        prev_tz = ?prev_tz,
+        new_tz = ?new_session.tz_offset_hours,
+        raw_form_value = ?form.tz_offset_hours,
+        next = %form.next.as_deref().unwrap_or(""),
+        "tz change applied"
+    );
 
     // Strip tz_offset_hours from the redirect target so the
     // freshly-set session cookie isn't overridden by a stale

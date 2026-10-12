@@ -1812,10 +1812,15 @@ fn html_escape(s: &str) -> String {
 }
 
 /// Cap for the POST `/cdr/export.csv` batch path (ids or filter).
-/// Matches `BATCH_MAX` in `routes::pcap` — same 100-row ceiling so the
-/// operator's mental model ("zip / csv of selected / all matching") has
-/// one consistent limit.
-const CSV_BATCH_MAX: usize = 100;
+/// Matches `BATCH_MAX` in `routes::pcap` so the operator's mental model
+/// ("zip / csv of selected / all matching") has one consistent limit.
+/// Both batch caps now read `CSV_EXPORT_LIMIT` from config — the
+/// historical hard-coded 100 was a footgun: operators with `CSV_EXPORT_LIMIT=10000`
+/// in `.env` got the streaming CSV right but the batch endpoint silently
+/// truncated at 100, which is what the WARN log `cap=100` was telling us.
+fn csv_batch_limit(state: &crate::state::AppState) -> usize {
+    state.config.csv_export_limit
+}
 
 /// Request body for `POST /cdr/export.csv`. Mirrors `BatchPcapRequest`
 /// shape — the JS frontend uses the same `{ids, filter}` JSON for both
@@ -2007,11 +2012,13 @@ pub async fn cdr_export_csv(
 /// selection-clearing / cross-page checkbox state drives both
 /// downloads.
 ///
-/// Resolves the request to a concrete list of CDR IDs (cap = 100),
-/// fetches each in a single SQL roundtrip via `fetch_by_ids`, then
-/// streams them out as CSV. IDs not in the DB are silently skipped
-/// (a deleted CDR in the middle of a session-cookie selection isn't
-/// a hard error — the operator still gets the rows that do exist).
+/// Resolves the request to a concrete list of CDR IDs (capped at
+/// `CSV_EXPORT_LIMIT` so the operator's `.env` cap applies to both the
+/// streaming and batch paths), fetches each in a single SQL roundtrip
+/// via `fetch_by_ids`, then streams them out as CSV. IDs not in the DB
+/// are silently skipped (a deleted CDR in the middle of a session-cookie
+/// selection isn't a hard error — the operator still gets the rows that
+/// do exist).
 pub async fn cdr_export_csv_batch(
     State(state): State<AppState>,
     user: SessionUser,
@@ -2030,7 +2037,7 @@ pub async fn cdr_export_csv_batch(
         out
     } else if let Some(filter) = req.filter.as_deref() {
         let tz = state.tz_default();
-        cdr::ids_for_query_string(&state.pool, filter, tz, CSV_BATCH_MAX, *state.ip_shape).await?
+        cdr::ids_for_query_string(&state.pool, filter, tz, csv_batch_limit(&state), *state.ip_shape).await?
     } else {
         return Err(AppError::BadRequest(
             "either `ids` or `filter` must be provided".into(),
@@ -2043,14 +2050,14 @@ pub async fn cdr_export_csv_batch(
         ));
     }
 
-    if cdr_ids.len() > CSV_BATCH_MAX {
+    if cdr_ids.len() > csv_batch_limit(&state) {
         tracing::warn!(
             requested = cdr_ids.len(),
-            cap = CSV_BATCH_MAX,
+            cap = csv_batch_limit(&state),
             "CSV batch export exceeds cap; truncating"
         );
     }
-    let cdr_ids = &cdr_ids[..cdr_ids.len().min(CSV_BATCH_MAX)];
+    let cdr_ids = &cdr_ids[..cdr_ids.len().min(csv_batch_limit(&state))];
 
     // Use the operator's session TZ for the output so the CSV timestamps
     // match what the operator sees in the list view. The list view's
@@ -2076,7 +2083,7 @@ pub async fn cdr_export_csv_batch(
         ));
     }
 
-    build_csv_response(summaries, CSV_BATCH_MAX)
+    build_csv_response(summaries, csv_batch_limit(&state))
 }
 
 pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilters {

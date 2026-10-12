@@ -555,8 +555,15 @@ fn build_sources_from_fbasename(
 
 /// Maximum number of CDRs accepted in a single batch download. Keeps the
 /// in-memory zip bounded and avoids pathological client requests that
-/// would consume worker threads for minutes.
-const BATCH_MAX: usize = 100;
+/// would consume worker threads for minutes. Reads from
+/// `CSV_EXPORT_LIMIT` so the operator's `.env` cap applies uniformly to
+/// streaming CSV, batch CSV, and batch PCAP — the historical hard-coded
+/// 100 was a footgun: an operator with `CSV_EXPORT_LIMIT=10000` got the
+/// streaming CSV right but the batch endpoints silently truncated at
+/// 100, which is what the WARN log `cap=100` was telling us.
+fn batch_max(state: &AppState) -> usize {
+    state.config.csv_export_limit
+}
 
 /// Request body for `POST /pcap/batch`.
 ///
@@ -692,20 +699,20 @@ async fn resolve_batch_ids(
     } else if let Some(filter) = filter {
         let query_tz: Option<i8> = parse_tz_from_filter(filter);
         let (tz, _) = state.resolve_tz(user, query_tz);
-        cdr::ids_for_query_string(&state.pool, filter, tz, BATCH_MAX, *state.ip_shape).await?
+        cdr::ids_for_query_string(&state.pool, filter, tz, batch_max(state), *state.ip_shape).await?
     } else {
         return Ok((Vec::new(), state.config.tz()));
     };
     if cdr_ids.is_empty() {
         return Ok((Vec::new(), state.config.tz()));
     }
-    if cdr_ids.len() > BATCH_MAX {
+    if cdr_ids.len() > batch_max(state) {
         tracing::warn!(
             requested = cdr_ids.len(),
-            cap = BATCH_MAX,
-            "filter matched more than BATCH_MAX; truncating"
+            cap = batch_max(state),
+            "filter matched more than batch_max; truncating"
         );
-        cdr_ids.truncate(BATCH_MAX);
+        cdr_ids.truncate(batch_max(state));
     }
     // For the `ids` path we didn't go through resolve_tz; default to
     // the user's session TZ (or server default). Per-request overrides
