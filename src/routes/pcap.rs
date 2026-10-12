@@ -762,7 +762,14 @@ async fn build_batch_zip_response(
     // resolved offset, applied to each row's `calldate` so the sidecar
     // CSV matches the timestamps the operator sees in the list view.
     let metadata: std::collections::HashMap<u64, cdr::CdrSummary> =
-        match cdr::fetch_by_ids(&state.pool, &cdr_ids, tz).await {
+        match cdr::fetch_by_ids(
+            &state.pool,
+            &cdr_ids,
+            tz,
+            state.config.db_tz_offset_secs,
+        )
+        .await
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "batch zip: metadata fetch failed; continuing without cdrs.csv");

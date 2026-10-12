@@ -344,7 +344,13 @@ pub async fn cdr_list(
     let (page_result, distinct_result) = tokio::join!(
         crate::error::with_query_timeout(
             timeout,
-            cdr::list(&state.pool, &normalized, *state.ip_shape, tz),
+            cdr::list(
+                &state.pool,
+                &normalized,
+                *state.ip_shape,
+                tz,
+                state.config.db_tz_offset_secs,
+            ),
         ),
         crate::error::with_query_timeout(timeout, cdr::distinct_values(&state.pool, 7, 100, tz)),
     );
@@ -518,7 +524,7 @@ pub async fn cdr_detail(
     // has no `?tz_offset_hours=` (it can't, the form lives on the
     // list page), so we rely on the session cookie + env default.
     let (tz, _) = state.resolve_tz(&user, None);
-    let cdr = CdrSummary::from_row(cdr, tz);
+    let cdr = CdrSummary::from_row(cdr, tz, state.config.db_tz_offset_secs);
 
     // Pull the optional extension tables in parallel — all three are tiny.
     let (next, branches, sip_messages) = tokio::join!(
@@ -2007,7 +2013,11 @@ pub async fn cdr_export_csv(
             let Some(row_result) = row_result else { break };
             match row_result {
                 Ok(r) => {
-                    let summary = CdrSummary::from_row(r, tz_for_stream);
+                    let summary = CdrSummary::from_row(
+                        r,
+                        tz_for_stream,
+                        state.config.db_tz_offset_secs,
+                    );
                     let line = format_csv_line(&summary);
                     if csv_tx.send(Ok(Bytes::from(line))).await.is_err() {
                         break; // client disconnected
@@ -2096,7 +2106,13 @@ pub async fn cdr_export_csv_batch(
 
     // Single SQL roundtrip, then preserve input order — the operator
     // expects the CSV rows to follow the order they ticked.
-    let by_id = cdr::fetch_by_ids(&state.pool, cdr_ids, tz).await?;
+    let by_id = cdr::fetch_by_ids(
+        &state.pool,
+        cdr_ids,
+        tz,
+        state.config.db_tz_offset_secs,
+    )
+    .await?;
     let mut summaries: Vec<CdrSummary> = Vec::with_capacity(cdr_ids.len());
     for &id in cdr_ids {
         if let Some(s) = by_id.get(&id) {

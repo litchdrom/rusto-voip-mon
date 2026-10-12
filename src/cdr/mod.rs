@@ -349,14 +349,24 @@ impl CdrSummary {
     ///
     /// `CdrRow` carries the values straight from MySQL — `calldate` /
     /// `callend` are `NaiveDateTime` because the underlying `DATETIME`
-    /// column is timezone-blind and VoIPmonitor stores wall-clock UTC.
-    /// Without a conversion at this boundary every consumer (template,
-    /// CSV, detail page) would render in UTC regardless of the user's
-    /// preference and the topbar TZ selector would be cosmetic.
+    /// column is timezone-blind. VoIPmonitor's default convention is
+    /// wall-clock UTC, but some installs store in server local time
+    /// (e.g. PST). The `db_tz_secs` argument names the offset of the
+    /// stored wall-clock value so the conversion is correct in both
+    /// cases:
+    ///
+    ///   1. Subtract `db_tz_secs` from the stored value to interpret
+    ///      it as a UTC `NaiveDateTime`.
+    ///   2. Anchor that in `tz` to get a `DateTime<FixedOffset>` in
+    ///      the operator's resolved timezone.
+    ///
+    /// Without step 1 the conversion would be off by the storage-TZ
+    /// offset (e.g. 8 hours for PST data) — a +3 operator would see
+    /// PST-wall-clock values mis-labeled as UTC-shifted-into-+3.
     ///
     /// Takes `tz` by value (not by reference) so the spawned CSV-export
     /// task can move it into the closure without a clone per row.
-    pub fn from_row(row: CdrRow, tz: FixedOffset) -> Self {
+    pub fn from_row(row: CdrRow, tz: FixedOffset, db_tz_secs: i32) -> Self {
         let mos_str = row
             .mos_min_mult10
             .map(|m| format!("{:.1}", m as f32 / 10.0))
@@ -415,8 +425,18 @@ impl CdrSummary {
         };
         Self {
             id: row.id,
-            calldate: Utc.from_utc_datetime(&row.calldate).with_timezone(&tz),
-            callend: Utc.from_utc_datetime(&row.callend).with_timezone(&tz),
+            // Interpret the stored value as wall-clock in `db_tz_secs`,
+            // shift it to UTC, then anchor in the operator's `tz`. The
+            // combination is equivalent to `row.calldate + (operator_tz
+            // - db_tz)` in wall-clock terms, but built on UTC anchors so
+            // the result is a valid `DateTime<FixedOffset>` regardless
+            // of DST transitions.
+            calldate: tz.from_utc_datetime(
+                &(row.calldate - Duration::seconds(db_tz_secs as i64)),
+            ),
+            callend: tz.from_utc_datetime(
+                &(row.callend - Duration::seconds(db_tz_secs as i64)),
+            ),
             duration: row.duration,
             connect_duration: row.connect_duration,
             caller: row.caller,
@@ -1095,6 +1115,7 @@ pub async fn list(
     f: &NormalizedFilters,
     ip_shape: IpColumnShape,
     tz: FixedOffset,
+    db_tz_secs: i32,
 ) -> Result<CdrPage, sqlx::Error> {
     let (where_sql, binds) = f.to_where(ip_shape);
     let limit = f.page_size + 1;
@@ -1123,7 +1144,7 @@ pub async fn list(
     }
     let summaries = rows
         .into_iter()
-        .map(|row| CdrSummary::from_row(row, tz))
+        .map(|row| CdrSummary::from_row(row, tz, db_tz_secs))
         .collect();
     Ok(CdrPage { rows: summaries, has_more })
 }
@@ -1216,6 +1237,7 @@ pub async fn fetch_by_ids(
     pool: &MySqlPool,
     ids: &[u64],
     tz: FixedOffset,
+    db_tz_secs: i32,
 ) -> Result<std::collections::HashMap<u64, CdrSummary>, sqlx::Error> {
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
@@ -1242,7 +1264,7 @@ pub async fn fetch_by_ids(
     let rows = q.fetch_all(pool).await?;
     let mut out = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
-        let s = CdrSummary::from_row(row, tz);
+        let s = CdrSummary::from_row(row, tz, db_tz_secs);
         out.insert(s.id, s);
     }
     Ok(out)
@@ -2154,7 +2176,7 @@ mod rtp_leg_tests {
             a_saddr: Some(IpAddr::V4(0x0a00_0001)),
             b_saddr: Some(IpAddr::V4(0x0a00_0002)),
         };
-        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap());
+        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0);
         // SIP-level IPs stay where they were.
         assert_eq!(s.src_ip_str, "10.0.0.1");
         assert_eq!(s.dst_ip_str, "10.0.0.2");
@@ -2215,25 +2237,32 @@ mod rtp_leg_tests {
             a_saddr: None,
             b_saddr: None,
         };
-        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap());
+        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0);
         assert_eq!(s.rtp_a.src_ip_str, "");
         assert_eq!(s.rtp_a.dst_ip_str, "");
         assert_eq!(s.rtp_b.src_ip_str, "");
         assert_eq!(s.rtp_b.dst_ip_str, "");
     }
 
-    /// The whole point of `from_row` is the UTC→operator-TZ conversion.
-    /// Without it the topbar dropdown is cosmetic and the user sees
-    /// the same wall-clock time regardless of their preference. A row
-    /// stored as `2026-10-12 00:30:00` UTC should appear as
-    /// `2026-10-12 03:30:00` in a +3 summary and `2026-10-11 21:30:00`
-    /// in a -3 summary.
+    /// The whole point of `from_row` is the storage-TZ→operator-TZ
+    /// conversion. Without it the topbar dropdown is cosmetic and the
+    /// user sees the same wall-clock time regardless of their
+    /// preference. The first three assertions cover the standard
+    /// VoIPmonitor convention (calldate stored in UTC); the last one
+    /// covers the PST-stored data case an operator hit during the
+    /// initial deploy, where 07:01:42 PST should appear as
+    /// 18:01:42 in a +3 view.
     #[test]
     fn from_row_converts_utc_calldate_to_operator_tz() {
-        // Helper: build a minimal CdrRow with the given UTC datetimes
-        // and run it through from_row with the given operator TZ, then
-        // format the resulting calldate as the user would see it.
-        let formatted = |calldate: NaiveDateTime, callend: NaiveDateTime, tz_h: i32| -> String {
+        // Helper: build a minimal CdrRow with the given datetimes,
+        // interpret the stored value as wall-clock in `db_tz_h`, and
+        // run it through from_row with the given operator TZ. Returns
+        // the formatted calldate as the user would see it.
+        let formatted = |calldate: NaiveDateTime,
+                         callend: NaiveDateTime,
+                         db_tz_h: i32,
+                         op_tz_h: i32|
+         -> String {
             let row = CdrRow {
                 id: 1,
                 calldate,
@@ -2273,10 +2302,14 @@ mod rtp_leg_tests {
                 a_saddr: None,
                 b_saddr: None,
             };
-            CdrSummary::from_row(row, FixedOffset::east_opt(tz_h * 3600).unwrap())
-                .calldate
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
+            CdrSummary::from_row(
+                row,
+                FixedOffset::east_opt(op_tz_h * 3600).unwrap(),
+                db_tz_h * 3600,
+            )
+            .calldate
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
         };
         let utc_dt = NaiveDate::from_ymd_opt(2026, 10, 12)
             .unwrap()
@@ -2286,12 +2319,18 @@ mod rtp_leg_tests {
             .unwrap()
             .and_hms_opt(0, 30, 42)
             .unwrap();
-        // UTC stays UTC — sanity check that the conversion is a no-op
-        // when the operator's TZ is +0.
-        assert_eq!(formatted(utc_dt, end_utc_dt, 0), "2026-10-12 00:30:00");
-        // +3 shifts forward three hours.
-        assert_eq!(formatted(utc_dt, end_utc_dt, 3), "2026-10-12 03:30:00");
-        // -3 shifts backward and crosses midnight into the previous day.
-        assert_eq!(formatted(utc_dt, end_utc_dt, -3), "2026-10-11 21:30:00");
+        // UTC-stored data, +0 operator: stays UTC. Sanity check that
+        // the conversion is a no-op when both TZs are UTC.
+        assert_eq!(formatted(utc_dt, end_utc_dt, 0, 0), "2026-10-12 00:30:00");
+        // UTC-stored data, +3 operator: shifts forward three hours.
+        assert_eq!(formatted(utc_dt, end_utc_dt, 0, 3), "2026-10-12 03:30:00");
+        // UTC-stored data, -3 operator: shifts backward and crosses
+        // midnight into the previous day.
+        assert_eq!(formatted(utc_dt, end_utc_dt, 0, -3), "2026-10-11 21:30:00");
+        // PST-stored data, +3 operator: 00:30 PST interpreted as
+        // 08:30 UTC, then displayed in +3 → 11:30. The day crosses
+        // midnight in the storage TZ (PST) but the displayed day
+        // is +1 relative to the stored day.
+        assert_eq!(formatted(utc_dt, end_utc_dt, -8, 3), "2026-10-12 11:30:00");
     }
 }

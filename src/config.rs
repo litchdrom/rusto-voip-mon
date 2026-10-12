@@ -18,6 +18,15 @@ pub struct Config {
     /// match the operator's local time when the server clock is in UTC
     /// but the human isn't.
     pub tz_offset_secs: i32,
+    /// Timezone offset of the **stored** `calldate` values, in seconds.
+    /// Defaults to 0 (UTC) for the standard VoIPmonitor convention.
+    /// Set via `APP_DB_TZ_OFFSET_HOURS` to a non-zero value when the
+    /// server's MySQL session stores `DATETIME` in server local time
+    /// (e.g. -28800 for PST). The conversion is applied at the
+    /// SQL→view boundary in `CdrSummary::from_row` so every consumer
+    /// (template, CSV, detail page) renders in the operator's
+    /// resolved offset without each having to know the storage TZ.
+    pub db_tz_offset_secs: i32,
     /// Per-query timeout in seconds. Bounds how long a single sqlx call
     /// (CDR list setup, detail page, distinct-values lookup, pcap parts
     /// query, etc.) is allowed to run before the client gets a 504 and
@@ -41,6 +50,11 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
             tz_offset_secs: std::env::var("APP_TZ_OFFSET_HOURS")
+                .ok()
+                .and_then(|v| v.parse::<i32>().ok())
+                .map(|h| h.saturating_mul(3600))
+                .unwrap_or(0),
+            db_tz_offset_secs: std::env::var("APP_DB_TZ_OFFSET_HOURS")
                 .ok()
                 .and_then(|v| v.parse::<i32>().ok())
                 .map(|h| h.saturating_mul(3600))
