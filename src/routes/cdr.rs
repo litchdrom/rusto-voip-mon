@@ -423,8 +423,24 @@ pub async fn cdr_list(
     let body = tmpl
         .render()
         .map_err(|e| AppError::Internal(format!("render: {e}")))?;
+    // Cache-Control: no-store. Without it, the browser heuristically
+    // caches the rendered HTML (no explicit max-age), and after a
+    // server-side template change the operator sees a stale page even
+    // after a hard-refresh — which is exactly the failure mode the TZ
+    // dropdown fell into. The form-submit IIFE was added in 2b0ba36
+    // and the browser kept serving the pre-2b0ba36 page from cache,
+    // so the change event never had a handler attached. Forcing
+    // no-store makes every navigation re-fetch and re-render.
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, no-cache, must-revalidate, max-age=0",
+            ),
+            (axum::http::header::PRAGMA, "no-cache"),
+            (axum::http::header::EXPIRES, "0"),
+        ],
         body,
     )
         .into_response())
@@ -723,8 +739,21 @@ pub async fn cdr_detail(
         rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
         rtp_chart_html = render_rtp_chart_panel(id),
     );
+    // Same no-store policy as cdr_list — see the comment there for the
+    // reasoning. cdr_detail hosts the per-message `seq-msg-cell` and
+    // the `sip-body` <details> block, neither of which is static, and
+    // the operator reloads the page after the cookie-based TZ change
+    // to re-render the calldate / callend in the new offset.
     Ok((
-        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "no-store, no-cache, must-revalidate, max-age=0",
+            ),
+            (axum::http::header::PRAGMA, "no-cache"),
+            (axum::http::header::EXPIRES, "0"),
+        ],
         body,
     )
         .into_response())

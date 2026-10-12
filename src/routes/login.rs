@@ -47,10 +47,24 @@ pub async fn login_form(
     });
     (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        )],
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            ),
+            // no-store: see cdr_list comment. The login page holds the
+            // error banner and the next= hidden field, both of which
+            // would be confusing to see served from cache after a
+            // fix-deploy.
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(
+                    "no-store, no-cache, must-revalidate, max-age=0",
+                ),
+            ),
+            (header::PRAGMA, HeaderValue::from_static("no-cache")),
+            (header::EXPIRES, HeaderValue::from_static("0")),
+        ],
         body,
     )
         .into_response()
