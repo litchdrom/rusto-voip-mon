@@ -12,12 +12,7 @@
   <form method="post" action="/tz" class="tz-form" id="tz-form">
     <label for="tz-select" class="muted small">TZ</label>
     <select name="tz_offset_hours" id="tz-select">
-      {% for h in -12..=14 %}
-        <option value="{{ h }}" {% if h == tz_offset_hours %}selected{% endif %}>
-          {% if h == 0 %}UTC{% else if h > 0 %}UTC+{{ h }}{% else %}UTC{{ h }}{% endif %}
-          {% if h == tz_default_hours %} (server default){% endif %}
-        </option>
-      {% endfor %}
+      {{ tz_options_html|safe }}
     </select>
     <input type="hidden" name="next" value="" id="tz-next">
     <span id="tz-status" class="tz-status" aria-live="polite"></span>

@@ -18,6 +18,40 @@ use crate::{
     state::AppState,
 };
 
+/// `0` → "UTC", positive → "UTC+N", negative → "UTC-N".
+fn tz_label(h: i8) -> String {
+    if h == 0 {
+        "UTC".to_string()
+    } else if h > 0 {
+        format!("UTC+{}", h)
+    } else {
+        format!("UTC{}", h)
+    }
+}
+
+/// Render the full `<option>...</option>` set for the
+/// topbar TZ dropdown as a single HTML string.
+///
+/// We do this in Rust (instead of a `{% for opt in
+/// tz_options %}` loop in `cdr_list.html`) because askama
+/// 0.12's `for` loop on a `Vec` yielded zero iterations in
+/// this template — the `<select>` rendered empty, the form
+/// submitted an empty value, the server cleared the cookie,
+/// and the page reverted to TZ=0. Generating the HTML
+/// server-side bypasses the askama issue entirely.
+fn render_tz_options_html(selected_hours: i8, default_hours: i8) -> String {
+    let mut out = String::with_capacity(2048);
+    for h in -12..=14 {
+        let label = tz_label(h);
+        let selected = if h == selected_hours { " selected" } else { "" };
+        let suffix = if h == default_hours { " (server default)" } else { "" };
+        out.push_str(&format!(
+            "<option value=\"{h}\"{selected}>{label}{suffix}</option>",
+        ));
+    }
+    out
+}
+
 #[derive(Template)]
 #[template(path = "cdr_list.html")]
 pub struct CdrListTemplate {
@@ -47,6 +81,11 @@ pub struct CdrListTemplate {
     /// Server default TZ offset hours, so the dropdown can label
     /// "Server default (-3h)" distinctly from "user override".
     pub tz_default_hours: i8,
+    /// Pre-rendered HTML for the topbar TZ dropdown's
+    /// `<option>` set. See `render_tz_options_html` for why
+    /// this is a `String` rather than a `Vec<TzOption>` that
+    /// the template would loop over.
+    pub tz_options_html: String,
     /// Full operator selection (every CDR ID ticked across all visited
     /// pages). Serialised into a `<script type="application/json">` tag
     /// in the template so the JS state mirrors the session without a
@@ -372,6 +411,13 @@ pub async fn cdr_list(
         day_label,
         tz_offset_hours: (tz.local_minus_utc() / 3600) as i8,
         tz_default_hours: (state.config.tz_offset_secs / 3600) as i8,
+        // Render the <option> set in Rust — see
+        // `render_tz_options_html` for why the template can't
+        // loop over the options itself.
+        tz_options_html: render_tz_options_html(
+            (tz.local_minus_utc() / 3600) as i8,
+            (state.config.tz_offset_secs / 3600) as i8,
+        ),
         selected_count: user.selected_cdr_ids.len(),
     };
     let body = tmpl
