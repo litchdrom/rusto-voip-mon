@@ -10,7 +10,7 @@
 //!                     (`mos_str`, `src_ip_str`, `dst_ip_str`). Templates
 //!                     consume this one.
 
-use chrono::{Duration, FixedOffset, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, MySqlPool, Row};
@@ -208,8 +208,14 @@ pub const CDR_FULL_SELECT_COLUMNS: &str = "ID AS `id`, calldate, callend, durati
 #[derive(Debug, Clone, Serialize)]
 pub struct CdrSummary {
     pub id: u64,
-    pub calldate: NaiveDateTime,
-    pub callend: NaiveDateTime,
+    /// Call start, expressed in the operator's resolved timezone. The
+    /// underlying `calldate` column is a `DATETIME` in MySQL and stores
+    /// wall-clock UTC (VoIPmonitor's convention); the conversion happens
+    /// at the `From<CdrRow>` boundary below so every consumer (template,
+    /// CSV, detail page) renders in the operator's chosen offset.
+    pub calldate: DateTime<FixedOffset>,
+    /// Call end, same convention as `calldate`.
+    pub callend: DateTime<FixedOffset>,
     pub duration: Option<u32>,
     pub connect_duration: Option<u32>,
     pub caller: Option<String>,
@@ -337,8 +343,20 @@ impl RtpLeg {
     }
 }
 
-impl From<CdrRow> for CdrSummary {
-    fn from(row: CdrRow) -> Self {
+impl CdrSummary {
+    /// Build a view struct from a SQL row, expressing `calldate` /
+    /// `callend` in the operator's resolved timezone.
+    ///
+    /// `CdrRow` carries the values straight from MySQL — `calldate` /
+    /// `callend` are `NaiveDateTime` because the underlying `DATETIME`
+    /// column is timezone-blind and VoIPmonitor stores wall-clock UTC.
+    /// Without a conversion at this boundary every consumer (template,
+    /// CSV, detail page) would render in UTC regardless of the user's
+    /// preference and the topbar TZ selector would be cosmetic.
+    ///
+    /// Takes `tz` by value (not by reference) so the spawned CSV-export
+    /// task can move it into the closure without a clone per row.
+    pub fn from_row(row: CdrRow, tz: FixedOffset) -> Self {
         let mos_str = row
             .mos_min_mult10
             .map(|m| format!("{:.1}", m as f32 / 10.0))
@@ -397,8 +415,8 @@ impl From<CdrRow> for CdrSummary {
         };
         Self {
             id: row.id,
-            calldate: row.calldate,
-            callend: row.callend,
+            calldate: Utc.from_utc_datetime(&row.calldate).with_timezone(&tz),
+            callend: Utc.from_utc_datetime(&row.callend).with_timezone(&tz),
             duration: row.duration,
             connect_duration: row.connect_duration,
             caller: row.caller,
@@ -1076,6 +1094,7 @@ pub async fn list(
     pool: &MySqlPool,
     f: &NormalizedFilters,
     ip_shape: IpColumnShape,
+    tz: FixedOffset,
 ) -> Result<CdrPage, sqlx::Error> {
     let (where_sql, binds) = f.to_where(ip_shape);
     let limit = f.page_size + 1;
@@ -1102,7 +1121,10 @@ pub async fn list(
     if has_more {
         rows.truncate(f.page_size as usize);
     }
-    let summaries = rows.into_iter().map(CdrSummary::from).collect();
+    let summaries = rows
+        .into_iter()
+        .map(|row| CdrSummary::from_row(row, tz))
+        .collect();
     Ok(CdrPage { rows: summaries, has_more })
 }
 
@@ -1193,6 +1215,7 @@ pub async fn list_ids_matching(
 pub async fn fetch_by_ids(
     pool: &MySqlPool,
     ids: &[u64],
+    tz: FixedOffset,
 ) -> Result<std::collections::HashMap<u64, CdrSummary>, sqlx::Error> {
     if ids.is_empty() {
         return Ok(std::collections::HashMap::new());
@@ -1219,7 +1242,7 @@ pub async fn fetch_by_ids(
     let rows = q.fetch_all(pool).await?;
     let mut out = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
-        let s = CdrSummary::from(row);
+        let s = CdrSummary::from_row(row, tz);
         out.insert(s.id, s);
     }
     Ok(out)
@@ -2131,7 +2154,7 @@ mod rtp_leg_tests {
             a_saddr: Some(IpAddr::V4(0x0a00_0001)),
             b_saddr: Some(IpAddr::V4(0x0a00_0002)),
         };
-        let s = CdrSummary::from(row);
+        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap());
         // SIP-level IPs stay where they were.
         assert_eq!(s.src_ip_str, "10.0.0.1");
         assert_eq!(s.dst_ip_str, "10.0.0.2");
@@ -2192,10 +2215,83 @@ mod rtp_leg_tests {
             a_saddr: None,
             b_saddr: None,
         };
-        let s = CdrSummary::from(row);
+        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap());
         assert_eq!(s.rtp_a.src_ip_str, "");
         assert_eq!(s.rtp_a.dst_ip_str, "");
         assert_eq!(s.rtp_b.src_ip_str, "");
         assert_eq!(s.rtp_b.dst_ip_str, "");
+    }
+
+    /// The whole point of `from_row` is the UTC→operator-TZ conversion.
+    /// Without it the topbar dropdown is cosmetic and the user sees
+    /// the same wall-clock time regardless of their preference. A row
+    /// stored as `2026-10-12 00:30:00` UTC should appear as
+    /// `2026-10-12 03:30:00` in a +3 summary and `2026-10-11 21:30:00`
+    /// in a -3 summary.
+    #[test]
+    fn from_row_converts_utc_calldate_to_operator_tz() {
+        // Helper: build a minimal CdrRow with the given UTC datetimes
+        // and run it through from_row with the given operator TZ, then
+        // format the resulting calldate as the user would see it.
+        let formatted = |calldate: NaiveDateTime, callend: NaiveDateTime, tz_h: i32| -> String {
+            let row = CdrRow {
+                id: 1,
+                calldate,
+                callend,
+                duration: None,
+                connect_duration: None,
+                caller: None,
+                callername: None,
+                called: None,
+                sipcallerip: None,
+                sipcalledip: None,
+                last_sip_response_num: None,
+                mos_min_mult10: None,
+                a_lost: None,
+                b_lost: None,
+                id_sensor: None,
+                a_mos_lqo_mult10: None,
+                b_mos_lqo_mult10: None,
+                a_received: None,
+                b_received: None,
+                a_avgjitter_mult10: None,
+                b_avgjitter_mult10: None,
+                a_maxjitter: None,
+                b_maxjitter: None,
+                a_packet_loss_perc_mult1000: None,
+                b_packet_loss_perc_mult1000: None,
+                a_delay_avg_mult100: None,
+                b_delay_avg_mult100: None,
+                a_rtcp_loss: None,
+                b_rtcp_loss: None,
+                a_rtcp_maxjitter: None,
+                b_rtcp_maxjitter: None,
+                a_payload: None,
+                b_payload: None,
+                a_rtp_ptime: None,
+                b_rtp_ptime: None,
+                a_saddr: None,
+                b_saddr: None,
+            };
+            CdrSummary::from_row(row, FixedOffset::east_opt(tz_h * 3600).unwrap())
+                .calldate
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        };
+        let utc_dt = NaiveDate::from_ymd_opt(2026, 10, 12)
+            .unwrap()
+            .and_hms_opt(0, 30, 0)
+            .unwrap();
+        let end_utc_dt = NaiveDate::from_ymd_opt(2026, 10, 12)
+            .unwrap()
+            .and_hms_opt(0, 30, 42)
+            .unwrap();
+        // UTC stays UTC — sanity check that the conversion is a no-op
+        // when the operator's TZ is +0.
+        assert_eq!(formatted(utc_dt, end_utc_dt, 0), "2026-10-12 00:30:00");
+        // +3 shifts forward three hours.
+        assert_eq!(formatted(utc_dt, end_utc_dt, 3), "2026-10-12 03:30:00");
+        // -3 shifts backward and crosses midnight into the previous day.
+        assert_eq!(formatted(utc_dt, end_utc_dt, -3), "2026-10-11 21:30:00");
     }
 }

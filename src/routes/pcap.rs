@@ -26,7 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use chrono::{Duration, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{Duration, NaiveDateTime, NaiveTime, TimeZone, Timelike};
 use lzo;
 use sqlx::{MySqlPool, Row};
 use tokio::sync::mpsc;
@@ -751,9 +751,11 @@ async fn build_batch_zip_response(
 
     // One roundtrip for the metadata sidecar. Failure here is non-fatal
     // (we'd rather ship the pcaps without the CSV than 500 the whole
-    // batch) — log + continue with an empty map.
+    // batch) — log + continue with an empty map. `tz` is the operator's
+    // resolved offset, applied to each row's `calldate` so the sidecar
+    // CSV matches the timestamps the operator sees in the list view.
     let metadata: std::collections::HashMap<u64, cdr::CdrSummary> =
-        match cdr::fetch_by_ids(&state.pool, &cdr_ids).await {
+        match cdr::fetch_by_ids(&state.pool, &cdr_ids, tz).await {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "batch zip: metadata fetch failed; continuing without cdrs.csv");
@@ -1516,17 +1518,23 @@ mod tests {
         let mut metadata: HashMap<u64, cdr::CdrSummary> = HashMap::new();
         // Synthetic metadata — none of the database fields are required
         // to be real here, we're just exercising the CSV rendering path.
-        let utc = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
+        // The row's calldate is stored as wall-clock UTC (VoIPmonitor's
+        // convention); the operator's TZ (+7) shifts the displayed time
+        // forward by 7 hours — that's the whole point of the conversion
+        // done by CdrSummary::from_row.
+        let operator_tz = chrono::FixedOffset::east_opt(7 * 3600).unwrap();
+        let calldate_utc = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+            .unwrap()
+            .and_hms_opt(14, 30, 0)
+            .unwrap();
+        let callend_utc = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+            .unwrap()
+            .and_hms_opt(14, 31, 5)
+            .unwrap();
         let row = cdr::CdrSummary {
             id: 42,
-            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
-                .unwrap()
-                .and_hms_opt(14, 30, 0)
-                .unwrap(),
-            callend: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
-                .unwrap()
-                .and_hms_opt(14, 31, 5)
-                .unwrap(),
+            calldate: chrono::Utc.from_utc_datetime(&calldate_utc).with_timezone(&operator_tz),
+            callend: chrono::Utc.from_utc_datetime(&callend_utc).with_timezone(&operator_tz),
             duration: Some(65),
             connect_duration: Some(60),
             caller: Some("+49123".into()),
@@ -1543,7 +1551,7 @@ mod tests {
             rtp_b: cdr::RtpLeg::default(),
         };
         metadata.insert(42, row);
-        let csv = build_cdrs_csv(&metadata, &[42], utc);
+        let csv = build_cdrs_csv(&metadata, &[42], operator_tz);
         let text = std::str::from_utf8(&csv).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         // First two lines are the TZ note, third is the column header.
@@ -1554,8 +1562,9 @@ mod tests {
             lines[2],
             "id,calldate,callend,duration_sec,caller,called,src_ip,dst_ip,last_sip,mos,id_sensor"
         );
-        // The data row uses the operator's TZ for timestamps.
-        assert!(text.contains("42,2026-09-25 14:30:00,2026-09-25 14:31:05,65,+49123,49199,10.0.0.1,10.0.0.2,200,4.2,1"));
+        // The data row uses the operator's TZ for timestamps: 14:30:00
+        // UTC stored in the row renders as 21:30:00 in UTC+7.
+        assert!(text.contains("42,2026-09-25 21:30:00,2026-09-25 21:31:05,65,+49123,49199,10.0.0.1,10.0.0.2,200,4.2,1"));
     }
 
     #[test]
@@ -1564,14 +1573,22 @@ mod tests {
         let utc = chrono::FixedOffset::east_opt(0).unwrap();
         let mk = |id: u64| cdr::CdrSummary {
             id,
-            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap(),
-            callend: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
-                .unwrap()
-                .and_hms_opt(0, 1, 0)
-                .unwrap(),
+            calldate: chrono::Utc
+                .from_utc_datetime(
+                    &chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap(),
+                )
+                .with_timezone(&utc),
+            callend: chrono::Utc
+                .from_utc_datetime(
+                    &chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                        .unwrap()
+                        .and_hms_opt(0, 1, 0)
+                        .unwrap(),
+                )
+                .with_timezone(&utc),
             duration: None,
             connect_duration: None,
             caller: None,

@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum::body::Bytes;
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, TimeZone};
 use futures_util::StreamExt;
 use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
@@ -344,7 +344,7 @@ pub async fn cdr_list(
     let (page_result, distinct_result) = tokio::join!(
         crate::error::with_query_timeout(
             timeout,
-            cdr::list(&state.pool, &normalized, *state.ip_shape),
+            cdr::list(&state.pool, &normalized, *state.ip_shape, tz),
         ),
         crate::error::with_query_timeout(timeout, cdr::distinct_values(&state.pool, 7, 100, tz)),
     );
@@ -498,7 +498,11 @@ pub async fn cdr_detail(
     // — used as the direction marker for the SIP timeline (an outgoing
     // request is one whose `sipcallerip` matches the CDR's own).
     let sipcallerip = cdr.sipcallerip;
-    let cdr = CdrSummary::from(cdr);
+    // Resolve the operator's TZ for the detail page — the detail URL
+    // has no `?tz_offset_hours=` (it can't, the form lives on the
+    // list page), so we rely on the session cookie + env default.
+    let (tz, _) = state.resolve_tz(&user, None);
+    let cdr = CdrSummary::from_row(cdr, tz);
 
     // Pull the optional extension tables in parallel — all three are tiny.
     let (next, branches, sip_messages) = tokio::join!(
@@ -1915,6 +1919,10 @@ pub async fn cdr_export_csv(
     // stream runs as long as needed (a 100k-row export shouldn't trip a
     // 30s cap).
     let mut row_stream = cdr::list_stream(&state.pool, &normalized, cap, *state.ip_shape);
+    // Move `tz` into the spawn so each row can be converted to the
+    // operator's resolved offset before formatting. Without this the
+    // CSV would be in wall-clock UTC regardless of the user's choice.
+    let tz_for_stream = tz;
 
     // Channel of formatted CSV byte chunks for the HTTP response.
     let (csv_tx, csv_rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8);
@@ -1965,7 +1973,7 @@ pub async fn cdr_export_csv(
             let Some(row_result) = row_result else { break };
             match row_result {
                 Ok(r) => {
-                    let summary = CdrSummary::from(r);
+                    let summary = CdrSummary::from_row(r, tz_for_stream);
                     let line = format_csv_line(&summary);
                     if csv_tx.send(Ok(Bytes::from(line))).await.is_err() {
                         break; // client disconnected
@@ -2006,7 +2014,7 @@ pub async fn cdr_export_csv(
 /// a hard error — the operator still gets the rows that do exist).
 pub async fn cdr_export_csv_batch(
     State(state): State<AppState>,
-    _user: SessionUser,
+    user: SessionUser,
     axum::Json(req): axum::Json<BatchCsvRequest>,
 ) -> AppResult<Response> {
     // Same ids-vs-filter precedence rule as the pcap batch: explicit
@@ -2044,9 +2052,15 @@ pub async fn cdr_export_csv_batch(
     }
     let cdr_ids = &cdr_ids[..cdr_ids.len().min(CSV_BATCH_MAX)];
 
+    // Use the operator's session TZ for the output so the CSV timestamps
+    // match what the operator sees in the list view. The list view's
+    // `?tz_offset_hours=` URL param is irrelevant here (the request is a
+    // POST with no query string), so the cookie is the only signal.
+    let (tz, _) = state.resolve_tz(&user, None);
+
     // Single SQL roundtrip, then preserve input order — the operator
     // expects the CSV rows to follow the order they ticked.
-    let by_id = cdr::fetch_by_ids(&state.pool, cdr_ids).await?;
+    let by_id = cdr::fetch_by_ids(&state.pool, cdr_ids, tz).await?;
     let mut summaries: Vec<CdrSummary> = Vec::with_capacity(cdr_ids.len());
     for &id in cdr_ids {
         if let Some(s) = by_id.get(&id) {
@@ -2586,16 +2600,20 @@ mod csv_tests {
 
     /// Build a minimal `CdrSummary` for the tests. Only the fields
     /// `format_csv_line` actually reads are populated; everything
-    /// else gets `Default::default()`.
+    /// else gets `Default::default()`. The `calldate` is anchored in
+    /// UTC (the column's storage convention) — `from_row` will
+    /// convert it to the operator's TZ at the boundary.
     fn mk_summary(id: u64, caller: Option<&str>, called: Option<&str>) -> CdrSummary {
-        let calldate = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+        let calldate_utc = chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
             .unwrap()
             .and_hms_opt(14, 30, 0)
             .unwrap();
+        let callend_utc = calldate_utc + chrono::Duration::seconds(42);
+        let utc = chrono::FixedOffset::east_opt(0).unwrap();
         CdrSummary {
             id,
-            calldate,
-            callend: calldate + chrono::Duration::seconds(42),
+            calldate: chrono::Utc.from_utc_datetime(&calldate_utc).with_timezone(&utc),
+            callend: chrono::Utc.from_utc_datetime(&callend_utc).with_timezone(&utc),
             duration: Some(42),
             connect_duration: None,
             caller: caller.map(String::from),
