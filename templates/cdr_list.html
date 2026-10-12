@@ -39,7 +39,17 @@
       const form   = document.getElementById('tz-form');
       const next   = document.getElementById('tz-next');
       const status = document.getElementById('tz-status');
-      if (!select || !form) return;
+      // Diagnostic breadcrumbs — visible in devtools console, no UI
+      // impact. Without these, "the dropdown does nothing" is a
+      // debugging dead end: we can't tell whether (a) the IIFE didn't
+      // run, (b) the elements weren't found, (c) the change event
+      // didn't fire, or (d) form.submit() is being silently dropped.
+      // Each branch logs a distinct message so the operator can grep.
+      console.debug('[tz-form] IIFE start, select=%o form=%o next=%o status=%o', select, form, next, status);
+      if (!select || !form) {
+        console.warn('[tz-form] required elements missing; change handler NOT attached');
+        return;
+      }
 
       // Pre-populate the `next` field so the <noscript> fallback
       // also preserves the operator's URL. We strip `tz_offset_hours`
@@ -54,8 +64,11 @@
         u.searchParams.delete('tz_offset_hours');
         next.value = u.pathname + u.search;
       }
+      console.debug('[tz-form] next field populated: %o', next && next.value);
 
       select.addEventListener('change', function() {
+        console.debug('[tz-form] change fired, value=%s, form.action=%s, next=%s',
+          select.value, form.action, next && next.value);
         if (status) {
           status.textContent = 'applying…';
           status.className = 'tz-status tz-status-pending';
@@ -76,8 +89,12 @@
         // The trade-off is a full page reload — which the
         // operator already approved (re-running the search
         // is fine for a TZ change).
-        setTimeout(function() { form.submit(); }, 100);
+        setTimeout(function() {
+          console.debug('[tz-form] calling form.submit() now');
+          form.submit();
+        }, 100);
       });
+      console.debug('[tz-form] change listener attached');
     })();
   </script>
 {% endblock %}
