@@ -131,6 +131,31 @@ fn sanitize_next(next: Option<&str>) -> String {
     }
 }
 
+/// Drop any `tz_offset_hours=...` from the URL's query string. The
+/// CDR list page reads TZ precedence as URL > session > env
+/// default — if the redirect target still has the OLD tz_offset_hours
+/// on it (e.g. because the operator landed on a URL with the param
+/// for shareability), the freshly-set session cookie loses to the
+/// URL param and the dropdown reverts. Stripping it here makes the
+/// fix live in the binary so it doesn't depend on the template's
+/// JS also having the same fix deployed.
+fn strip_tz_param(url: &str) -> String {
+    let Some((path, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        if !pair.starts_with("tz_offset_hours=") {
+            kept.push(pair);
+        }
+    }
+    if kept.is_empty() {
+        path.to_string()
+    } else {
+        format!("{}?{}", path, kept.join("&"))
+    }
+}
+
 pub async fn logout() -> Response {
     let cookie_header = format_set_cookie(COOKIE_NAME, "", "/", Some(0));
     let mut resp = Redirect::to("/login").into_response();
@@ -167,7 +192,10 @@ pub async fn set_tz(
     let value = encode_cookie(&new_session, state.config.cookie_secret.as_bytes());
     let cookie_header = format_set_cookie(COOKIE_NAME, &value, "/", Some(TTL_SECS));
 
-    let next = sanitize_next(form.next.as_deref());
+    // Strip tz_offset_hours from the redirect target so the
+    // freshly-set session cookie isn't overridden by a stale
+    // URL param (see strip_tz_param for the why).
+    let next = strip_tz_param(&sanitize_next(form.next.as_deref()));
     let mut resp = Redirect::to(&next).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
@@ -253,4 +281,34 @@ fn parse_session_cookie(headers: &HeaderMap) -> Option<cookie::Cookie<'static>> 
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `strip_tz_param` is the safety net that lives in the binary
+    /// itself (not in the template's JS) so the fix works regardless
+    /// of which template version is deployed.
+    #[test]
+    fn strip_tz_removes_only_the_offset_param() {
+        assert_eq!(strip_tz_param("/?tz_offset_hours=0"), "/");
+        assert_eq!(
+            strip_tz_param("/?tz_offset_hours=0&caller=145,165,167"),
+            "/?caller=145,165,167"
+        );
+        assert_eq!(
+            strip_tz_param("/?caller=145,165,167&tz_offset_hours=0&page=2"),
+            "/?caller=145,165,167&page=2"
+        );
+        // Other params with the same prefix stay — only the exact
+        // `tz_offset_hours=` key matches.
+        assert_eq!(
+            strip_tz_param("/?tz_offset_hours_legacy=1&tz_offset_hours=0"),
+            "/?tz_offset_hours_legacy=1"
+        );
+        // No query string → unchanged.
+        assert_eq!(strip_tz_param("/"), "/");
+        assert_eq!(strip_tz_param("/cdr/12345"), "/cdr/12345");
+    }
 }
