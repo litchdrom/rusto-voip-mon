@@ -32,72 +32,6 @@
   {# Warm the CSV endpoint too — large exports benefit most from a head start. #}
   <link rel="prefetch" href="{{ export_url }}">
 {% endblock %}
-{% block scripts %}
-  <script>
-    (function() {
-      const select = document.getElementById('tz-select');
-      const form   = document.getElementById('tz-form');
-      const next   = document.getElementById('tz-next');
-      const status = document.getElementById('tz-status');
-      // Diagnostic breadcrumbs — visible in devtools console, no UI
-      // impact. Without these, "the dropdown does nothing" is a
-      // debugging dead end: we can't tell whether (a) the IIFE didn't
-      // run, (b) the elements weren't found, (c) the change event
-      // didn't fire, or (d) form.submit() is being silently dropped.
-      // Each branch logs a distinct message so the operator can grep.
-      console.debug('[tz-form] IIFE start, select=%o form=%o next=%o status=%o', select, form, next, status);
-      if (!select || !form) {
-        console.warn('[tz-form] required elements missing; change handler NOT attached');
-        return;
-      }
-
-      // Pre-populate the `next` field so the <noscript> fallback
-      // also preserves the operator's URL. We strip `tz_offset_hours`
-      // from it because the page's TZ precedence is URL > session >
-      // env default — if the URL still has the OLD tz_offset_hours
-      // when the redirect lands, it overrides the freshly-set
-      // session cookie and the dropdown reverts to the old value.
-      // Dropping the param means the redirect lands on a "clean"
-      // URL and the cookie wins.
-      if (next && !next.value) {
-        const u = new URL(window.location.href);
-        u.searchParams.delete('tz_offset_hours');
-        next.value = u.pathname + u.search;
-      }
-      console.debug('[tz-form] next field populated: %o', next && next.value);
-
-      select.addEventListener('change', function() {
-        console.debug('[tz-form] change fired, value=%s, form.action=%s, next=%s',
-          select.value, form.action, next && next.value);
-        if (status) {
-          status.textContent = 'applying…';
-          status.className = 'tz-status tz-status-pending';
-        }
-        // Just submit the form. The browser handles the POST
-        // natively (urlencoded, follows the 303), the server
-        // sets the cookie, and the redirect lands back on the
-        // current URL — same filters, fresh dates in the new
-        // TZ. The 100ms delay is just enough to register the
-        // "applying…" indicator visually before the navigation
-        // kicks in.
-        //
-        // This is more reliable than a fetch() round-trip:
-        //   - no Content-Type mismatch with the server's
-        //     `Form<SetTzForm>` extractor,
-        //   - no opaque-redirect / Set-Cookie quirks,
-        //   - the page reload is the browser's job, not ours.
-        // The trade-off is a full page reload — which the
-        // operator already approved (re-running the search
-        // is fine for a TZ change).
-        setTimeout(function() {
-          console.debug('[tz-form] calling form.submit() now');
-          form.submit();
-        }, 100);
-      });
-      console.debug('[tz-form] change listener attached');
-    })();
-  </script>
-{% endblock %}
 {% block content %}
 
 {# When JS is disabled the cross-page batch-selection machinery doesn't
@@ -355,6 +289,45 @@
 
 {% endblock %}
 {% block scripts %}
+<script>
+// TZ dropdown: form-submit on change. Sits at the top of this single
+// scripts block because the template previously had two such blocks
+// and askama honored only the last — which dropped the form-submit
+// JS entirely and made the dropdown appear inert even though the
+// HTML was rendered. Consolidating into one block is the fix; the
+// breadcrumb logs make the live state observable in devtools if it
+// ever stops working again.
+(function() {
+  const select = document.getElementById('tz-select');
+  const form   = document.getElementById('tz-form');
+  const next   = document.getElementById('tz-next');
+  const status = document.getElementById('tz-status');
+  console.debug('[tz-form] IIFE start, select=%o form=%o next=%o status=%o', select, form, next, status);
+  if (!select || !form) {
+    console.warn('[tz-form] required elements missing; change handler NOT attached');
+    return;
+  }
+  if (next && !next.value) {
+    const u = new URL(window.location.href);
+    u.searchParams.delete('tz_offset_hours');
+    next.value = u.pathname + u.search;
+  }
+  console.debug('[tz-form] next field populated: %o', next && next.value);
+  select.addEventListener('change', function() {
+    console.debug('[tz-form] change fired, value=%s, form.action=%s, next=%s',
+      select.value, form.action, next && next.value);
+    if (status) {
+      status.textContent = 'applying…';
+      status.className = 'tz-status tz-status-pending';
+    }
+    setTimeout(function() {
+      console.debug('[tz-form] calling form.submit() now');
+      form.submit();
+    }, 100);
+  });
+  console.debug('[tz-form] change listener attached');
+})();
+</script>
 <script>
 // Clear one multi-select section: empty the text input(s) + uncheck the
 // checkboxes in the same <details>.
