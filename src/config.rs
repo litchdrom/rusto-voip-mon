@@ -12,11 +12,13 @@ pub struct Config {
     /// Hard cap on rows returned per CSV export. Prevents accidental
     /// multi-GB downloads from "all time" filters.
     pub csv_export_limit: usize,
-    /// Display/filter timezone offset from UTC, in seconds. Defaults to 0
-    /// (UTC) so behavior is unchanged when unset. Set via
-    /// `APP_TZ_OFFSET_HOURS` to shift the "today" window and labels to
+    /// Display/filter timezone offset from UTC, in **seconds**. Defaults
+    /// to 0 (UTC) so behavior is unchanged when unset. Set via
+    /// `APP_TZ_OFFSET_SECS` to shift the "today" window and labels to
     /// match the operator's local time when the server clock is in UTC
-    /// but the human isn't.
+    /// but the human isn't. Seconds (not hours) so non-whole-hour
+    /// zones work — e.g. `28800` for UTC+8, `19800` for IST +5:30,
+    /// `20700` for Nepal +5:45.
     pub tz_offset_secs: i32,
     /// Timezone offset of the **stored** `calldate` values, in seconds.
     /// Defaults to 0 (UTC) for the standard VoIPmonitor convention.
@@ -49,10 +51,9 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10_000),
-            tz_offset_secs: std::env::var("APP_TZ_OFFSET_HOURS")
+            tz_offset_secs: std::env::var("APP_TZ_OFFSET_SECS")
                 .ok()
                 .and_then(|v| v.parse::<i32>().ok())
-                .map(|h| h.saturating_mul(3600))
                 .unwrap_or(0),
             db_tz_offset_secs: std::env::var("APP_DB_TZ_OFFSET_HOURS")
                 .ok()

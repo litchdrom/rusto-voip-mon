@@ -18,14 +18,23 @@ use crate::{
     state::AppState,
 };
 
-/// `0` → "UTC", positive → "UTC+N", negative → "UTC-N".
-fn tz_label(h: i8) -> String {
-    if h == 0 {
-        "UTC".to_string()
-    } else if h > 0 {
-        format!("UTC+{}", h)
+/// Format an offset in seconds as a TZ label. Whole-hour offsets
+/// keep the short form (`UTC+5`, `UTC-3`); non-whole-hour offsets
+/// print `:MM` (`UTC+5:30` for IST, `UTC+5:45` for Nepal,
+/// `UTC+12:45` for Chatham). The label never includes a sign on
+/// `0` — that's just "UTC".
+fn tz_label(secs: i32) -> String {
+    if secs == 0 {
+        return "UTC".to_string();
+    }
+    let sign = if secs > 0 { "+" } else { "-" };
+    let abs = secs.unsigned_abs();
+    let hours = abs / 3600;
+    let minutes = (abs % 3600) / 60;
+    if minutes == 0 {
+        format!("UTC{sign}{hours}")
     } else {
-        format!("UTC{}", h)
+        format!("UTC{sign}{hours}:{minutes:02}")
     }
 }
 
@@ -39,14 +48,67 @@ fn tz_label(h: i8) -> String {
 /// submitted an empty value, the server cleared the cookie,
 /// and the page reverted to TZ=0. Generating the HTML
 /// server-side bypasses the askama issue entirely.
-fn render_tz_options_html(selected_hours: i8, default_hours: i8) -> String {
-    let mut out = String::with_capacity(2048);
-    for h in -12..=14 {
-        let label = tz_label(h);
-        let selected = if h == selected_hours { " selected" } else { "" };
-        let suffix = if h == default_hours { " (server default)" } else { "" };
+///
+/// The offsets are in **seconds from UTC** and cover the
+/// full set of populated timezones the operator might pick
+/// (whole hours plus the half- and quarter-hour zones).
+/// Sorted ascending so the dropdown reads naturally.
+fn render_tz_options_html(selected_secs: i32, default_secs: i32) -> String {
+    // Offsets in seconds from UTC, sorted ascending. Whole-hour
+    // entries keep the old short-form for compactness in the
+    // dropdown; non-whole-hour entries are added so operators in
+    // India, Iran, Nepal, Newfoundland, Myanmar, Japan, Lord
+    // Howe, Chatham, Marquesas get the exact offset.
+    let offsets: &[(i32, &str)] = &[
+        (-12 * 3600, "Baker / Howland Island"),
+        (-11 * 3600, "American Samoa"),
+        (-10 * 3600, "Hawaii"),
+        (-9 * 3600, "Alaska"),
+        (-34200, "Marquesas Islands (UTC-9:30)"),
+        (-8 * 3600, "Los Angeles / PST"),
+        (-7 * 3600, "Denver / MST"),
+        (-6 * 3600, "Chicago / CST"),
+        (-5 * 3600, "New York / EST"),
+        (-4 * 3600, "Atlantic"),
+        (-12600, "Newfoundland (UTC-3:30)"),
+        (-3 * 3600, "Buenos Aires / São Paulo"),
+        (-2 * 3600, "Mid-Atlantic"),
+        (-1 * 3600, "Cape Verde"),
+        (0, "UTC"),
+        (1 * 3600, "Berlin / Paris / CET"),
+        (2 * 3600, "Helsinki / Athens / EET"),
+        (3 * 3600, "Moscow / Istanbul"),
+        (16200, "Iran / Afghanistan (UTC+4:30)"),
+        (4 * 3600, "Dubai / Samara"),
+        (5 * 3600, "Karachi / Yekaterinburg"),
+        (19800, "India / Sri Lanka (UTC+5:30)"),
+        (20700, "Nepal (UTC+5:45)"),
+        (6 * 3600, "Dhaka / Omsk"),
+        (23400, "Myanmar / Cocos (UTC+6:30)"),
+        (7 * 3600, "Bangkok / Jakarta / Krasnoyarsk"),
+        (8 * 3600, "Beijing / Singapore / Perth"),
+        (9 * 3600, "Tokyo / Seoul / Yakutsk"),
+        (34200, "Japan / Aus Central (UTC+9:30)"),
+        (10 * 3600, "Sydney / Guam / Vladivostok"),
+        (37800, "Lord Howe / Aus (UTC+10:30)"),
+        (11 * 3600, "Magadan / Solomon"),
+        (12 * 3600, "Auckland / Fiji / Kamchatka"),
+        (45900, "Chatham Islands (UTC+12:45)"),
+        (13 * 3600, "Samoa / Tonga"),
+        (14 * 3600, "Kiribati"),
+    ];
+    let mut out = String::with_capacity(4096);
+    for (secs, hint) in offsets {
+        let label = tz_label(*secs);
+        let selected = if *secs == selected_secs { " selected" } else { "" };
+        let suffix = if *secs == default_secs { " (server default)" } else { "" };
+        let full_label = if hint.is_empty() {
+            format!("{label}{suffix}")
+        } else {
+            format!("{label} — {hint}{suffix}")
+        };
         out.push_str(&format!(
-            "<option value=\"{h}\"{selected}>{label}{suffix}</option>",
+            "<option value=\"{secs}\"{selected}>{full_label}</option>",
         ));
     }
     out
@@ -75,12 +137,13 @@ pub struct CdrListTemplate {
     pub next_url: String,
     pub prev_url: String,
     pub day_label: String,
-    /// Active TZ offset hours (the one driving the page), for the
-    /// dropdown's `selected` attribute.
-    pub tz_offset_hours: i8,
-    /// Server default TZ offset hours, so the dropdown can label
-    /// "Server default (-3h)" distinctly from "user override".
-    pub tz_default_hours: i8,
+    /// Active TZ offset in **seconds from UTC** (the one driving the
+    /// page), for the dropdown's `selected` attribute. Seconds (not
+    /// whole hours) so non-whole-hour zones work.
+    pub tz_offset_secs: i32,
+    /// Server default TZ offset in seconds, so the dropdown can
+    /// label "server default" distinctly from "user override".
+    pub tz_default_secs: i32,
     /// Pre-rendered HTML for the topbar TZ dropdown's
     /// `<option>` set. See `render_tz_options_html` for why
     /// this is a `String` rather than a `Vec<TzOption>` that
@@ -331,8 +394,11 @@ pub async fn cdr_list(
     };
     let filters = build_filters(&q, &params);
     // Per-request TZ override wins, then session-stored, then env default.
-    let query_tz: Option<i8> = params
-        .first("tz_offset_hours")
+    // Stored as seconds so IST (+5:30 = 19800s) and other half/quarter-hour
+    // zones work; `0` is the "reset" sentinel.
+    let query_tz: Option<i32> = params
+        .first("tz_offset_secs")
+        .or_else(|| params.first("tz_offset_hours")) // legacy alias
         .as_deref()
         .and_then(|s| s.parse().ok());
     let (tz, _) = state.resolve_tz(&user, query_tz);
@@ -415,14 +481,14 @@ pub async fn cdr_list(
         next_url,
         prev_url,
         day_label,
-        tz_offset_hours: (tz.local_minus_utc() / 3600) as i8,
-        tz_default_hours: (state.config.tz_offset_secs / 3600) as i8,
+        tz_offset_secs: tz.local_minus_utc(),
+        tz_default_secs: state.config.tz_offset_secs,
         // Render the <option> set in Rust — see
         // `render_tz_options_html` for why the template can't
         // loop over the options itself.
         tz_options_html: render_tz_options_html(
-            (tz.local_minus_utc() / 3600) as i8,
-            (state.config.tz_offset_secs / 3600) as i8,
+            tz.local_minus_utc(),
+            state.config.tz_offset_secs,
         ),
         selected_count: user.selected_cdr_ids.len(),
     };
@@ -521,7 +587,7 @@ pub async fn cdr_detail(
     // request is one whose `sipcallerip` matches the CDR's own).
     let sipcallerip = cdr.sipcallerip;
     // Resolve the operator's TZ for the detail page — the detail URL
-    // has no `?tz_offset_hours=` (it can't, the form lives on the
+    // has no `?tz_offset_secs=` (it can't, the form lives on the
     // list page), so we rely on the session cookie + env default.
     let (tz, _) = state.resolve_tz(&user, None);
     let cdr = CdrSummary::from_row(cdr, tz, state.config.db_tz_offset_secs);
@@ -2100,7 +2166,7 @@ pub async fn cdr_export_csv_batch(
 
     // Use the operator's session TZ for the output so the CSV timestamps
     // match what the operator sees in the list view. The list view's
-    // `?tz_offset_hours=` URL param is irrelevant here (the request is a
+    // `?tz_offset_secs=` URL param is irrelevant here (the request is a
     // POST with no query string), so the cookie is the only signal.
     let (tz, _) = state.resolve_tz(&user, None);
 
@@ -2635,6 +2701,147 @@ mod sip_render_tests {
         assert!(
             rtp_pos < bye_pos,
             "RTP row must appear BEFORE the BYE row in the timeline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tz_label_tests {
+    //! Unit tests for the seconds-precision TZ label / dropdown
+    //! renderer. Whole-hour offsets print the short form (`UTC+5`),
+    //! non-whole-hour offsets print `:MM` (`UTC+5:30` for IST,
+    //! `UTC+5:45` for Nepal, `UTC+12:45` for Chatham Islands).
+    //! The dropdown must include every half/quarter-hour entry in
+    //! the canonical list, with no duplicates or omissions.
+
+    use super::*;
+
+    /// Whole-hour offsets use the short form, no `:MM` suffix.
+    #[test]
+    fn label_for_whole_hour_offsets() {
+        assert_eq!(tz_label(0), "UTC");
+        assert_eq!(tz_label(3 * 3600), "UTC+3");
+        assert_eq!(tz_label(-3 * 3600), "UTC-3");
+        assert_eq!(tz_label(8 * 3600), "UTC+8");
+        assert_eq!(tz_label(-12 * 3600), "UTC-12");
+    }
+
+    /// Non-whole-hour offsets print the `:MM` suffix.
+    #[test]
+    fn label_for_half_and_quarter_hour_offsets() {
+        assert_eq!(tz_label(19800), "UTC+5:30"); // India
+        assert_eq!(tz_label(-19800), "UTC-5:30");
+        assert_eq!(tz_label(20700), "UTC+5:45"); // Nepal
+        assert_eq!(tz_label(16200), "UTC+4:30"); // Iran / Afghanistan
+        assert_eq!(tz_label(23400), "UTC+6:30"); // Myanmar
+        assert_eq!(tz_label(34200), "UTC+9:30"); // Japan / Aus Central
+        assert_eq!(tz_label(37800), "UTC+10:30"); // Lord Howe
+        assert_eq!(tz_label(45900), "UTC+12:45"); // Chatham Islands
+        assert_eq!(tz_label(-12600), "UTC-3:30"); // Newfoundland
+        assert_eq!(tz_label(-34200), "UTC-9:30"); // Marquesas
+    }
+
+    /// The dropdown must include every half/quarter-hour zone we
+    /// promise in the label, AND a representative whole-hour zone
+    /// for each region. Counts the number of <option> entries that
+    /// actually carry one of the non-whole-hour seconds values; if
+    /// the array silently drops an entry, this test fails.
+    #[test]
+    fn dropdown_includes_all_half_and_quarter_hour_zones() {
+        let html = render_tz_options_html(0, 0);
+        for (secs, hint_substring) in &[
+            (-34200i32, "Marquesas"),
+            (-12600, "Newfoundland"),
+            (16200, "Iran"),
+            (19800, "India"),
+            (20700, "Nepal"),
+            (23400, "Myanmar"),
+            (34200, "Japan"),
+            (37800, "Lord Howe"),
+            (45900, "Chatham"),
+        ] {
+            let needle = format!("value=\"{secs}\"");
+            assert!(
+                html.contains(&needle),
+                "dropdown is missing tz_offset_secs={secs} ({hint_substring})"
+            );
+            assert!(
+                html.contains(hint_substring),
+                "dropdown entry for {secs} should mention {hint_substring}"
+            );
+        }
+    }
+
+    /// The `selected` attribute must land on exactly one option —
+    /// the operator's chosen offset, regardless of whether it's
+    /// a whole-hour, half-hour, or quarter-hour entry. The
+    /// env-default option gets a `(server default)` *text marker*
+    /// (so operators can see which option the system uses when
+    /// no per-operator TZ is set) but never `selected` unless
+    /// `selected_secs == default_secs`.
+    #[test]
+    fn dropdown_marks_selected_and_default() {
+        // IST is selected, env default is +3 (different).
+        let html = render_tz_options_html(19800, 3 * 3600);
+
+        // 1. Exactly one option carries `selected` (HTML semantics:
+        //    multiple would be invalid and the browser would honor
+        //    only the last).
+        assert_eq!(
+            html.matches(" selected").count(),
+            1,
+            "exactly one <option> should be marked selected"
+        );
+
+        // 2. The selected option is IST.
+        assert!(
+            html.contains("value=\"19800\" selected"),
+            "IST (19800) should be the selected option"
+        );
+
+        // 3. The env-default offset +3 carries the marker text but
+        //    NOT the `selected` attribute.
+        assert!(
+            html.contains("UTC+3 — Moscow / Istanbul (server default)"),
+            "env default +3 should carry the (server default) text marker"
+        );
+        assert!(
+            !html.contains("value=\"10800\" selected"),
+            "env default +3 should NOT carry `selected` when operator picked IST"
+        );
+
+        // 4. IST itself is in the dropdown exactly once (no
+        //    duplicate entry, no accidental second `<option>`).
+        assert_eq!(
+            html.matches("value=\"19800\"").count(),
+            1,
+            "IST (19800) should appear exactly once in the dropdown"
+        );
+
+        // 5. IST does NOT carry the (server default) marker when
+        //    the env default is +3.
+        assert!(
+            !html.contains("UTC+5:30 — India / Sri Lanka (server default)"),
+            "IST should not be marked as (server default) when env default is +3"
+        );
+    }
+
+    /// When `selected_secs == default_secs`, the same option gets
+    /// both `selected` AND the `(server default)` marker — the
+    /// typical case for a fresh operator who hasn't picked a TZ
+    /// yet, so the cookie has no value and we render the env
+    /// default as the chosen one.
+    #[test]
+    fn dropdown_selected_and_default_can_coincide() {
+        let html = render_tz_options_html(3 * 3600, 3 * 3600);
+        assert_eq!(
+            html.matches(" selected").count(),
+            1,
+            "exactly one option should be marked selected"
+        );
+        assert!(
+            html.contains("value=\"10800\" selected>UTC+3 — Moscow / Istanbul (server default)"),
+            "+3 should be both selected and the server default"
         );
     }
 }

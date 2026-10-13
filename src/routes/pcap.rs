@@ -697,7 +697,7 @@ async fn resolve_batch_ids(
         }
         out
     } else if let Some(filter) = filter {
-        let query_tz: Option<i8> = parse_tz_from_filter(filter);
+        let query_tz: Option<i32> = parse_tz_from_filter(filter);
         let (tz, _) = state.resolve_tz(user, query_tz);
         cdr::ids_for_query_string(&state.pool, filter, tz, batch_max(state), *state.ip_shape).await?
     } else {
@@ -983,19 +983,34 @@ fn csv_escape(s: &Option<String>) -> String {
     }
 }
 
-/// Pull the optional `tz_offset_hours` out of a raw CDR-list query string.
-/// Returns `None` if absent, malformed, or set to `0` (which the list
-/// page treats as "use the server default").
-fn parse_tz_from_filter(raw_query: &str) -> Option<i8> {
+/// Pull the optional `tz_offset_secs` (or legacy `tz_offset_hours`)
+/// out of a raw CDR-list query string. Returns the parsed value as
+/// seconds, or `None` if absent, malformed, or set to `0` (which the
+/// list page treats as "use the server default"). Tries the modern
+/// `tz_offset_secs` first, then falls back to `tz_offset_hours` for
+/// URLs minted before the seconds migration.
+fn parse_tz_from_filter(raw_query: &str) -> Option<i32> {
     let raw_query = raw_query.trim_start_matches('?');
+    let mut legacy: Option<i32> = None;
     for pair in raw_query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
-            if k == "tz_offset_hours" {
+            if k == "tz_offset_secs" {
                 return v.parse().ok();
+            }
+            if k == "tz_offset_hours" && legacy.is_none() {
+                // Treat the legacy hours value as if it were seconds
+                // so a stale URL with the old key still resolves. If
+                // someone passed `tz_offset_hours=3` (3 hours) on the
+                // legacy format, parse as i32 — 3 is still 3 either
+                // way (whole hours are whole seconds), so the values
+                // coincide for whole-hour offsets and only diverge
+                // for the half/quarter-hour zones (which the legacy
+                // format never carried anyway).
+                legacy = v.parse().ok();
             }
         }
     }
-    None
+    legacy
 }
 
 async fn fetch_parts(pool: &MySqlPool, cdr_id: u64) -> AppResult<Vec<TarPartRow>> {

@@ -38,13 +38,18 @@ pub struct SessionUser {
     pub can_cdr: bool,
     pub can_pcap: bool,
     pub expires_at: i64,
-    /// Per-user timezone offset from UTC in hours. `None` means "use the
-    /// server's `APP_TZ_OFFSET_HOURS` default". Stored in the session so
-    /// the operator's choice survives navigation and page reloads.
+    /// Per-user timezone offset from UTC in **seconds**. `None` means
+    /// "use the server's `APP_TZ_OFFSET_SECS` default". Stored in
+    /// the session so the operator's choice survives navigation and
+    /// page reloads. Seconds (not hours) so non-whole-hour zones work
+    /// — India (+5:30), Iran (+4:30), Nepal (+5:45), Newfoundland
+    /// (-3:30), Myanmar (+6:30), Japan/Aus Central (+9:30), Lord
+    /// Howe (+10:30), Chatham Islands (+12:45), Marquesas (-9:30).
     /// Defaulted on deserialize so cookies minted before this field
-    /// existed keep working.
+    /// existed keep working (the field is just missing → None →
+    /// server default).
     #[serde(default)]
-    pub tz_offset_hours: Option<i8>,
+    pub tz_offset_secs: Option<i32>,
     /// CDR IDs the operator has ticked for the upcoming batch download.
     /// Cross-page selection state — toggling a checkbox on page 2 still
     /// sees the ones you ticked on page 1. Always deduplicated + capped
@@ -77,16 +82,17 @@ impl SessionUser {
             can_cdr,
             can_pcap,
             expires_at,
-            tz_offset_hours: None,
+            tz_offset_secs: None,
             selected_cdr_ids: Vec::new(),
         }
     }
 
     /// Return a copy of this session with the timezone override updated.
     /// The encoded cookie's HMAC changes too, so the browser must be
-    /// re-issued the cookie.
-    pub fn with_tz(mut self, tz_offset_hours: Option<i8>) -> Self {
-        self.tz_offset_hours = tz_offset_hours;
+    /// re-issued the cookie. `tz_offset_secs` is the offset in seconds
+    /// from UTC (e.g. `Some(19800)` for IST +5:30).
+    pub fn with_tz(mut self, tz_offset_secs: Option<i32>) -> Self {
+        self.tz_offset_secs = tz_offset_secs;
         // Re-stamp the TTL so a TZ change bumps the session lifetime.
         self.expires_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)

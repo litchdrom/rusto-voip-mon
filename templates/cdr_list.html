@@ -11,7 +11,7 @@
      the JS-disabled path is covered). #}
   <form method="post" action="/tz" class="tz-form" id="tz-form">
     <label for="tz-select" class="muted small">TZ</label>
-    <select name="tz_offset_hours" id="tz-select">
+    <select name="tz_offset_secs" id="tz-select">
       {{ tz_options_html|safe }}
     </select>
     <input type="hidden" name="next" value="" id="tz-next">
@@ -98,8 +98,10 @@
       onsubmit="var b=document.getElementById('apply-btn'); if(b){b.classList.add('loading'); setTimeout(function(){b.disabled=true;},0);}">
   {# Carry the active TZ into the URL so the filter view is shareable
      and survives even if the session cookie is dropped. Server precedence
-     still: ?tz_offset_hours=N > session > env default. #}
-  <input type="hidden" name="tz_offset_hours" value="{{ tz_offset_hours }}" id="tz-hidden">
+     still: ?tz_offset_secs=N > session > env default. The value is in
+     SECONDS (not whole hours) so non-whole-hour zones work: 19800 for
+     IST, 20700 for Nepal, etc. #}
+  <input type="hidden" name="tz_offset_secs" value="{{ tz_offset_secs }}" id="tz-hidden">
 
   <div class="grid">
     <label><span>From</span><input type="datetime-local" name="from" value="{{ filters.from_str }}"></label>
@@ -309,6 +311,12 @@
   }
   if (next && !next.value) {
     const u = new URL(window.location.href);
+    // Strip both the new (tz_offset_secs) and the legacy
+    // (tz_offset_hours) URL params so the redirect target lands on a
+    // clean URL. The server-side strip_tz_param does the same, but
+    // stripping here means the noscript fallback (a plain form
+    // submit) also works correctly.
+    u.searchParams.delete('tz_offset_secs');
     u.searchParams.delete('tz_offset_hours');
     next.value = u.pathname + u.search;
   }

@@ -145,21 +145,21 @@ fn sanitize_next(next: Option<&str>) -> String {
     }
 }
 
-/// Drop any `tz_offset_hours=...` from the URL's query string. The
-/// CDR list page reads TZ precedence as URL > session > env
-/// default — if the redirect target still has the OLD tz_offset_hours
-/// on it (e.g. because the operator landed on a URL with the param
-/// for shareability), the freshly-set session cookie loses to the
-/// URL param and the dropdown reverts. Stripping it here makes the
-/// fix live in the binary so it doesn't depend on the template's
-/// JS also having the same fix deployed.
+/// Drop any `tz_offset_secs=...` (legacy `tz_offset_hours=...`) from
+/// the URL's query string. The CDR list page reads TZ precedence as
+/// URL > session > env default — if the redirect target still has the
+/// OLD tz param on it (e.g. because the operator landed on a URL with
+/// the param for shareability), the freshly-set session cookie loses
+/// to the URL param and the dropdown reverts. Stripping it here
+/// makes the fix live in the binary so it doesn't depend on the
+/// template's JS also having the same fix deployed.
 fn strip_tz_param(url: &str) -> String {
     let Some((path, query)) = url.split_once('?') else {
         return url.to_string();
     };
     let mut kept: Vec<&str> = Vec::new();
     for pair in query.split('&') {
-        if !pair.starts_with("tz_offset_hours=") {
+        if !pair.starts_with("tz_offset_secs=") && !pair.starts_with("tz_offset_hours=") {
             kept.push(pair);
         }
     }
@@ -181,9 +181,12 @@ pub async fn logout() -> Response {
 
 /// Update the session-stored timezone and redirect back. Accepts form
 /// fields:
-///   `tz_offset_hours`  — required, integer in [-12, 14]. Empty / 0
+///   `tz_offset_secs`   — required, integer in [-12*3600, 14*3600]
+///                        (i.e. -12h to +14h in seconds). Empty / 0
 ///                        clears the override and falls back to the
-///                        server's `APP_TZ_OFFSET_HOURS`.
+///                        server's `APP_TZ_OFFSET_SECS`. Values like
+///                        19800 (IST +5:30), 20700 (Nepal +5:45), or
+///                        -12600 (Newfoundland -3:30) are all valid.
 ///   `next`             — relative URL to bounce back to.
 pub async fn set_tz(
     State(state): State<crate::state::AppState>,
@@ -193,16 +196,22 @@ pub async fn set_tz(
     // Parse + range-check, then collapse "0 means clear" so we return
     // Option<i8> instead of Option<Option<i8>>: 0 = clear (None), any
     // other valid hour = Some(h).
-    let parsed: Option<i8> = form
-        .tz_offset_hours
+    // The form value is now an offset in *seconds* (not whole hours),
+    // so non-whole-hour zones work: 19800 = IST +5:30, 20700 = Nepal
+    // +5:45, 45900 = Chatham Islands +12:45, etc. Valid range is the
+    // union of the dropdown's options: -12h to +14h in the steps
+    // emitted by `render_tz_options_html` (see routes::cdr::tz_label).
+    // Sentinel `0` collapses to `None` (clears the override).
+    let parsed: Option<i32> = form
+        .tz_offset_secs
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<i8>().ok())
-        .filter(|&h| (-12..=14).contains(&h))
-        .and_then(|h| if h == 0 { None } else { Some(h) });
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&s| (-12 * 3600..=14 * 3600).contains(&s))
+        .and_then(|s| if s == 0 { None } else { Some(s) });
 
-    let prev_tz = user.tz_offset_hours;
+    let prev_tz = user.tz_offset_secs;
     let new_session = user.with_tz(parsed);
     let value = encode_cookie(&new_session, state.config.cookie_secret.as_bytes());
     let cookie_header = format_set_cookie(COOKIE_NAME, &value, "/", Some(TTL_SECS));
@@ -212,19 +221,21 @@ pub async fn set_tz(
     // pull them out of the browser devtools. The `prev -> new` pair
     // makes it obvious whether the change took effect (or whether the
     // form submitted an empty value, which collapses to None and clears
-    // the cookie).
+    // the cookie). `raw_form_value` records the literal string the
+    // browser sent so a unit confusion (hours vs seconds) is
+    // immediately visible in the log.
     tracing::info!(
         user_id = new_session.user_id,
-        prev_tz = ?prev_tz,
-        new_tz = ?new_session.tz_offset_hours,
-        raw_form_value = ?form.tz_offset_hours,
+        prev_tz_secs = ?prev_tz,
+        new_tz_secs = ?new_session.tz_offset_secs,
+        raw_form_value = ?form.tz_offset_secs,
         next = %form.next.as_deref().unwrap_or(""),
         "tz change applied"
     );
 
-    // Strip tz_offset_hours from the redirect target so the
-    // freshly-set session cookie isn't overridden by a stale
-    // URL param (see strip_tz_param for the why).
+    // Strip tz_offset_secs (and legacy tz_offset_hours) from the
+    // redirect target so the freshly-set session cookie isn't
+    // overridden by a stale URL param (see strip_tz_param for the why).
     let next = strip_tz_param(&sanitize_next(form.next.as_deref()));
     let mut resp = Redirect::to(&next).into_response();
     resp.headers_mut().insert(
@@ -237,7 +248,10 @@ pub async fn set_tz(
 
 #[derive(Debug, Deserialize)]
 pub struct SetTzForm {
-    pub tz_offset_hours: Option<String>,
+    /// Offset in **seconds** from UTC, not whole hours. Sourced from
+    /// the `<select name="tz_offset_secs">` in the topbar form.
+    /// `19800` = IST +5:30, `0` = reset (clears the session override).
+    pub tz_offset_secs: Option<String>,
     pub next: Option<String>,
 }
 
@@ -319,12 +333,16 @@ mod tests {
 
     /// `strip_tz_param` is the safety net that lives in the binary
     /// itself (not in the template's JS) so the fix works regardless
-    /// of which template version is deployed.
+    /// of which template version is deployed. Strips both the
+    /// modern `tz_offset_secs=` and the legacy `tz_offset_hours=`
+    /// form so any cookie / link minted before the seconds migration
+    /// still cleans up correctly.
     #[test]
     fn strip_tz_removes_only_the_offset_param() {
-        assert_eq!(strip_tz_param("/?tz_offset_hours=0"), "/");
+        assert_eq!(strip_tz_param("/?tz_offset_secs=0"), "/");
+        assert_eq!(strip_tz_param("/?tz_offset_hours=0"), "/"); // legacy
         assert_eq!(
-            strip_tz_param("/?tz_offset_hours=0&caller=145,165,167"),
+            strip_tz_param("/?tz_offset_secs=19800&caller=145,165,167"),
             "/?caller=145,165,167"
         );
         assert_eq!(
@@ -332,10 +350,10 @@ mod tests {
             "/?caller=145,165,167&page=2"
         );
         // Other params with the same prefix stay — only the exact
-        // `tz_offset_hours=` key matches.
+        // `tz_offset_secs=` / `tz_offset_hours=` keys match.
         assert_eq!(
-            strip_tz_param("/?tz_offset_hours_legacy=1&tz_offset_hours=0"),
-            "/?tz_offset_hours_legacy=1"
+            strip_tz_param("/?tz_offset_secs_legacy=1&tz_offset_secs=0"),
+            "/?tz_offset_secs_legacy=1"
         );
         // No query string → unchanged.
         assert_eq!(strip_tz_param("/"), "/");
