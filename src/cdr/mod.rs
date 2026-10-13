@@ -1864,6 +1864,58 @@ fn parse_sip_method(request_content: &str) -> String {
     first.to_string()
 }
 
+/// Returns `true` if `token` is one of the SIP request methods
+/// defined by RFC 3261 / the extensions we expect to see in
+/// `sip_msg` (INVITE / ACK / BYE / CANCEL / REGISTER / OPTIONS /
+/// INFO / NOTIFY / SUBSCRIBE / REFER / UPDATE / PRACK / MESSAGE /
+/// PUBLISH). Empty strings and anything else return `false`.
+///
+/// Used by [`is_sip_message_row`] to discriminate real SIP messages
+/// from RTP / DTMF-event / other non-SIP rows that voipmonitor
+/// stores in the same `sip_msg` table (e.g. `request_content =
+/// "RTP ..."` for RFC 2833 telephone-event packets).
+fn is_known_sip_method(token: &str) -> bool {
+    matches!(
+        token,
+        "ACK"
+            | "BYE"
+            | "CANCEL"
+            | "INVITE"
+            | "OPTIONS"
+            | "REGISTER"
+            | "INFO"
+            | "NOTIFY"
+            | "SUBSCRIBE"
+            | "REFER"
+            | "UPDATE"
+            | "PRACK"
+            | "MESSAGE"
+            | "PUBLISH"
+    )
+}
+
+/// Returns `true` if this `SipMessage` is a real SIP message rather
+/// than an RTP / DTMF-event / non-SIP row that voipmonitor stores in
+/// the same `sip_msg` table.
+///
+/// Decision order (any one passing returns `true`):
+///   1. `m.method` is a known SIP method — the request-line parse
+///      already classified this row, trust it.
+///   2. `m.content`'s first whitespace-delimited token is `SIP/2.0`
+///      — status-line parse classified this row as a response.
+/// Anything else ("RTP …", "telephone-event …", "ping", an empty
+/// body, SDP body where the request-line was discarded, …) is a
+/// non-SIP row and gets filtered out of the SIP-aware renderers
+/// (the call-flow diagram) but kept in the forensic timeline that
+/// wants every row.
+pub fn is_sip_message_row(m: &SipMessage) -> bool {
+    if is_known_sip_method(&m.method) {
+        return true;
+    }
+    let first = m.content.split_whitespace().next().unwrap_or("");
+    first.eq_ignore_ascii_case("SIP/2.0")
+}
+
 /// Pull every `c=` connection-info address out of an SDP body.
 /// Returns IPs in textual form, deduplicated in order of first
 /// appearance. Both session-level `c=` and media-level `c=` lines
@@ -2503,5 +2555,136 @@ mod rtp_leg_tests {
         // midnight in the storage TZ (PST) but the displayed day
         // is +1 relative to the stored day.
         assert_eq!(formatted(utc_dt, end_utc_dt, -8, 3), "2026-10-12 11:30:00");
+    }
+}
+
+#[cfg(test)]
+mod sip_row_classify_tests {
+    //! `is_sip_message_row` is the filter the call-flow diagram
+    //! uses to drop non-SIP rows (RTP, DTMF telephone-event,
+    //! empty) from VoIPmonitor's `sip_msg` table before rendering.
+    //! The forensic timeline keeps every row, so the filter is
+    //! view-scoped — these tests pin the discrimination rules so
+    //! future schema changes don't silently re-break the diagram.
+
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn mk(method: &str, response_status_line: &str) -> SipMessage {
+        // Content is built the way `fetch_sip_messages` builds it:
+        // request_content wins if non-empty, otherwise the response
+        // content. The point is to exercise the row through
+        // `is_sip_message_row` exactly the way the live query feeds
+        // it.
+        let content = if !method.is_empty() {
+            method.to_string()
+        } else {
+            response_status_line.to_string()
+        };
+        SipMessage {
+            id: 1,
+            calldate: NaiveDate::from_ymd_opt(2026, 10, 14)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+            method: method.to_string(),
+            response_num: if response_status_line.is_empty() {
+                0
+            } else {
+                200
+            },
+            response_text: String::new(),
+            from_num: String::new(),
+            to_num: String::new(),
+            src_ip_str: String::new(),
+            dst_ip_str: String::new(),
+            direction: "out".into(),
+            content_type: String::new(),
+            content,
+            cseq_num: None,
+            cseq_method: None,
+        }
+    }
+
+    /// Real SIP request, regardless of method. Includes the
+    /// lifecycle methods (INVITE/BYE/ACK/CANCEL) and the
+    /// DTMF-via-INFO extension (RFC 6086) so analysts can still
+    /// see INFO requests in the call-flow diagram when DTMF is
+    /// sent that way. The first arg to `mk` is the parsed SIP
+    /// method (just the token), matching what
+    /// `fetch_sip_messages` stores on `SipMessage.method` via
+    /// `parse_sip_method`. The full request line (with URI +
+    /// version) goes into `content`.
+    #[test]
+    fn real_sip_requests_are_kept() {
+        assert!(is_sip_message_row(&mk(
+            "INVITE",
+            "INVITE sip:a@x SIP/2.0\r\n...",
+        )));
+        assert!(is_sip_message_row(&mk(
+            "BYE",
+            "BYE sip:a@x SIP/2.0\r\n...",
+        )));
+        assert!(is_sip_message_row(&mk(
+            "ACK",
+            "ACK sip:a@x SIP/2.0\r\n...",
+        )));
+        assert!(is_sip_message_row(&mk(
+            "CANCEL",
+            "CANCEL sip:a@x SIP/2.0\r\n...",
+        )));
+        assert!(is_sip_message_row(&mk(
+            "INFO",
+            "INFO sip:a@x SIP/2.0\r\nSignal=1\r\nDuration=100\r\n",
+        )));
+    }
+
+    /// Real SIP status response — content is the raw status line
+    /// starting with `SIP/2.0 …`. Detection runs on the first
+    /// whitespace-delimited token of `content`.
+    #[test]
+    fn real_sip_responses_are_kept() {
+        assert!(is_sip_message_row(&mk("", "SIP/2.0 200 OK\r\n...")));
+        assert!(is_sip_message_row(&mk("", "SIP/2.0 100 Trying\r\n...")));
+        assert!(is_sip_message_row(&mk("", "SIP/2.0 486 Busy Here\r\n...")));
+    }
+
+    /// The original bug: RFC 2833 telephone-event DTMF packets
+    /// voipmonitor stores in `sip_msg` with `request_content`
+    /// starting with `RTP …` (or `telephone-event …`). The
+    /// `response_number` column is still 200 for these rows
+    /// (because that's the column's value for the call overall),
+    /// so the diagram used to render every such row as "200 OK"
+    /// — they crowded out the actual SIP messages.
+    #[test]
+    fn rtp_and_telephone_event_rows_are_dropped() {
+        assert!(!is_sip_message_row(&mk("RTP (g711U)", "")));
+        assert!(!is_sip_message_row(&mk(
+            "telephone-event DTMF One 1 100",
+            ""
+        )));
+        // DTMF event delivered as RTP — both populating strategy
+        // variants the db might emit.
+        assert!(!is_sip_message_row(&mk(
+            "",
+            "RTP payload 14048 bytes ... telephone-event ...",
+        )));
+    }
+
+    /// Empty rows, or rows with junk content, are dropped too —
+    /// they're never real SIP.
+    #[test]
+    fn empty_and_unrecognisable_rows_are_dropped() {
+        let mut empty = mk("", "");
+        empty.content = String::new();
+        assert!(!is_sip_message_row(&empty));
+        // A STUN keepalive or something — first token "ping" is
+        // not a SIP method.
+        assert!(!is_sip_message_row(&mk("ping", "")));
+        // Garbage payload with a 200 in the column but no SIP
+        // request/response line anywhere.
+        let mut junk = mk("", "");
+        junk.content = "\x00\x00\x00garbage".into();
+        assert!(!is_sip_message_row(&junk));
     }
 }

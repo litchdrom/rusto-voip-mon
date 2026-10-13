@@ -983,6 +983,24 @@ fn render_sngrep_flow(
         return String::new();
     }
 
+    // VoIPmonitor's `sip_msg` table stores real SIP messages AND
+    // RTP / DTMF-event rows in the same place (RFC 2833
+    // telephone-event packets, e.g.). For the UML sequence diagram
+    // we want only real SIP messages — otherwise an RTP/DTMF row
+    // whose `response_number` is the column-default of 200 would
+    // render as "200 OK" and crowd out the actual call legs. The
+    // forensic timeline below the diagram still keeps every row,
+    // so nothing is lost — we're just choosing a different lens
+    // for each view.
+    let messages: Vec<cdr::SipMessage> = messages
+        .iter()
+        .filter(|m| cdr::is_sip_message_row(m))
+        .cloned()
+        .collect();
+    if messages.is_empty() {
+        return String::new();
+    }
+
     // Build the actor list. Start with caller + callee from the
     // first observed outgoing message's src/dst IPs, then add any
     // SDP-discovered media IPs (c= lines) that aren't already in
@@ -2496,6 +2514,19 @@ mod sip_render_tests {
             .and_hms_opt(14, 30, 0)
             .unwrap();
         let delta_ms = (seconds_offset * 1000.0) as i64;
+        // Mirror `fetch_sip_messages`'s toggle-body pattern: requests
+        // populate `content` with the SIP request line, responses
+        // with the SIP status line. `is_sip_message_row` keys off
+        // `content`'s first whitespace-delimited token, so without
+        // this the call-flow diagram's filter would drop every test
+        // row.
+        let content = if !method.is_empty() {
+            format!("{method} sip:test@host SIP/2.0\r\n")
+        } else if code != 0 {
+            format!("SIP/2.0 {code} {reason}\r\n", reason = code)
+        } else {
+            String::new()
+        };
         cdr::SipMessage {
             id: 0,
             calldate: t0 + chrono::Duration::milliseconds(delta_ms),
@@ -2508,7 +2539,7 @@ mod sip_render_tests {
             dst_ip_str: String::new(),
             direction: String::new(),
             content_type: String::new(),
-            content: String::new(),
+            content,
             cseq_num: None,
             cseq_method: None,
         }
