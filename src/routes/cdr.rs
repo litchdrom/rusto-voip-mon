@@ -619,33 +619,53 @@ pub async fn cdr_detail(
         }
     };
 
-    // Fallback: if the sip_msg table didn't yield anything (install
-    // doesn't populate it, schema doesn't match, or the rows were
-    // purged), parse the SIP messages straight out of the merged
-    // pcap archive. VoIPmonitor always writes the SIP wire format
-    // there — it's the source of truth. Cost: one pcap extraction
-    // per page load, bounded by the user's existing pcap_dir I/O.
-    if sip_messages.is_empty() {
-        match crate::routes::pcap::build_pcap_bytes(&state, id).await {
-            Ok(pcap_bytes) => {
-                let parsed = cdr::sip_pcap::parse_sip_messages_from_pcap(
-                    &pcap_bytes, 500,
-                );
-                if !parsed.is_empty() {
+    // Source-of-truth check: pull SIP messages from the merged pcap
+    // archive when it's available. VoIPmonitor writes the SIP wire
+    // format into the `SIP_*.tar.zst` archive on disk — every SIP
+    // method, every status code, parsed off the actual UDP payload.
+    //
+    // The `sip_msg` DB table is a derived view that, on some installs,
+    // loses method information: rows where the request line lives
+    // only in `response_content` collapse to "method='' status=200"
+    // and the call-flow diagram collapses to a wall of "200 OK"
+    // entries. Pcap parsing of the same data keeps the method and
+    // status correct because each UDP packet IS a complete SIP
+    // message (request line OR status line, not both).
+    //
+    // We prefer pcap when it produces results; if pcap is unavailable
+    // (no archive yet, archive truncated, install doesn't keep them)
+    // we fall back to whatever sip_msg returned. The pcap path costs
+    // one zstd+tar extraction per page load, bounded by pcap_dir I/O
+    // — acceptable for a detail page that's opened interactively.
+    match crate::routes::pcap::build_pcap_bytes(&state, id).await {
+        Ok(pcap_bytes) => {
+            let parsed = cdr::sip_pcap::parse_sip_messages_from_pcap(&pcap_bytes, 500);
+            if !parsed.is_empty() {
+                if parsed.len() != sip_messages.len() {
                     tracing::info!(
                         cdr_id = id,
-                        count = parsed.len(),
-                        "sip timeline sourced from pcap (sip_msg table empty)"
+                        from_sip_msg = sip_messages.len(),
+                        from_pcap = parsed.len(),
+                        "sip timeline sourced from pcap"
                     );
-                    sip_messages = parsed;
                 }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    cdr_id = id, error = ?e,
-                    "pcap fallback also failed; timeline stays empty"
+                sip_messages = parsed;
+            } else if !sip_messages.is_empty() {
+                tracing::debug!(
+                    cdr_id = id,
+                    "pcap parse returned no SIP packets; keeping sip_msg"
                 );
             }
+        }
+        Err(e) => {
+            // pcap archive missing / unreadable — fall back to the DB.
+            // log at debug because this is the common case for some
+            // installs (pcap archive retention is shorter than
+            // sip_msg retention by operator preference).
+            tracing::debug!(
+                cdr_id = id, error = ?e,
+                "pcap unavailable; timeline uses sip_msg"
+            );
         }
     }
 
