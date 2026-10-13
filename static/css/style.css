@@ -712,9 +712,39 @@ table.sip-timeline .sip-row:hover {
   white-space: nowrap;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
 }
-.seq-table .seq-actor-box[data-role="caller"] .seq-actor-letter { color: var(--accent); }
-.seq-table .seq-actor-box[data-role="callee"] .seq-actor-letter { color: #fbbf24; }
-.seq-table .seq-actor-box[data-role="media"]  .seq-actor-letter { color: #4ade80; }
+.seq-table .seq-actor-box[data-role="caller"]  .seq-actor-letter { color: var(--accent); }
+.seq-table .seq-actor-box[data-role="callee"]  .seq-actor-letter { color: #fbbf24; }
+.seq-table .seq-actor-box[data-role="media"]   .seq-actor-letter { color: #4ade80; }
+/* SDP-advertised actors (Asterisk external_media_address, RTPEngine
+   advertise, MediaProxy, etc.) get a dim treatment so operators
+   reading the diagram don't mistake them for a separate SIP peer.
+   Dashed border + muted colors tell the eye "this is metadata
+   about where media is anchored, not a third box that sent SIP". */
+.seq-table .seq-actor-box[data-role="advertised"] {
+  border-style: dashed;
+  border-color: #4a5468;
+  background: transparent;
+  opacity: 0.78;
+}
+.seq-table .seq-actor-box[data-role="advertised"] .seq-actor-letter {
+  color: var(--fg-muted);
+  font-weight: 600;
+}
+.seq-table .seq-actor-box[data-role="advertised"] .seq-actor-ip {
+  color: var(--fg-muted);
+  opacity: 0.85;
+}
+/* "advertised" caption tucked under the IP — the explicit label
+   that ties the dim box back to the legend in the paragraph above
+   the diagram. */
+.seq-table .seq-actor-source {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--fg-muted);
+  margin-top: 3px;
+  opacity: 0.85;
+}
 /* Message cells sit in the LAST column (after all actor cells).
    The CSS-drawn arrow inside uses negative horizontal margins
    to extend from the first actor's lifeline to the last actor's

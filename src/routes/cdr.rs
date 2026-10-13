@@ -986,28 +986,39 @@ fn render_sngrep_flow(
     // the list. This makes proxy / RTPEngine scenarios visible as
     // additional columns — e.g. caller → proxy → callee with the
     // proxy's IP showing up in SDP.
+    //
+    // Each actor remembers how it was discovered:
+    //   * from_sdp = false → came from SIP signaling (caller/callee)
+    //   * from_sdp = true  → came from an SDP c= line (advertised
+    //     media address; the actual signaling peer is elsewhere)
+    // The renderer uses this to label middleware-style actors
+    // ("advertised") differently from real SIP peers so operators
+    // don't read them as separate call participants.
     let first = messages.iter().find(|m| !m.src_ip_str.is_empty());
     let (caller_ip, callee_ip) = first.map_or((String::new(), String::new()), |m| {
         (m.src_ip_str.clone(), m.dst_ip_str.clone())
     });
-    let mut actors: Vec<String> = Vec::new();
+    // (ip, from_sdp) tuples. Caller/callee land first with
+    // from_sdp=false; any SDP-discovered IP that isn't already in
+    // the list gets from_sdp=true.
+    let mut actors: Vec<(String, bool)> = Vec::new();
     for ip in [&caller_ip, &callee_ip] {
-        if !ip.is_empty() && !actors.iter().any(|a| a == ip) {
-            actors.push(ip.clone());
+        if !ip.is_empty() && !actors.iter().any(|a| a.0 == *ip) {
+            actors.push((ip.clone(), false));
         }
     }
     // Discover additional media endpoints from SDP bodies.
     for m in messages.iter() {
         for sdp_ip in cdr::parse_sdp_c_lines(&m.content) {
-            if !actors.iter().any(|a| a == &sdp_ip) {
-                actors.push(sdp_ip);
+            if !actors.iter().any(|a| a.0 == sdp_ip) {
+                actors.push((sdp_ip, true));
             }
         }
     }
     // Cap at 6 actors — beyond that the table becomes unreadable.
     actors.truncate(6);
     let actor_idx = |ip: &str| -> Option<usize> {
-        actors.iter().position(|a| a == ip)
+        actors.iter().position(|a| a.0 == ip)
     };
 
     // Time axis: relative to the first message's timestamp.
@@ -1018,25 +1029,54 @@ fn render_sngrep_flow(
     // plus its IP below — matches the classic UML sequence-diagram
     // idiom from sip-diagrams.netlify.app where the actor has a
     // small box at both ends of its lifeline.
+    //
+    // SDP-discovered actors (Asterisk `external_media_address`,
+    // RTPEngine, MediaProxy, etc.) get a third role `advertised`
+    // so CSS can dim them and a small `advertised` caption so
+    // operators don't read them as a separate SIP peer. The first
+    // and last actors always come from real SIP signaling so they
+    // keep the bold `caller` / `callee` styling.
     let actor_boxes: Vec<String> = actors
         .iter()
         .enumerate()
-        .map(|(i, ip)| {
+        .map(|(i, (ip, from_sdp))| {
+            // Role priority:
+            //   1. First actor is always the SIP caller (always
+            //      signaling, never SDP).
+            //   2. The actor whose IP matches the SIP signaling
+            //      dst is the callee. We can't rely on
+            //      "last index" because SDP-discovered IPs come
+            //      AFTER the caller/callee pair and can end up
+            //      at the trailing position.
+            //   3. SDP-discovered actors → "advertised" so CSS
+            //      dims them.
+            //   4. Reserved for future signaling-side middleware
+            //      → "media".
             let role = if i == 0 {
                 "caller"
-            } else if i == actors.len() - 1 {
+            } else if !*from_sdp && !callee_ip.is_empty() && ip == &callee_ip {
                 "callee"
+            } else if *from_sdp {
+                "advertised"
             } else {
                 "media"
             };
             // Letter label: A, B, C, … (skip I/O for legibility).
             let letter = ((b'A' + i as u8) as char).to_string();
+            // Only SDP-derived actors get the caption — it would
+            // be noise on the always-signaling caller/callee.
+            let source_caption = if *from_sdp {
+                "<div class=\"seq-actor-source\">advertised</div>"
+            } else {
+                ""
+            };
             format!(
                 "<div class=\"seq-actor-box\" data-role=\"{role}\">\
                    <div class=\"seq-actor-letter\">{letter}</div>\
                    <div class=\"seq-actor-ip\">{ip}</div>\
+                   {source_caption}\
                  </div>",
-                ip = html_escape(ip)
+                ip = html_escape(ip),
             )
         })
         .collect();
@@ -1305,7 +1345,8 @@ fn render_sngrep_flow(
          <p class=\"muted small\">\
            {total} SIP messages across {n_actors} actor{s}, time top-to-bottom. \
            Outgoing solid blue arrows, incoming dashed amber arrows. \
-           Additional actors discovered from SDP c= lines (proxy / media relay).\
+           Boxes labelled <em>advertised</em> are media addresses from the SDP \
+           connection line — not separate signaling peers.\
          </p>\
          <div class=\"seq-diagram\">\
            <table class=\"seq-table\">\
@@ -2592,6 +2633,93 @@ mod sip_render_tests {
         assert!(html.contains("10.101.1.1"));
         assert!(html.contains("10.101.1.112"));
         let _ = t0;
+    }
+
+    #[test]
+    fn seq_diagram_marks_sdp_discovered_actor_as_advertised() {
+        // End-to-end check that the third actor surfaced from an
+        // SDP c= line (Asterisk `external_media_address`,
+        // RTPEngine advertise, MediaProxy, etc.) gets the new
+        // `advertised` role + caption — NOT the old `media` role
+        // that operators were reading as "a separate SIP peer".
+        //
+        // Caller on 10.0.0.1 sends INVITE to B at 10.0.0.2 with an
+        // SDP body advertising media on 198.51.100.7 (the typical
+        // external_media scenario). The diagram should show A, B,
+        // and a third lane labelled C with `data-role="advertised"`.
+        let mut invite = mk_msg("INVITE", 0, 0.0);
+        invite.src_ip_str = "10.0.0.1".into();
+        invite.dst_ip_str = "10.0.0.2".into();
+        invite.content = concat!(
+            "v=0\r\n",
+            "o=- 0 0 IN IP4 10.0.0.1\r\n",
+            "s=-\r\n",
+            "c=IN IP4 198.51.100.7\r\n",
+            "t=0 0\r\n",
+            "m=audio 5004 RTP/AVP 0\r\n",
+        )
+        .into();
+        let html = render_sngrep_flow(
+            &[invite],
+            None,
+            None,
+            "",
+            "",
+            None,
+            None,
+            "",
+            "",
+        );
+
+        // Three actor letters: A, B, C.
+        assert!(html.contains("\"seq-actor-letter\">A<"), "actor A should be a letter");
+        assert!(html.contains("\"seq-actor-letter\">B<"), "actor B should be a letter");
+        assert!(html.contains("\"seq-actor-letter\">C<"), "actor C should be a letter");
+
+        // First and last actors keep their real SIP roles.
+        assert!(
+            html.contains(r#"data-role="caller""#),
+            "actor A should remain a SIP caller"
+        );
+        assert!(
+            html.contains(r#"data-role="callee""#),
+            "actor B should remain a SIP callee"
+        );
+
+        // Actor C (the SDP-advertised IP) gets the new role, NOT
+        // the old "media" role that operators confused for a peer.
+        assert!(
+            html.contains(r#"data-role="advertised""#),
+            "actor C should be tagged with data-role=\"advertised\""
+        );
+        assert!(
+            !html.contains(r#"data-role="media""#),
+            "the SDP-discovered actor must NOT carry the old data-role=\"media\""
+        );
+
+        // The dim treatment is a CSS class — verify the caption
+        // element is present so the box has something to style.
+        assert!(
+            html.contains("seq-actor-source"),
+            "advertised actor should carry the seq-actor-source caption element"
+        );
+        assert!(
+            html.contains(">advertised<"),
+            "advertised actor should display the literal \"advertised\" caption"
+        );
+
+        // The advertised IP is shown verbatim in the actor box.
+        assert!(
+            html.contains("198.51.100.7"),
+            "advertised actor should show the SDP c= IP literally"
+        );
+
+        // The diagram header now mentions the new "advertised"
+        // terminology so operators don't have to guess.
+        assert!(
+            html.contains("<em>advertised</em>"),
+            "the call-flow header should mention \"advertised\" to teach the new dim style"
+        );
     }
 
     #[test]
