@@ -78,7 +78,8 @@ VoIPmonitor host. `docker-compose.yml` shows the wiring.
 | `PCAP_DIR` | no | `/var/spool/voipmonitor` | VoIPmonitor pcap spool root |
 | `APP_COOKIE_SECRET` | **yes** | — | 32+ random bytes — `openssl rand -hex 32` |
 | `CSV_EXPORT_LIMIT` | no | `10000` | Hard cap on rows per CSV download. Per-request override `?csv_limit=N`. |
-| `APP_TZ_OFFSET_HOURS` | no | `0` | Shifts the default "today" filter window + label by N hours from UTC |
+| `APP_TZ_OFFSET_SECS` | no | `0` | Default operator-display TZ (seconds from UTC). Shifts the "today" window, label, and per-operator fallback. Whole-hour zones: `28800` for UTC+8, `-18000` for UTC-5. Half/quarter-hour zones also supported: `19800` for IST (UTC+5:30), `20700` for Nepal (UTC+5:45), `45900` for Chatham (UTC+12:45). Range `-43200..=50400`. Operators can override per-session from the topbar TZ selector. |
+| `APP_DB_TZ_OFFSET_HOURS` | no | `0` | TZ offset, in **hours**, of the **stored** `calldate` values in the VoIPmonitor DB. Default 0 because the standard VoIPmonitor convention is to store `DATETIME` in UTC. Set non-zero only when your MySQL session is configured for server-local time (e.g. `8` if `calldate` rows come back as UTC+8 wall-clock despite the column looking like UTC). Conversion is applied at the SQL→view boundary so all displayed times are in the operator's chosen TZ. |
 | `APP_QUERY_TIMEOUT_SECS` | no | `30` | Per-query DB timeout; `0` disables. On hit the client gets a 504. |
 | `RUST_LOG` | no | `info` | Standard tracing filter — `rusto_voip_mon=debug` for verbose |
 
