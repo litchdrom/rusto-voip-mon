@@ -699,7 +699,15 @@ async fn resolve_batch_ids(
     } else if let Some(filter) = filter {
         let query_tz: Option<i32> = parse_tz_from_filter(filter);
         let (tz, _) = state.resolve_tz(user, query_tz);
-        cdr::ids_for_query_string(&state.pool, filter, tz, batch_max(state), *state.ip_shape).await?
+        cdr::ids_for_query_string(
+            &state.pool,
+            filter,
+            tz,
+            batch_max(state),
+            *state.ip_shape,
+            state.config.db_tz_offset_secs,
+        )
+        .await?
     } else {
         return Ok((Vec::new(), state.config.tz()));
     };

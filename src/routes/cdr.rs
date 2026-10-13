@@ -418,7 +418,10 @@ pub async fn cdr_list(
                 state.config.db_tz_offset_secs,
             ),
         ),
-        crate::error::with_query_timeout(timeout, cdr::distinct_values(&state.pool, 7, 100, tz)),
+        crate::error::with_query_timeout(
+            timeout,
+            cdr::distinct_values(&state.pool, 7, 100, tz, state.config.db_tz_offset_secs),
+        ),
     );
     let page = page_result?;
     let distinct = DistinctView::from(
@@ -2065,7 +2068,14 @@ pub async fn cdr_export_csv(
     // seconds, we 504 and drop the channel. Once rows start flowing, the
     // stream runs as long as needed (a 100k-row export shouldn't trip a
     // 30s cap).
-    let mut row_stream = cdr::list_stream(&state.pool, &normalized, cap, *state.ip_shape);
+    let mut row_stream = cdr::list_stream(
+        &state.pool,
+        &normalized,
+        cap,
+        *state.ip_shape,
+        tz.local_minus_utc(),
+        state.config.db_tz_offset_secs,
+    );
     // Move `tz` into the spawn so each row can be converted to the
     // operator's resolved offset before formatting. Without this the
     // CSV would be in wall-clock UTC regardless of the user's choice.
@@ -2183,7 +2193,15 @@ pub async fn cdr_export_csv_batch(
         out
     } else if let Some(filter) = req.filter.as_deref() {
         let tz = state.tz_default();
-        cdr::ids_for_query_string(&state.pool, filter, tz, csv_batch_limit(&state), *state.ip_shape).await?
+        cdr::ids_for_query_string(
+            &state.pool,
+            filter,
+            tz,
+            csv_batch_limit(&state),
+            *state.ip_shape,
+            state.config.db_tz_offset_secs,
+        )
+        .await?
     } else {
         return Err(AppError::BadRequest(
             "either `ids` or `filter` must be provided".into(),

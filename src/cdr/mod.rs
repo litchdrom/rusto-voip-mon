@@ -643,7 +643,7 @@ mod in_clause_tests {
             vec!["alice".into(), "bob".into(), "carol".into()],
             vec![],
         )
-        .to_where(IpColumnShape::LegacyInt);
+        .to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE caller IN (?,?,?)");
         let got: Vec<String> = binds
             .into_iter()
@@ -661,7 +661,7 @@ mod in_clause_tests {
             vec![],
             vec![491234567, 491234568],
         )
-        .to_where(IpColumnShape::LegacyInt);
+        .to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE called IN (?,?)");
         let got: Vec<String> = binds
             .into_iter()
@@ -675,7 +675,7 @@ mod in_clause_tests {
 
     #[test]
     fn empty_in_lists_add_no_clause() {
-        let (sql, binds) = f(vec![], vec![]).to_where(IpColumnShape::LegacyInt);
+        let (sql, binds) = f(vec![], vec![]).to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "");
         assert!(binds.is_empty());
     }
@@ -690,7 +690,7 @@ mod in_clause_tests {
         // when the operator meant exact-match.
         let mut f = f(vec!["alice".into(), "bob".into()], vec![]);
         f.caller = Some("a".into());
-        let (sql, _) = f.to_where(IpColumnShape::LegacyInt);
+        let (sql, _) = f.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE caller IN (?,?)");
     }
 
@@ -701,7 +701,7 @@ mod in_clause_tests {
     fn src_ips_use_inet_aton_for_legacy_shape() {
         let mut f = f(vec![], vec![]);
         f.src_ips = vec!["1.2.3.4".into(), "5.6.7.8".into()];
-        let (sql, binds) = f.to_where(IpColumnShape::LegacyInt);
+        let (sql, binds) = f.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE sipcallerip IN (INET_ATON(?),INET_ATON(?))");
         let got: Vec<String> = binds
             .into_iter()
@@ -722,7 +722,7 @@ mod in_clause_tests {
     fn src_ips_use_inet6_aton_for_varbinary_shape() {
         let mut f = f(vec![], vec![]);
         f.src_ips = vec!["1.2.3.4".into(), "2001:db8::1".into()];
-        let (sql, binds) = f.to_where(IpColumnShape::Varbinary);
+        let (sql, binds) = f.to_where(IpColumnShape::Varbinary, 0, 0);
         assert_eq!(
             sql,
             "WHERE sipcallerip IN (INET6_ATON(?),INET6_ATON(?))"
@@ -745,11 +745,11 @@ mod in_clause_tests {
         let mut f = f(vec![], vec![]);
         f.src_ips = vec!["1.2.3.4".into()];
         f.dst_ips = vec!["5.6.7.8".into()];
-        let (sql, _) = f.to_where(IpColumnShape::Varbinary);
+        let (sql, _) = f.to_where(IpColumnShape::Varbinary, 0, 0);
         assert!(sql.contains("sipcallerip IN (INET6_ATON(?)"));
         assert!(sql.contains("sipcalledip IN (INET6_ATON(?)"));
         // And vice versa for legacy.
-        let (sql, _) = f.to_where(IpColumnShape::LegacyInt);
+        let (sql, _) = f.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert!(sql.contains("sipcallerip IN (INET_ATON(?)"));
         assert!(sql.contains("sipcalledip IN (INET_ATON(?)"));
     }
@@ -771,7 +771,7 @@ mod in_clause_tests {
         // so the SQL shape is unambiguous.
         let mut nf = f(normalized.caller_in.clone(), vec![]);
         nf.caller = normalized.caller.clone();
-        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt);
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE caller IN (?,?,?)");
         assert_eq!(binds.len(), 3);
     }
@@ -786,7 +786,7 @@ mod in_clause_tests {
         assert_eq!(normalized.called_in, vec![491234567, 491234568, 491234569]);
         let mut nf = f(vec![], normalized.called_in.clone());
         nf.called = normalized.called.clone();
-        let (sql, _) = nf.to_where(IpColumnShape::LegacyInt);
+        let (sql, _) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE called IN (?,?,?)");
     }
 
@@ -802,7 +802,7 @@ mod in_clause_tests {
         assert!(normalized.caller_in.is_empty());
         let mut nf = f(vec![], vec![]);
         nf.caller = normalized.caller.clone();
-        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt);
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE caller LIKE ?");
         let got: Vec<String> = binds
             .into_iter()
@@ -830,7 +830,7 @@ mod in_clause_tests {
         assert!(normalized.called_in.is_empty());
         let mut nf = f(vec![], vec![]);
         nf.called = normalized.called.clone();
-        let (sql, _) = nf.to_where(IpColumnShape::LegacyInt);
+        let (sql, _) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert_eq!(sql, "WHERE called LIKE ?");
     }
 
@@ -845,6 +845,117 @@ mod in_clause_tests {
         let normalized = raw.normalized(FixedOffset::east_opt(0).unwrap());
         assert_eq!(normalized.caller_in, vec!["145", "165"]);
         assert_eq!(normalized.called_in, vec![1, 2]);
+    }
+
+    /// The whole reason `to_where()` now takes `op_tz_secs` and
+    /// `db_tz_secs`: the operator in IST (+5:30) sees CDR times
+    /// from a DB that stores them as naive UTC+8. The naive
+    /// `from`/`to` values come in as IST midnight (operator's
+    /// "today" intent) and have to be shifted forward 2h30m
+    /// before binding so they match the real wall-clock moment
+    /// in the DB's storage TZ. Without this shift, the "Today"
+    /// filter returns calls from the wrong ~24h slice.
+    ///
+    /// Concretely: IST 00:00:00 on day D = UTC+8 02:30:00 on day D
+    /// (real instant 18:30 UTC of D-1). Operator wants
+    /// "calldate >= 00:00 IST today"; the SQL bound should be
+    /// `2026-10-14 02:30:00` (the DB's clock at the same instant),
+    /// not `2026-10-14 00:00:00`.
+    #[test]
+    fn to_where_shifts_from_and_to_from_operator_tz_to_db_tz() {
+        use chrono::NaiveDate;
+        let mut nf = f(vec![], vec![]);
+        nf.from = Some(
+            NaiveDate::from_ymd_opt(2026, 10, 14)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        );
+        nf.to = Some(
+            NaiveDate::from_ymd_opt(2026, 10, 14)
+                .unwrap()
+                .and_hms_opt(23, 59, 59)
+                .unwrap(),
+        );
+
+        // Operator is IST (+5:30 = 19800s); DB stores naive UTC+8
+        // (= 8 * 3600 = 28800s). Shift = 28800 - 19800 = +9000s
+        // (2h30m forward).
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 19800, 28800);
+        assert_eq!(sql, "WHERE calldate >= ? AND calldate <= ?");
+        assert_eq!(binds.len(), 2);
+
+        // 00:00 IST + 2h30m = 02:30 same day in UTC+8.
+        let FilterBind::DateTime(from) = &binds[0] else {
+            panic!("expected DateTime bind for from");
+        };
+        assert_eq!(
+            from.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-10-14 02:30:00",
+            "from should shift forward 2h30m to match DB clock"
+        );
+
+        // 23:59 IST + 2h30m = 02:29 next day in UTC+8 (rolls over).
+        let FilterBind::DateTime(to) = &binds[1] else {
+            panic!("expected DateTime bind for to");
+        };
+        assert_eq!(
+            to.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-10-15 02:29:59",
+            "to should shift forward 2h30m, day overflows to next"
+        );
+    }
+
+    /// Opposite direction: operator is UTC+8 and DB is also UTC+8.
+    /// No shift — bounds bind verbatim. This is the "no-op
+    /// regression" case so we don't silently break UTC-equivalent
+    /// installs when changing the signature.
+    #[test]
+    fn to_where_does_not_shift_when_op_equals_db() {
+        use chrono::NaiveDate;
+        let mut nf = f(vec![], vec![]);
+        nf.from = Some(
+            NaiveDate::from_ymd_opt(2026, 10, 14)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        );
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 28800, 28800);
+        assert_eq!(sql, "WHERE calldate >= ?");
+        let FilterBind::DateTime(from) = &binds[0] else {
+            panic!("expected DateTime bind");
+        };
+        assert_eq!(
+            from.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-10-14 00:00:00",
+            "with op == db, the bound should pass through unchanged"
+        );
+    }
+
+    /// Quarter-hour op + whole-hour DB. Shift is non-integer-hour
+    /// too: Nepal (UTC+5:45 = 20700s) operator looking at a UTC+8
+    /// DB. Shift = 28800 - 20700 = 8100s = 2h15m. Verifies the
+    /// fix works for half- and quarter-hour TZs, not just whole.
+    #[test]
+    fn to_where_shifts_quarter_hour_op_against_whole_hour_db() {
+        use chrono::NaiveDate;
+        let mut nf = f(vec![], vec![]);
+        nf.from = Some(
+            NaiveDate::from_ymd_opt(2026, 10, 14)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap(),
+        );
+        // Nepal (+5:45 = 20700s) operator, UTC+8 (= 28800s) DB.
+        let (_sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 20700, 28800);
+        let FilterBind::DateTime(from) = &binds[0] else {
+            panic!("expected DateTime bind");
+        };
+        assert_eq!(
+            from.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-10-14 02:15:00",
+            "quarter-hour shift (Nepal op, UTC+8 DB) → +2h15m"
+        );
     }
 }
 
@@ -893,18 +1004,52 @@ impl NormalizedFilters {
     /// so this function stays pure — easy to unit-test, no global
     /// state. The caller is responsible for plumbing the cached
     /// shape through.
-    pub fn to_where(&self, ip_shape: IpColumnShape) -> (String, Vec<FilterBind>) {
+    ///
+    /// `op_tz_secs` and `db_tz_secs` are the operator-display TZ
+    /// and the DB-stored calldate TZ, both in **seconds** from
+    /// UTC. They only affect the `calldate >= ?` / `<= ?` bound
+    /// values — every other clause is TZ-neutral. The shift
+    /// applied below is the inverse of `CdrSummary::from_row`'s
+    /// `row.calldate - Duration::seconds(db_tz_secs)` step:
+    ///
+    /// ```text
+    ///   from_db_naive = from_op_naive + (db_tz_secs - op_tz_secs)
+    /// ```
+    ///
+    /// Without this shift, operator-typed naive `from`/`to`
+    /// values (e.g. `00:00 IST today`) would be compared against
+    /// the *DB's* naive calldate column (e.g. naive UTC+8) — a
+    /// TZ mismatch that puts the window boundary in the wrong
+    /// moment, so "Today" returns the wrong slice of calls when
+    /// the operator and DB TZs differ.
+    pub fn to_where(
+        &self,
+        ip_shape: IpColumnShape,
+        op_tz_secs: i32,
+        db_tz_secs: i32,
+    ) -> (String, Vec<FilterBind>) {
         let shape = ip_shape;
         let mut parts: Vec<String> = Vec::new();
         let mut binds: Vec<FilterBind> = Vec::new();
 
+        // Shift operator-TZ naive bounds to DB-stored-TZ naive
+        // values before binding. Same math used by
+        // `CdrSummary::from_row`, in reverse. `+0` (op == db) is
+        // a no-op so the existing full-UTC / UTC-equivalent
+        // paths stay bit-identical.
+        let shift_secs = (db_tz_secs - op_tz_secs) as i64;
+
         if let Some(from) = self.from {
             parts.push("calldate >= ?".into());
-            binds.push(FilterBind::DateTime(from));
+            binds.push(FilterBind::DateTime(
+                from + Duration::seconds(shift_secs),
+            ));
         }
         if let Some(to) = self.to {
             parts.push("calldate <= ?".into());
-            binds.push(FilterBind::DateTime(to));
+            binds.push(FilterBind::DateTime(
+                to + Duration::seconds(shift_secs),
+            ));
         }
         // `caller` and `caller_in` are mutually exclusive: a
         // comma-separated `caller` value gets routed into
@@ -1117,7 +1262,7 @@ pub async fn list(
     tz: FixedOffset,
     db_tz_secs: i32,
 ) -> Result<CdrPage, sqlx::Error> {
-    let (where_sql, binds) = f.to_where(ip_shape);
+    let (where_sql, binds) = f.to_where(ip_shape, tz.local_minus_utc(), db_tz_secs);
     let limit = f.page_size + 1;
     // Use the shared `CDR_FULL_SELECT_COLUMNS` so `query_as::<CdrRow>`
     // never trips `ColumnNotFound` when the struct gains a field.
@@ -1162,8 +1307,10 @@ pub fn list_stream(
     f: &NormalizedFilters,
     limit: usize,
     ip_shape: IpColumnShape,
+    op_tz_secs: i32,
+    db_tz_secs: i32,
 ) -> ReceiverStream<Result<CdrRow, sqlx::Error>> {
-    let (where_sql, binds) = f.to_where(ip_shape);
+    let (where_sql, binds) = f.to_where(ip_shape, op_tz_secs, db_tz_secs);
     // Shared with `list` — keeps `query_as::<CdrRow>` satisfied even
     // after the struct gains columns.
     let sql = format!(
@@ -1205,8 +1352,10 @@ pub async fn list_ids_matching(
     f: &NormalizedFilters,
     limit: usize,
     ip_shape: IpColumnShape,
+    op_tz_secs: i32,
+    db_tz_secs: i32,
 ) -> Result<Vec<u64>, sqlx::Error> {
-    let (where_sql, binds) = f.to_where(ip_shape);
+    let (where_sql, binds) = f.to_where(ip_shape, op_tz_secs, db_tz_secs);
     let sql = format!(
         "SELECT ID FROM cdr {where_sql} \
          ORDER BY calldate DESC, ID DESC \
@@ -1285,6 +1434,7 @@ pub async fn ids_for_query_string(
     tz: chrono::FixedOffset,
     limit: usize,
     ip_shape: IpColumnShape,
+    db_tz_secs: i32,
 ) -> Result<Vec<u64>, crate::error::AppError> {
     let params = crate::routes::cdr::parse_query_params(raw_query);
     let q = crate::routes::cdr::SingleParams {
@@ -1301,9 +1451,19 @@ pub async fn ids_for_query_string(
     };
     let filters = crate::routes::cdr::build_filters(&q, &params);
     let normalized = filters.normalized(tz);
-    crate::error::with_query_timeout(0, list_ids_matching(pool, &normalized, limit, ip_shape))
-        .await
-        .map_err(crate::error::AppError::from)
+    crate::error::with_query_timeout(
+        0,
+        list_ids_matching(
+            pool,
+            &normalized,
+            limit,
+            ip_shape,
+            tz.local_minus_utc(),
+            db_tz_secs,
+        ),
+    )
+    .await
+    .map_err(crate::error::AppError::from)
 }
 
 /// `cdr_next` — 1:1 extension to `cdr` that holds per-call derived state.
@@ -1884,8 +2044,19 @@ pub async fn distinct_values(
     lookback_days: i64,
     limit: u32,
     tz: FixedOffset,
+    db_tz_secs: i32,
 ) -> Result<DistinctValues, sqlx::Error> {
-    let since = today_window_in_tz(&tz).0 - Duration::days(lookback_days);
+    // `today_window_in_tz` returns the operator-TZ midnight-naive
+    // bounds. The DB column is naive in `db_tz_secs`; shift before
+    // binding the same way `to_where()` does for `from`/`to`.
+    // (`to_where` itself isn't used here because distinct_values
+    // issues 4 separate `WHERE calldate >= ?` queries rather than
+    // one combined WHERE.)
+    let op_secs = tz.local_minus_utc();
+    let shift_secs = (db_tz_secs - op_secs) as i64;
+    let since = today_window_in_tz(&tz).0
+        + Duration::seconds(shift_secs)
+        - Duration::days(lookback_days);
 
     let sip_codes: Vec<u16> = sqlx::query_scalar(
         "SELECT DISTINCT lastSIPresponseNum FROM cdr \
