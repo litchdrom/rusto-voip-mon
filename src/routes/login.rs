@@ -179,12 +179,36 @@ pub async fn logout() -> Response {
     resp
 }
 
+/// Parse the operator-submitted TZ form value into a `Option<i32>`
+/// suitable for the cookie. Pure function so the round-trip is
+/// unit-testable without an axum runtime.
+///
+/// Returns:
+///   * `Some(secs)` — operator picked a TZ in the dropdown and
+///     the value parsed cleanly. `secs == 0` is **a real UTC
+///     choice**, not a reset sentinel: an operator whose env
+///     default is IST, picking "UTC" in the topbar now actually
+///     gets UTC instead of snapping back to IST.
+///   * `None` — the form field was missing, empty, or
+///     unparseable; or the value was outside the
+///     `-43200..=50400` range used by `render_tz_options_html`.
+///     `None` clears the session-cookie override so the next
+///     request falls back to the env default.
+fn parse_tz_form_value(raw: Option<&str>) -> Option<i32> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<i32>().ok())
+        .filter(|&s| (-43200..=50400).contains(&s))
+}
+
 /// Update the session-stored timezone and redirect back. Accepts form
 /// fields:
-///   `tz_offset_secs`   — required, integer in [-12*3600, 14*3600]
-///                        (i.e. -12h to +14h in seconds). Empty / 0
-///                        clears the override and falls back to the
-///                        server's `APP_TZ_OFFSET_SECS`. Values like
+///   `tz_offset_secs`   — required, integer in [-43200, 50400]
+///                        (i.e. -12h to +14h in seconds). `0` is a
+///                        real UTC choice (NOT a reset). Empty /
+///                        missing form value clears the override and
+///                        falls back to the server's
+///                        `APP_TZ_OFFSET_SECS`. Values like
 ///                        19800 (IST +5:30), 20700 (Nepal +5:45), or
 ///                        -12600 (Newfoundland -3:30) are all valid.
 ///   `next`             — relative URL to bounce back to.
@@ -193,23 +217,7 @@ pub async fn set_tz(
     user: SessionUser,
     Form(form): Form<SetTzForm>,
 ) -> AppResult<Response> {
-    // Parse + range-check, then collapse "0 means clear" so we return
-    // Option<i8> instead of Option<Option<i8>>: 0 = clear (None), any
-    // other valid hour = Some(h).
-    // The form value is now an offset in *seconds* (not whole hours),
-    // so non-whole-hour zones work: 19800 = IST +5:30, 20700 = Nepal
-    // +5:45, 45900 = Chatham Islands +12:45, etc. Valid range is the
-    // union of the dropdown's options: -12h to +14h in the steps
-    // emitted by `render_tz_options_html` (see routes::cdr::tz_label).
-    // Sentinel `0` collapses to `None` (clears the override).
-    let parsed: Option<i32> = form
-        .tz_offset_secs
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<i32>().ok())
-        .filter(|&s| (-12 * 3600..=14 * 3600).contains(&s))
-        .and_then(|s| if s == 0 { None } else { Some(s) });
+    let parsed: Option<i32> = parse_tz_form_value(form.tz_offset_secs.as_deref());
 
     let prev_tz = user.tz_offset_secs;
     let new_session = user.with_tz(parsed);
@@ -250,7 +258,10 @@ pub async fn set_tz(
 pub struct SetTzForm {
     /// Offset in **seconds** from UTC, not whole hours. Sourced from
     /// the `<select name="tz_offset_secs">` in the topbar form.
-    /// `19800` = IST +5:30, `0` = reset (clears the session override).
+    /// `19800` = IST +5:30, `0` = UTC (a real, persisted choice —
+    /// NOT a reset sentinel). Empty / missing form value is what
+    /// clears the session override so the next request falls back
+    /// to `APP_TZ_OFFSET_SECS`.
     pub tz_offset_secs: Option<String>,
     pub next: Option<String>,
 }
@@ -358,5 +369,66 @@ mod tests {
         // No query string → unchanged.
         assert_eq!(strip_tz_param("/"), "/");
         assert_eq!(strip_tz_param("/cdr/12345"), "/cdr/12345");
+    }
+
+    /// `parse_tz_form_value` extracts the i32-seconds TZ choice from
+    /// the `<select name="tz_offset_secs">` form field. Until this
+    /// commit, `Some("0")` collapsed to `None`, which silently
+    /// prevented the operator from picking "UTC" via the topbar when
+    /// the env default was a non-zero TZ like IST — exactly the bug
+    /// a user hit in production (the audit log showed
+    /// `new_tz_secs=None` after they tried to switch). The function
+    /// now keeps `Some(0)` as a real UTC choice.
+    #[test]
+    fn parse_tz_form_value_treats_zero_as_real_utc_choice() {
+        // The whole point of this commit. UTC used to be unreachable
+        // from the topbar; now it round-trips.
+        assert_eq!(parse_tz_form_value(Some("0")), Some(0));
+    }
+
+    /// Non-zero offsets pass through unchanged. Whole hours, half-
+    /// hours, and quarter-hours — the union of the dropdown's
+    /// emitted values.
+    #[test]
+    fn parse_tz_form_value_round_trips_known_offsets() {
+        assert_eq!(parse_tz_form_value(Some("28800")), Some(28800)); // UTC+8
+        assert_eq!(parse_tz_form_value(Some("19800")), Some(19800)); // IST +5:30
+        assert_eq!(parse_tz_form_value(Some("20700")), Some(20700)); // Nepal +5:45
+        assert_eq!(parse_tz_form_value(Some("-43200")), Some(-43200)); // Baker Island
+        assert_eq!(parse_tz_form_value(Some("50400")), Some(50400)); // Kiribati +14
+    }
+
+    /// Whitespace-only and empty-string form values still resolve to
+    /// `None` (cookie cleared, falls back to env default). The
+    /// template's hidden-field fallback puts the resolved offset
+    /// into the form, so a missing render-time value here means the
+    /// operator's JS-driven form submit produced an empty string —
+    /// which is the same as them asking to clear the override.
+    #[test]
+    fn parse_tz_form_value_empty_or_whitespace_clears_cookie() {
+        assert_eq!(parse_tz_form_value(None), None);
+        assert_eq!(parse_tz_form_value(Some("")), None);
+        assert_eq!(parse_tz_form_value(Some("   ")), None);
+    }
+
+    /// Garbage that won't parse as an integer also clears the
+    /// cookie rather than 500ing. Belt-and-suspenders against a
+    /// hand-edited form or a misconfigured client.
+    #[test]
+    fn parse_tz_form_value_garbage_does_not_panic() {
+        assert_eq!(parse_tz_form_value(Some("abc")), None);
+        assert_eq!(parse_tz_form_value(Some("--")), None);
+        assert_eq!(parse_tz_form_value(Some("0x10")), None);
+    }
+
+    /// Out-of-range values are rejected so an attacker who can
+    /// change the dropdown can't make the server store a bogus TZ
+    /// that breaks `FixedOffset::east_opt`. The bounds here match
+    /// `chrono::FixedOffset`'s own range and what
+    /// `render_tz_options_html` actually emits.
+    #[test]
+    fn parse_tz_form_value_rejects_out_of_range() {
+        assert_eq!(parse_tz_form_value(Some("99999")), None);
+        assert_eq!(parse_tz_form_value(Some("-99999")), None);
     }
 }
