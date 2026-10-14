@@ -1136,9 +1136,15 @@ fn render_sngrep_flow(
             // suffix so we don't print `:0`. Ports come from the
             // pcap parser (UDP transport header) for that
             // source-of-truth; the DB path can't recover them.
+            //
+            // Rendered as its own block rather than appended to the
+            // IP line so the IP stays inside the 110px actor-cell
+            // even on IPv6+5060 or `172.29.31.103:5062`-style
+            // widths that would otherwise overflow and overlap the
+            // next actor's lifeline.
             let port_html = if *port > 0 {
                 format!(
-                    "<span class=\"seq-actor-port\">:{port}</span>",
+                    "<div class=\"seq-actor-port\">:{port}</div>",
                     port = port,
                 )
             } else {
@@ -1147,7 +1153,8 @@ fn render_sngrep_flow(
             format!(
                 "<div class=\"seq-actor-box\" data-role=\"{role}\">\
                    <div class=\"seq-actor-letter\">{letter}</div>\
-                   <div class=\"seq-actor-ip\">{ip}{port_html}</div>\
+                   <div class=\"seq-actor-ip\">{ip}</div>\
+                   {port_html}\
                    {source_caption}\
                  </div>",
                 ip = html_escape(ip),
@@ -2859,16 +2866,18 @@ mod sip_render_tests {
             "",
             "",
         );
-        // The port suffix rides inside a span so CSS can render it
-        // as a secondary chip. Look for the IP followed by the
-        // span carrying the port.
+        // The port suffix rides on its own block line below the IP so
+        // the IP itself stays inside the 110px actor-cell even on
+        // long-IP + port combinations (the cosmetic fix the
+        // diagram needed when B's `:5060` started overlapping
+        // with C's lifeline).
         assert!(
-            html.contains("192.168.129.200<span class=\"seq-actor-port\">:5060</span>"),
-            "actor A's box should render ip + span-wrapped :5060 when port known"
+            html.contains("192.168.129.200</div><div class=\"seq-actor-port\">:5060"),
+            "actor A's box should render the IP followed by a port div on its own line"
         );
         assert!(
-            html.contains("172.29.31.103<span class=\"seq-actor-port\">:5061</span>"),
-            "actor B's box should render ip + span-wrapped :5061 when port known"
+            html.contains("172.29.31.103</div><div class=\"seq-actor-port\">:5061"),
+            "actor B's box should render the IP followed by a port div on its own line"
         );
     }
 

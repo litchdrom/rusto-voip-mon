@@ -545,8 +545,16 @@ table.sip-timeline .sip-row:hover {
   line-height: 1.4;
   max-height: 360px;
   overflow: auto;
+  /* Long SIP headers (To: / From: with multi-char route-set tags,
+     Authorization headers, etc.) need to wrap. `pre-wrap` preserves
+     the original CRLF line breaks; `overflow-wrap: anywhere`
+     breaks a single long line at any character boundary so it
+     stays inside the table column rather than horizontally
+     scrolling forever — but unlike `word-break: break-all` it
+     does NOT force mid-word breaks when a whitespace boundary
+     is available, so the result is still readable. */
   white-space: pre-wrap;
-  word-break: break-all;
+  overflow-wrap: anywhere;
 }
 
 /* Call flow diagram (above the SIP timeline).
@@ -709,6 +717,10 @@ table.sip-timeline .sip-row:hover {
   font-size: 10px;
   color: var(--fg-muted);
   margin-top: 2px;
+  /* nowrap keeps the IP from wrapping mid-octet; the actor box
+     stays inside the 110px cell even when the IP is long because
+     the :port suffix (when present) goes on its own block line,
+     not appended to the IP. */
   white-space: nowrap;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
 }
@@ -734,15 +746,21 @@ table.sip-timeline .sip-row:hover {
   color: var(--fg-muted);
   opacity: 0.85;
 }
-/* Port suffix tucked after the IP. Same muted family as the IP so
-   it reads as a continuation (`192.168.129.200:5060`) rather than
-   a separate label; only appended when the source data carried
-   port info (pcap parser) — DB-path and SDP-discovered actors
-   skip the suffix. */
+/* Port suffix sits on its own block line right under the IP.
+   Same muted family as the IP so it reads as a continuation of
+   the address; only rendered when the source data carried port
+   info (pcap parser) — DB-path and SDP-discovered actors skip the
+   line entirely. The `.seq-actor-ip` line above stays `nowrap`
+   so the IP itself never wraps mid-octet; the port picks up the
+   slack on its own row. */
 .seq-table .seq-actor-port {
+  display: block;
   color: var(--fg-muted);
   opacity: 0.8;
   font-weight: 600;
+  font-size: 10px;
+  margin-top: 1px;
+  font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
 }
 /* "advertised" caption tucked under the IP — the explicit label
    that ties the dim box back to the legend in the paragraph above
