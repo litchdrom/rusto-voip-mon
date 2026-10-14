@@ -155,6 +155,13 @@ pub fn parse_sip_messages_from_pcap(pcap_bytes: &[u8], limit: usize) -> Vec<SipM
             to_num: extract_sip_header(&body, "To"),
             src_ip_str: src_ip.to_string(),
             dst_ip_str: dst_ip.to_string(),
+            // UDP transport ports — same source-of-truth as the IP,
+            // and the only way to know which SIP port the packet
+            // arrived on. Typical values 5060 / 5061, occasionally
+            // 5062/5082 for operators running secondary PBX legs on
+            // the same host.
+            src_port,
+            dst_port,
             direction: String::new(), // filled in by caller
             content_type: extract_sip_header(&body, "Content-Type"),
             content: body,

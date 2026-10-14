@@ -734,6 +734,16 @@ table.sip-timeline .sip-row:hover {
   color: var(--fg-muted);
   opacity: 0.85;
 }
+/* Port suffix tucked after the IP. Same muted family as the IP so
+   it reads as a continuation (`192.168.129.200:5060`) rather than
+   a separate label; only appended when the source data carried
+   port info (pcap parser) — DB-path and SDP-discovered actors
+   skip the suffix. */
+.seq-table .seq-actor-port {
+  color: var(--fg-muted);
+  opacity: 0.8;
+  font-weight: 600;
+}
 /* "advertised" caption tucked under the IP — the explicit label
    that ties the dim box back to the legend in the paragraph above
    the diagram. */

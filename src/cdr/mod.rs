@@ -1620,6 +1620,18 @@ pub struct SipMessage {
     pub to_num: String,
     pub src_ip_str: String,
     pub dst_ip_str: String,
+    /// UDP source port the message arrived on. `0` when the source
+    /// data didn't carry port info (e.g. fetched from a `sip_msg`
+    /// install that doesn't expose ports) — the diagram omits the
+    /// port suffix in that case so the renderer doesn't print
+    /// `:0`. Populated by the pcap parser; defaulted to `0` (no
+    /// port info) by the sip_msg fetch path which doesn't have
+    /// the columns.
+    pub src_port: u16,
+    /// UDP destination port. Same conventions as `src_port`. Typical
+    /// values: 5060 (standard SIP), 5061 (SIP/TLS), 5062/5082
+    /// (some operators' secondary PBX).
+    pub dst_port: u16,
     /// Direction: "out" if this sensor initiated the request, "in" if it
     /// received it. Computed by comparing `sipcallerip` against the CDR's
     /// own `sipcallerip` — same direction as the CDR's primary leg.
@@ -1833,6 +1845,12 @@ pub async fn fetch_sip_messages(
             to_num: row.try_get::<String, _>("number_dst").unwrap_or_default(),
             src_ip_str,
             dst_ip_str,
+            // VoIPmonitor's `sip_msg` schema doesn't expose per-message
+            // UDP ports, so the DB path can't fill these. The pcap
+            // parser (after this fallback check in the route handler)
+            // replaces this row wholesale when ports are knowable.
+            src_port: 0,
+            dst_port: 0,
             direction,
             content_type: String::new(), // schema has no per-message CT column
             content,
@@ -2598,6 +2616,11 @@ mod sip_row_classify_tests {
             to_num: String::new(),
             src_ip_str: String::new(),
             dst_ip_str: String::new(),
+            // No port info on the DB path by default — pcap-parsed
+            // rows in production get these populated from the UDP
+            // transport header.
+            src_port: 0,
+            dst_port: 0,
             direction: "out".into(),
             content_type: String::new(),
             content,

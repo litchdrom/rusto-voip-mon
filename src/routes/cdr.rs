@@ -1036,24 +1036,42 @@ fn render_sngrep_flow(
     // ("advertised") differently from real SIP peers so operators
     // don't read them as separate call participants.
     let first = messages.iter().find(|m| !m.src_ip_str.is_empty());
-    let (caller_ip, callee_ip) = first.map_or((String::new(), String::new()), |m| {
-        (m.src_ip_str.clone(), m.dst_ip_str.clone())
-    });
-    // (ip, from_sdp) tuples. Caller/callee land first with
-    // from_sdp=false; any SDP-discovered IP that isn't already in
-    // the list gets from_sdp=true.
-    let mut actors: Vec<(String, bool)> = Vec::new();
-    for ip in [&caller_ip, &callee_ip] {
-        if !ip.is_empty() && !actors.iter().any(|a| a.0 == *ip) {
-            actors.push((ip.clone(), false));
+    // First observed port for caller / callee. `0` means "no port
+    // info came from the source data" — typical for installs where
+    // the sip_msg DB path can't recover ports and the pcap parse
+    // didn't run. The renderer omits the `:N` suffix in that case.
+    let (caller_ip, callee_ip, caller_port, callee_port) =
+        first.map_or((String::new(), String::new(), 0, 0), |m| {
+            (
+                m.src_ip_str.clone(),
+                m.dst_ip_str.clone(),
+                m.src_port,
+                m.dst_port,
+            )
+        });
+    // (ip, port, from_sdp) tuples. Port is captured at the
+    // moment the IP is first observed (the same message that
+    // introduced the IP) and stays fixed for that actor — for SIP
+    // the listening port on each endpoint is constant across the
+    // dialog. Caller/callee land first with from_sdp=false; any
+    // SDP-discovered IP that isn't already in the list gets
+    // from_sdp=true and port=0 (SDP `c=` lines only carry the
+    // connection address, not the port).
+    let mut actors: Vec<(String, u16, bool)> = Vec::new();
+    let push_actor = |actors: &mut Vec<(String, u16, bool)>,
+                       ip: String,
+                       port: u16,
+                       from_sdp: bool| {
+        if !ip.is_empty() && !actors.iter().any(|a| a.0 == ip) {
+            actors.push((ip, port, from_sdp));
         }
-    }
+    };
+    push_actor(&mut actors, caller_ip.clone(), caller_port, false);
+    push_actor(&mut actors, callee_ip.clone(), callee_port, false);
     // Discover additional media endpoints from SDP bodies.
     for m in messages.iter() {
         for sdp_ip in cdr::parse_sdp_c_lines(&m.content) {
-            if !actors.iter().any(|a| a.0 == sdp_ip) {
-                actors.push((sdp_ip, true));
-            }
+            push_actor(&mut actors, sdp_ip, 0, true);
         }
     }
     // Cap at 6 actors — beyond that the table becomes unreadable.
@@ -1080,7 +1098,7 @@ fn render_sngrep_flow(
     let actor_boxes: Vec<String> = actors
         .iter()
         .enumerate()
-        .map(|(i, (ip, from_sdp))| {
+        .map(|(i, (ip, port, from_sdp))| {
             // Role priority:
             //   1. First actor is always the SIP caller (always
             //      signaling, never SDP).
@@ -1111,10 +1129,25 @@ fn render_sngrep_flow(
             } else {
                 ""
             };
+            // Port suffix: `:5060` / `:5061` / etc. when we know
+            // the actor's listening port. `port == 0` means the
+            // source data didn't carry port info (sip_msg DB path
+            // or SDP-discovered actors) — the renderer skips the
+            // suffix so we don't print `:0`. Ports come from the
+            // pcap parser (UDP transport header) for that
+            // source-of-truth; the DB path can't recover them.
+            let port_html = if *port > 0 {
+                format!(
+                    "<span class=\"seq-actor-port\">:{port}</span>",
+                    port = port,
+                )
+            } else {
+                String::new()
+            };
             format!(
                 "<div class=\"seq-actor-box\" data-role=\"{role}\">\
                    <div class=\"seq-actor-letter\">{letter}</div>\
-                   <div class=\"seq-actor-ip\">{ip}</div>\
+                   <div class=\"seq-actor-ip\">{ip}{port_html}</div>\
                    {source_caption}\
                  </div>",
                 ip = html_escape(ip),
@@ -2557,6 +2590,12 @@ mod sip_render_tests {
             to_num: String::new(),
             src_ip_str: String::new(),
             dst_ip_str: String::new(),
+            // Default to standard SIP ports — most tests don't
+            // exercise the port-rendering path so this stays
+            // harmless. Tests that want to render `:5062`-style
+            // ports override these after mk_msg returns.
+            src_port: 5060,
+            dst_port: 5060,
             direction: String::new(),
             content_type: String::new(),
             content,
@@ -2588,6 +2627,8 @@ mod sip_render_tests {
             to_num: "49199".into(),
             src_ip_str: "10.0.0.1".into(),
             dst_ip_str: "10.0.0.2".into(),
+            src_port: 5060,
+            dst_port: 5060,
             direction: "out".into(),
             content_type: "application/sdp".into(),
             content: String::new(),
@@ -2788,6 +2829,82 @@ mod sip_render_tests {
         assert!(
             html.contains("<em>advertised</em>"),
             "the call-flow header should mention \"advertised\" to teach the new dim style"
+        );
+    }
+
+    /// When the message carries port info (pcap-parsed), the
+    /// actor box shows the IP with a `:N` suffix. Caller port
+    /// taken from `m.src_port`, callee from the *same* message's
+    /// `m.dst_port` (so the listening port on each side is
+    /// captured at the moment that IP is first observed).
+    #[test]
+    fn seq_diagram_actor_ip_carries_port_suffix_when_known() {
+        let mut invite = mk_msg("INVITE", 0, 0.0);
+        invite.src_ip_str = "192.168.129.200".into();
+        invite.dst_ip_str = "172.29.31.103".into();
+        // Real SIP on 5060 ↔ SIP/TLS reply coming back on 5061 —
+        // a kind of asymmetric config you sometimes see on
+        // misconfigured endpoints. Distinguishing the two would
+        // not be possible from IP alone.
+        invite.src_port = 5060;
+        invite.dst_port = 5061;
+        let html = render_sngrep_flow(
+            &[invite],
+            None,
+            None,
+            "",
+            "",
+            None,
+            None,
+            "",
+            "",
+        );
+        // The port suffix rides inside a span so CSS can render it
+        // as a secondary chip. Look for the IP followed by the
+        // span carrying the port.
+        assert!(
+            html.contains("192.168.129.200<span class=\"seq-actor-port\">:5060</span>"),
+            "actor A's box should render ip + span-wrapped :5060 when port known"
+        );
+        assert!(
+            html.contains("172.29.31.103<span class=\"seq-actor-port\">:5061</span>"),
+            "actor B's box should render ip + span-wrapped :5061 when port known"
+        );
+    }
+
+    /// DB-path and SDP-discovered actors land with `port == 0`
+    /// (the schema doesn't carry per-message ports; SDP c= lines
+    /// only have the connection address). The renderer must
+    /// omit the suffix in that case — printing `:0` would be
+    /// noisy and misleading.
+    #[test]
+    fn seq_diagram_omits_port_suffix_when_unknown() {
+        let mut invite = mk_msg("INVITE", 0, 0.0);
+        invite.src_ip_str = "192.168.129.200".into();
+        invite.dst_ip_str = "172.29.31.103".into();
+        // Default mk_msg has 5060/5060 — clear it to test the
+        // "no port info" path explicitly.
+        invite.src_port = 0;
+        invite.dst_port = 0;
+        let html = render_sngrep_flow(
+            &[invite],
+            None,
+            None,
+            "",
+            "",
+            None,
+            None,
+            "",
+            "",
+        );
+        assert!(
+            !html.contains(":0<"),
+            "no `:0` suffix when port info is missing"
+        );
+        // IP alone (no colon, no port suffix) is still rendered.
+        assert!(
+            html.contains("192.168.129.200<"),
+            "ip alone renders without a port suffix"
         );
     }
 
