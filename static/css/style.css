@@ -528,12 +528,33 @@ table.sip-timeline .sip-row:hover {
 .sip-other { color: var(--fg-muted); }
 .sip-body {
   margin-top: 4px;
+  position: relative;
 }
 .sip-body summary {
   cursor: pointer;
   color: var(--accent);
   font-size: 11px;
   user-select: none;
+}
+/* When the operator opens the raw SIP body, lift it out of the narrow
+   sequence-diagram column and overlay it on the viewport. The summary
+   toggle stays anchored in the row (click it again to close), but the
+   <pre> itself floats so a long `To:` / `Via:` header is readable
+   instead of getting clipped to ~110px. */
+.sip-body[open] > pre {
+  position: fixed;
+  z-index: 1000;
+  top: 5vh;
+  left: 5vw;
+  right: 5vw;
+  width: auto;
+  max-height: 80vh;
+  background: var(--bg-elev);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 14px 18px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55);
+  overflow: auto;
 }
 .sip-body pre {
   margin: 4px 0 0;
@@ -717,11 +738,16 @@ table.sip-timeline .sip-row:hover {
   font-size: 10px;
   color: var(--fg-muted);
   margin-top: 2px;
-  /* nowrap keeps the IP from wrapping mid-octet; the actor box
-     stays inside the 110px cell even when the IP is long because
-     the :port suffix (when present) goes on its own block line,
-     not appended to the IP. */
-  white-space: nowrap;
+  /* Most IPs (15-char IPv4) fit the actor box without breaking, but
+     the occasional IPv6 / FQDN would overflow the 110px cell and
+     bleed into the next lifeline. `overflow-wrap: anywhere` lets the
+     address stay on one line when it fits, then breaks mid-token
+     (between colons / dots) only when it doesn't — visibly cleaner
+     than `break-all` for the common case. The port suffix (when
+     present) sits on its own block line below, so an over-long IP
+     still won't push the box taller than three lines. */
+  overflow-wrap: anywhere;
+  word-break: break-word;
   font-family: ui-monospace, "SFMono-Regular", "Menlo", "Consolas", monospace;
 }
 .seq-table .seq-actor-box[data-role="caller"]  .seq-actor-letter { color: var(--accent); }
