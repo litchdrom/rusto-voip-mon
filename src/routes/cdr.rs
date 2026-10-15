@@ -259,6 +259,14 @@ pub struct FiltersView {
     pub mos_max_str: String,
     pub duration_min_str: String,
     pub duration_max_str: String,
+    /// UDP source port typed in the form. Empty string when
+    /// unfiltered (so the <input value="..."> drops the placeholder
+    /// and the field looks empty on reload — matches every other
+    /// numeric field above).
+    pub src_port_str: String,
+    /// UDP destination port typed in the form. Same conventions
+    /// as `src_port_str`.
+    pub dst_port_str: String,
     /// Comma-separated input shown in the form.
     pub id_sensor_str: String,
     /// Resolved display strings for the multi-select summary headers.
@@ -307,6 +315,8 @@ impl FiltersView {
                 .max_duration
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
+            src_port_str: f.src_port.map(|v| v.to_string()).unwrap_or_default(),
+            dst_port_str: f.dst_port.map(|v| v.to_string()).unwrap_or_default(),
             id_sensor_str: id_sensor,
             yesterday_from: format!("{}T00:00", yesterday),
             yesterday_to: format!("{}T23:59", yesterday),
@@ -347,6 +357,12 @@ impl FiltersView {
         }
         if !self.duration_max_str.is_empty() {
             parts.push(("duration_max".into(), self.duration_max_str.clone()));
+        }
+        if !self.src_port_str.is_empty() {
+            parts.push(("src_port".into(), self.src_port_str.clone()));
+        }
+        if !self.dst_port_str.is_empty() {
+            parts.push(("dst_port".into(), self.dst_port_str.clone()));
         }
         if !self.id_sensor_str.is_empty() {
             parts.push(("id_sensor".into(), self.id_sensor_str.clone()));
@@ -389,6 +405,8 @@ pub async fn cdr_list(
         mos_max: params.first("mos_max"),
         duration_min: params.first("duration_min"),
         duration_max: params.first("duration_max"),
+        src_port: params.first("src_port"),
+        dst_port: params.first("dst_port"),
         page: params.first("page"),
         page_size: params.first("page_size"),
     };
@@ -1960,9 +1978,18 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
             String::new()
         } else {
             let content = html_escape(&m.content);
+            // The close button sits inside the <details> body (so it's
+            // hidden when the <details> is closed) but styles itself
+            // fixed-positioned when the <details> is open — see
+            // `.sip-body[open] > .sip-body-close` in style.css. The
+            // click handler in cdr_list.html sets `details.open =
+            // false`, which collapses the overlay back to the inline
+            // <summary> toggle in the table row.
             format!(
                 "<details class=\"sip-body\">\
                    <summary>raw SIP body ({content_type}, {bytes} bytes)</summary>\
+                   <button type=\"button\" class=\"sip-body-close\" \
+                           aria-label=\"Close raw SIP body\">✕</button>\
                    <pre>{content}</pre>\
                  </details>",
                 bytes = m.content.len(),
@@ -2122,6 +2149,8 @@ pub async fn cdr_export_csv(
         mos_max: params.first("mos_max"),
         duration_min: params.first("duration_min"),
         duration_max: params.first("duration_max"),
+        src_port: params.first("src_port"),
+        dst_port: params.first("dst_port"),
         page: params.first("page"),
         page_size: params.first("page_size"),
     };
@@ -2355,6 +2384,15 @@ pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilter
         mos_max: parse_opt(q.mos_max.as_deref()),
         min_duration: parse_opt(q.duration_min.as_deref()),
         max_duration: parse_opt(q.duration_max.as_deref()),
+        // UDP source/dst port filters — typed numbers from the form
+        // (e.g. `5060` for SIP over standard port, `5061` for TLS).
+        // `parse_opt` drops empty + unparseable, so a blank input
+        // becomes `None` and the port clause in `to_where()` is
+        // omitted. We DON'T fall back to 0 — 0 in sip_msg is a
+        // "we didn't record a port" sentinel, not a real value, and
+        // matching it would silently swallow noise rows.
+        src_port: parse_opt::<u16>(q.src_port.as_deref()),
+        dst_port: parse_opt::<u16>(q.dst_port.as_deref()),
         id_sensor: merge_csv(params.all("id_sensor")).filter(|s| !s.is_empty()),
         page: parse_opt(q.page.as_deref()),
         page_size: parse_opt(q.page_size.as_deref()),
@@ -2426,6 +2464,8 @@ pub(crate) struct SingleParams {
     pub mos_max: Option<String>,
     pub duration_min: Option<String>,
     pub duration_max: Option<String>,
+    pub src_port: Option<String>,
+    pub dst_port: Option<String>,
     pub page: Option<String>,
     pub page_size: Option<String>,
 }

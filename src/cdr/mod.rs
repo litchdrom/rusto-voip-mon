@@ -487,6 +487,16 @@ pub struct CdrFilters {
     pub sip_code: Option<String>,
     /// Sensor IDs. Comma-separated in the form.
     pub id_sensor: Option<String>,
+    /// UDP source port of the first / signalling leg (matches
+    /// `sip_msg.port_src`). Single-value exact match (no IN-list);
+    /// `0` is rejected at the parse step so the empty-input
+    /// sentinel never silently matches every port-0 row.
+    /// Use this to scope "calls that came in on the SBC vs the
+    /// PSTN gateway" — different route = different port.
+    pub src_port: Option<u16>,
+    /// UDP destination port of the first / signalling leg
+    /// (matches `sip_msg.port_dst`). Same semantics as `src_port`.
+    pub dst_port: Option<u16>,
     pub mos_min: Option<u8>,
     pub mos_max: Option<u8>,
     pub min_duration: Option<u32>,
@@ -538,6 +548,12 @@ impl CdrFilters {
             dst_ips: parse_ip_list(self.dst_ip.as_deref()),
             sip_codes: parse_u16_list(self.sip_code.as_deref()),
             sensor_ids: parse_u16_list(self.id_sensor.as_deref()),
+            // `0` is the empty-input sentinel here too — both
+            // `build_filters` (parse step) and the form-clear path
+            // pass `None` when the input is blank, so this branch
+            // only carries ports the operator explicitly typed.
+            src_port: self.src_port.filter(|&p| p > 0),
+            dst_port: self.dst_port.filter(|&p| p > 0),
             mos_min_mult10: self.mos_min.map(|m| (m as u16) * 10),
             mos_max_mult10: self.mos_max.map(|m| (m as u16) * 10),
             min_duration: self.min_duration,
@@ -628,6 +644,8 @@ mod in_clause_tests {
             dst_ips: vec![],
             sip_codes: vec![],
             sensor_ids: vec![],
+            src_port: None,
+            dst_port: None,
             mos_min_mult10: None,
             mos_max_mult10: None,
             min_duration: None,
@@ -957,6 +975,85 @@ mod in_clause_tests {
             "quarter-hour shift (Nepal op, UTC+8 DB) → +2h15m"
         );
     }
+
+    /// `src_port` alone emits a single EXISTS subquery keyed on
+    /// `sip_msg.port_src`, windowed against the cdr row's own
+    /// calldate/callend columns. The inner SELECT is correlated
+    /// but the sip_msg.time index makes it cheap (one seek per
+    /// cdr row that survives the rest of the WHERE).
+    #[test]
+    fn src_port_emits_single_exists_against_sip_msg() {
+        let mut nf = f(vec![], vec![]);
+        nf.src_port = Some(5060);
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
+        assert!(
+            sql.contains("EXISTS (SELECT 1 FROM sip_msg"),
+            "missing EXISTS clause: {sql}"
+        );
+        assert!(
+            sql.contains("sip_msg.port_src = ?"),
+            "missing port_src placeholder: {sql}"
+        );
+        assert!(
+            !sql.contains("port_dst"),
+            "dst_port should not appear when only src_port set: {sql}"
+        );
+        assert_eq!(binds, vec![FilterBind::U16(5060)]);
+    }
+
+    /// `dst_port` alone — mirror of the src_port case.
+    #[test]
+    fn dst_port_emits_single_exists_against_sip_msg() {
+        let mut nf = f(vec![], vec![]);
+        nf.dst_port = Some(5061);
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
+        assert!(
+            sql.contains("sip_msg.port_dst = ?"),
+            "missing port_dst placeholder: {sql}"
+        );
+        assert!(
+            !sql.contains("port_src"),
+            "src_port should not appear when only dst_port set: {sql}"
+        );
+        assert_eq!(binds, vec![FilterBind::U16(5061)]);
+    }
+
+    /// Both ports set → ONE EXISTS subquery with both conditions
+    /// AND-ed (call must have used BOTH ports, e.g. the SBC leg
+    /// came in on 5060 and the trunk leg out on 5061). Two
+    /// separate EXISTS clauses would scan sip_msg twice; one
+    /// combined clause with both placeholders lets MySQL do it
+    /// in a single seek per cdr row.
+    #[test]
+    fn src_and_dst_ports_combine_into_single_exists() {
+        let mut nf = f(vec![], vec![]);
+        nf.src_port = Some(5060);
+        nf.dst_port = Some(5061);
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
+        let exists_count = sql.matches("EXISTS (SELECT 1 FROM sip_msg").count();
+        assert_eq!(
+            exists_count, 1,
+            "expected one combined EXISTS, got {exists_count}: {sql}"
+        );
+        assert!(sql.contains("sip_msg.port_src = ? AND sip_msg.port_dst = ?"));
+        assert_eq!(
+            binds,
+            vec![FilterBind::U16(5060), FilterBind::U16(5061)],
+            "binds must follow placeholder order"
+        );
+    }
+
+    /// No port filter → no EXISTS clause at all. Verifies we don't
+    /// silently add a per-row correlated subquery when the operator
+    /// didn't ask for one.
+    #[test]
+    fn no_ports_means_no_exists_clause() {
+        let nf = f(vec![], vec![]);
+        let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
+        assert!(sql.is_empty(), "expected empty WHERE, got: {sql}");
+        assert!(binds.is_empty());
+        assert!(!sql.contains("sip_msg"));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -985,6 +1082,14 @@ pub struct NormalizedFilters {
     pub dst_ips: Vec<String>,
     pub sip_codes: Vec<u16>,
     pub sensor_ids: Vec<u16>,
+    /// UDP source port filter — emits `EXISTS (SELECT 1 FROM sip_msg
+    /// WHERE ... AND sip_msg.port_src = ?)` in `to_where()`.
+    /// Windowed against the cdr row's own `calldate`/`callend` so
+    /// each cdr gets an indexed per-row lookup against its call's
+    /// SIP messages. None = "no port filter".
+    pub src_port: Option<u16>,
+    /// UDP destination port filter — same shape as `src_port`.
+    pub dst_port: Option<u16>,
     pub mos_min_mult10: Option<u16>,
     pub mos_max_mult10: Option<u16>,
     pub min_duration: Option<u32>,
@@ -1133,6 +1238,34 @@ impl NormalizedFilters {
                 binds.push(FilterBind::U16(*v));
             }
         }
+        // UDP port filters — `sip_msg.port_src` / `port_dst`. Single
+        // value per filter (not IN-list); both ports can be combined
+        // into one EXISTS so a row with src=5060 AND dst=5061 is a
+        // single indexed lookup per cdr. The window is bounded by
+        // the cdr row's own calldate / callend so the inner SELECT
+        // is correlated — but sip_msg.time has a BTREE index on
+        // any reasonable voipmonitor install, so this is cheap
+        // (one seek per cdr). Using the cdr's columns also avoids
+        // the operator-vs-DB TZ shift gymnastics the calldate
+        // bounds need — `cdr.calldate`/`callend` are already in
+        // the DB's stored TZ, which is what sip_msg.time is in too.
+        let mut port_conds: Vec<&str> = Vec::new();
+        if let Some(p) = self.src_port {
+            port_conds.push("sip_msg.port_src = ?");
+            binds.push(FilterBind::U16(p));
+        }
+        if let Some(p) = self.dst_port {
+            port_conds.push("sip_msg.port_dst = ?");
+            binds.push(FilterBind::U16(p));
+        }
+        if !port_conds.is_empty() {
+            parts.push(format!(
+                "EXISTS (SELECT 1 FROM sip_msg \
+                 WHERE sip_msg.time BETWEEN cdr.calldate AND cdr.callend \
+                   AND {})",
+                port_conds.join(" AND ")
+            ));
+        }
         if let Some(m) = self.mos_min_mult10 {
             parts.push("mos_min_mult10 >= ?".into());
             binds.push(FilterBind::U16(m));
@@ -1159,6 +1292,7 @@ impl NormalizedFilters {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
 pub enum FilterBind {
     DateTime(NaiveDateTime),
     Str(String),
@@ -1446,6 +1580,8 @@ pub async fn ids_for_query_string(
         mos_max: params.first("mos_max"),
         duration_min: params.first("duration_min"),
         duration_max: params.first("duration_max"),
+        src_port: params.first("src_port"),
+        dst_port: params.first("dst_port"),
         page: params.first("page"),
         page_size: params.first("page_size"),
     };

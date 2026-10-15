@@ -112,6 +112,8 @@
     <label><span>MOS max</span><input type="number" step="0.1" min="0" max="5" name="mos_max" value="{{ filters.mos_max_str }}"></label>
     <label><span>Dur min (s)</span><input type="number" step="1" min="0" name="duration_min" value="{{ filters.duration_min_str }}"></label>
     <label><span>Dur max (s)</span><input type="number" step="1" min="0" name="duration_max" value="{{ filters.duration_max_str }}"></label>
+    <label><span>Src UDP port</span><input type="number" step="1" min="1" max="65535" name="src_port" value="{{ filters.src_port_str }}" placeholder="e.g. 5060" title="Calls that arrived on this source UDP port (sip_msg.port_src). Use to scope a single SBC or PSTN gateway route."></label>
+    <label><span>Dst UDP port</span><input type="number" step="1" min="1" max="65535" name="dst_port" value="{{ filters.dst_port_str }}" placeholder="e.g. 5061" title="Calls that went out on this destination UDP port (sip_msg.port_dst). Combine with Src UDP port to scope a specific route (e.g. SBC 5060 → trunk 5061)."></label>
   </div>
 
   <div class="multi-select-grid">
@@ -685,5 +687,25 @@ document.getElementById('batch-csv-btn')?.addEventListener('click', () => {
 document.getElementById('batch-csv-all-btn')?.addEventListener('click', downloadBatchCsvFromFilter);
 updateMasterCheckbox();
 updateBatchBtn();
+
+// SIP body close button — every open `.sip-body` overlay exposes a
+// `.sip-body-close` button in its top-right corner. Clicking it just
+// collapses the parent <details>, which both hides the overlay and
+// restores the inline <summary> toggle in the table cell. Delegated
+// so we don't need to re-wire on every page reload.
+document.addEventListener('click', function(ev) {
+  const btn = ev.target.closest('.sip-body-close');
+  if (!btn) return;
+  const details = btn.closest('details.sip-body');
+  if (details) details.open = false;
+});
+// ESC also closes the topmost open overlay — keyboard parity with the
+// close button. `keydown` on document so it works regardless of which
+// element has focus.
+document.addEventListener('keydown', function(ev) {
+  if (ev.key !== 'Escape') return;
+  const open = document.querySelector('details.sip-body[open]');
+  if (open) open.open = false;
+});
 </script>
 {% endblock %}
