@@ -1978,18 +1978,21 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
             String::new()
         } else {
             let content = html_escape(&m.content);
-            // The close button sits inside the <details> body (so it's
-            // hidden when the <details> is closed) but styles itself
-            // fixed-positioned when the <details> is open — see
-            // `.sip-body[open] > .sip-body-close` in style.css. The
-            // click handler in cdr_list.html sets `details.open =
-            // false`, which collapses the overlay back to the inline
-            // <summary> toggle in the table row.
+            // Close button uses inline `onclick` (no event delegation)
+            // so it always fires regardless of any earlier JS error
+            // in the page's main script — `this.closest('details')
+            // .open = false` collapses the overlay back to the inline
+            // <summary> toggle in the row. The CSS-positioning fix
+            // (button is `position: absolute` inside the floating
+            // <pre>) prevents any ancestor with `transform`/`filter`
+            // /`contain` from hijacking the button.
             format!(
-                "<details class=\"sip-body\">\
+                "<details class=\"sip-body\" \
+                         ontoggle=\"if(this.open) staggerSipOverlays()\">\
                    <summary>raw SIP body ({content_type}, {bytes} bytes)</summary>\
                    <button type=\"button\" class=\"sip-body-close\" \
-                           aria-label=\"Close raw SIP body\">✕</button>\
+                           aria-label=\"Close raw SIP body\" \
+                           onclick=\"this.closest('details').open=false\">✕</button>\
                    <pre>{content}</pre>\
                  </details>",
                 bytes = m.content.len(),

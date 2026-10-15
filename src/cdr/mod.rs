@@ -978,9 +978,11 @@ mod in_clause_tests {
 
     /// `src_port` alone emits a single EXISTS subquery keyed on
     /// `sip_msg.port_src`, joined against the cdr row's own
-    /// `sip_msg.calldate = cdr.calldate` — one indexed seek per
+    /// `sip_msg.time = cdr.calldate` — one indexed seek per
     /// surviving cdr (was a range scan on `sip_msg.time BETWEEN
-    /// calldate AND callend` which 504'd the request on long calls).
+    /// calldate AND callend` which 504'd the request on long calls,
+    /// and before that `sip_msg.calldate = cdr.calldate` which
+    /// 500'd because sip_msg has no `calldate` column).
     #[test]
     fn src_port_emits_single_exists_against_sip_msg() {
         let mut nf = f(vec![], vec![]);
@@ -991,12 +993,16 @@ mod in_clause_tests {
             "missing EXISTS clause: {sql}"
         );
         assert!(
-            sql.contains("sip_msg.calldate = cdr.calldate"),
-            "join key must be calldate=calldate (single seek), got: {sql}"
+            sql.contains("sip_msg.time = cdr.calldate"),
+            "join key must be time=calldate (single seek), got: {sql}"
         );
         assert!(
             !sql.contains("sip_msg.time BETWEEN"),
             "time-range join is the slow shape this replaced: {sql}"
+        );
+        assert!(
+            !sql.contains("sip_msg.calldate"),
+            "sip_msg has no calldate column on stock voipmonitor: {sql}"
         );
         assert!(
             sql.contains("sip_msg.port_src = ?"),
@@ -1016,8 +1022,12 @@ mod in_clause_tests {
         nf.dst_port = Some(5061);
         let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert!(
-            sql.contains("sip_msg.calldate = cdr.calldate"),
-            "join key must be calldate=calldate (single seek), got: {sql}"
+            sql.contains("sip_msg.time = cdr.calldate"),
+            "join key must be time=calldate (single seek), got: {sql}"
+        );
+        assert!(
+            !sql.contains("sip_msg.calldate"),
+            "sip_msg has no calldate column on stock voipmonitor: {sql}"
         );
         assert!(
             sql.contains("sip_msg.port_dst = ?"),
@@ -1048,8 +1058,8 @@ mod in_clause_tests {
             "expected one combined EXISTS, got {exists_count}: {sql}"
         );
         assert!(
-            sql.contains("sip_msg.calldate = cdr.calldate"),
-            "join key must be calldate=calldate, got: {sql}"
+            sql.contains("sip_msg.time = cdr.calldate"),
+            "join key must be time=calldate, got: {sql}"
         );
         assert!(sql.contains("sip_msg.port_src = ? AND sip_msg.port_dst = ?"));
         assert_eq!(
@@ -1259,18 +1269,20 @@ impl NormalizedFilters {
         // into one EXISTS so a row with src=5060 AND dst=5061 is a
         // single indexed lookup per cdr.
         //
-        // Join key is `sip_msg.calldate = cdr.calldate` — voipmonitor
-        // stamps every sip_msg row for a call with the call's start
-        // timestamp, so the per-row lookup is a single BTREE seek
-        // against `sip_msg.calldate` (indexed on any reasonable
-        // install). The earlier `sip_msg.time BETWEEN calldate AND
-        // callend` shape forced a range scan per surviving cdr — for
-        // the 30-second default query timeout and a "today" filter,
-        // that routinely 504'd once any port filter was set
-        // (especially on long calls where the time window was wide).
-        // Using cdr's own columns also dodges the operator-vs-DB TZ
-        // shift that the calldate bounds need — sip_msg.calldate and
-        // cdr.calldate are both in the DB's stored TZ already.
+        // Join key is `sip_msg.time = cdr.calldate` — voipmonitor
+        // stamps the very first SIP message of a call with the call
+        // start timestamp (= cdr.calldate), and stores that on
+        // `sip_msg.time` (sip_msg has no separate `calldate` column).
+        // Equality is one BTREE seek per surviving cdr against
+        // `sip_msg.time` (indexed on any reasonable install). The
+        // earlier `sip_msg.time BETWEEN calldate AND callend` shape
+        // forced a range scan per surviving cdr — for the 30-second
+        // default query timeout and a "today" filter, that routinely
+        // 504'd once any port filter was set (especially on long calls
+        // where the time window was wide). The earlier
+        // `sip_msg.calldate = cdr.calldate` shape used a column that
+        // doesn't exist on a stock voipmonitor install — it 500'd the
+        // request with "Unknown column 'sip_msg.calldate'".
         let mut port_conds: Vec<&str> = Vec::new();
         if let Some(p) = self.src_port {
             port_conds.push("sip_msg.port_src = ?");
@@ -1283,7 +1295,7 @@ impl NormalizedFilters {
         if !port_conds.is_empty() {
             parts.push(format!(
                 "EXISTS (SELECT 1 FROM sip_msg \
-                 WHERE sip_msg.calldate = cdr.calldate \
+                 WHERE sip_msg.time = cdr.calldate \
                    AND {})",
                 port_conds.join(" AND ")
             ));

@@ -7,7 +7,36 @@
   <link rel="stylesheet" href="/static/css/style.css">
   {% block head %}{% endblock %}
 </head>
-<body>
+<body onkeydown="
+  if (event.key === 'Escape') {
+    document.querySelectorAll('details.sip-body[open]').forEach(function(d){ d.open = false; });
+    if (typeof staggerSipOverlays === 'function') staggerSipOverlays();
+  }
+">
+{# Inline JS helpers — declared here (top of body) so they exist
+   regardless of any JS error in the page's main script. The
+   document-level addEventListener approach failed silently in
+   practice when something earlier in the script block threw —
+   these inline paths don't. #}
+<script>
+// Stagger every currently-open SIP-body overlay by a few vh/vw
+// so multiple open messages don't all sit at top-left and hide
+// each other. Called from each <details>'s `ontoggle` so it
+// fires the moment a new overlay opens (and again when any
+// closes, collapsing the stack back). Cap at 5 so older
+// overlays don't march off-screen.
+function staggerSipOverlays() {
+  var i = 0;
+  document.querySelectorAll('details.sip-body[open] > pre').forEach(function(pre) {
+    var step = Math.min(i, 5);
+    pre.style.top    = (5 + step * 3) + 'vh';
+    pre.style.left   = (5 + step * 3) + 'vw';
+    pre.style.right  = (5 - step * 3) + 'vw';
+    pre.style.bottom = (5 - step * 3) + 'vh';
+    i++;
+  });
+}
+</script>
   {% if let Some(u) = user %}
   <nav class="topbar">
     <div class="brand">
