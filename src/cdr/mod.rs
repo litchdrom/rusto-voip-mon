@@ -977,10 +977,10 @@ mod in_clause_tests {
     }
 
     /// `src_port` alone emits a single EXISTS subquery keyed on
-    /// `sip_msg.port_src`, windowed against the cdr row's own
-    /// calldate/callend columns. The inner SELECT is correlated
-    /// but the sip_msg.time index makes it cheap (one seek per
-    /// cdr row that survives the rest of the WHERE).
+    /// `sip_msg.port_src`, joined against the cdr row's own
+    /// `sip_msg.calldate = cdr.calldate` — one indexed seek per
+    /// surviving cdr (was a range scan on `sip_msg.time BETWEEN
+    /// calldate AND callend` which 504'd the request on long calls).
     #[test]
     fn src_port_emits_single_exists_against_sip_msg() {
         let mut nf = f(vec![], vec![]);
@@ -989,6 +989,14 @@ mod in_clause_tests {
         assert!(
             sql.contains("EXISTS (SELECT 1 FROM sip_msg"),
             "missing EXISTS clause: {sql}"
+        );
+        assert!(
+            sql.contains("sip_msg.calldate = cdr.calldate"),
+            "join key must be calldate=calldate (single seek), got: {sql}"
+        );
+        assert!(
+            !sql.contains("sip_msg.time BETWEEN"),
+            "time-range join is the slow shape this replaced: {sql}"
         );
         assert!(
             sql.contains("sip_msg.port_src = ?"),
@@ -1007,6 +1015,10 @@ mod in_clause_tests {
         let mut nf = f(vec![], vec![]);
         nf.dst_port = Some(5061);
         let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
+        assert!(
+            sql.contains("sip_msg.calldate = cdr.calldate"),
+            "join key must be calldate=calldate (single seek), got: {sql}"
+        );
         assert!(
             sql.contains("sip_msg.port_dst = ?"),
             "missing port_dst placeholder: {sql}"
@@ -1034,6 +1046,10 @@ mod in_clause_tests {
         assert_eq!(
             exists_count, 1,
             "expected one combined EXISTS, got {exists_count}: {sql}"
+        );
+        assert!(
+            sql.contains("sip_msg.calldate = cdr.calldate"),
+            "join key must be calldate=calldate, got: {sql}"
         );
         assert!(sql.contains("sip_msg.port_src = ? AND sip_msg.port_dst = ?"));
         assert_eq!(
@@ -1241,14 +1257,20 @@ impl NormalizedFilters {
         // UDP port filters — `sip_msg.port_src` / `port_dst`. Single
         // value per filter (not IN-list); both ports can be combined
         // into one EXISTS so a row with src=5060 AND dst=5061 is a
-        // single indexed lookup per cdr. The window is bounded by
-        // the cdr row's own calldate / callend so the inner SELECT
-        // is correlated — but sip_msg.time has a BTREE index on
-        // any reasonable voipmonitor install, so this is cheap
-        // (one seek per cdr). Using the cdr's columns also avoids
-        // the operator-vs-DB TZ shift gymnastics the calldate
-        // bounds need — `cdr.calldate`/`callend` are already in
-        // the DB's stored TZ, which is what sip_msg.time is in too.
+        // single indexed lookup per cdr.
+        //
+        // Join key is `sip_msg.calldate = cdr.calldate` — voipmonitor
+        // stamps every sip_msg row for a call with the call's start
+        // timestamp, so the per-row lookup is a single BTREE seek
+        // against `sip_msg.calldate` (indexed on any reasonable
+        // install). The earlier `sip_msg.time BETWEEN calldate AND
+        // callend` shape forced a range scan per surviving cdr — for
+        // the 30-second default query timeout and a "today" filter,
+        // that routinely 504'd once any port filter was set
+        // (especially on long calls where the time window was wide).
+        // Using cdr's own columns also dodges the operator-vs-DB TZ
+        // shift that the calldate bounds need — sip_msg.calldate and
+        // cdr.calldate are both in the DB's stored TZ already.
         let mut port_conds: Vec<&str> = Vec::new();
         if let Some(p) = self.src_port {
             port_conds.push("sip_msg.port_src = ?");
@@ -1261,7 +1283,7 @@ impl NormalizedFilters {
         if !port_conds.is_empty() {
             parts.push(format!(
                 "EXISTS (SELECT 1 FROM sip_msg \
-                 WHERE sip_msg.time BETWEEN cdr.calldate AND cdr.callend \
+                 WHERE sip_msg.calldate = cdr.calldate \
                    AND {})",
                 port_conds.join(" AND ")
             ));
