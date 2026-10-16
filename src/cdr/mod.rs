@@ -977,12 +977,16 @@ mod in_clause_tests {
     }
 
     /// `src_port` alone emits a single EXISTS subquery keyed on
-    /// `sip_msg.port_src`, joined against the cdr row's own
-    /// `sip_msg.time = cdr.calldate` — one indexed seek per
-    /// surviving cdr (was a range scan on `sip_msg.time BETWEEN
-    /// calldate AND callend` which 504'd the request on long calls,
-    /// and before that `sip_msg.calldate = cdr.calldate` which
-    /// 500'd because sip_msg has no `calldate` column).
+    /// `sip_msg.port_src`, joined against the cdr via a 7-second
+    /// window around `cdr.calldate` plus a party match — robust
+    /// against the sniffer's per-message clock drifting a second
+    /// or two off the cdr's stored calldate (the earlier
+    /// `sip_msg.time = cdr.calldate` exact-equality shape dropped
+    /// calls where that drift happened). Also explicitly forbids
+    /// the two broken shapes this replaced: the time-range join
+    /// `sip_msg.time BETWEEN cdr.calldate AND cdr.callend` (504'd
+    /// on long calls) and `sip_msg.calldate = cdr.calldate`
+    /// (sip_msg has no `calldate` column on stock voipmonitor).
     #[test]
     fn src_port_emits_single_exists_against_sip_msg() {
         let mut nf = f(vec![], vec![]);
@@ -993,12 +997,17 @@ mod in_clause_tests {
             "missing EXISTS clause: {sql}"
         );
         assert!(
-            sql.contains("sip_msg.time = cdr.calldate"),
-            "join key must be time=calldate (single seek), got: {sql}"
+            sql.contains("INTERVAL 2 SECOND") && sql.contains("INTERVAL 5 SECOND"),
+            "join key must be a small time window (7s), got: {sql}"
         );
         assert!(
-            !sql.contains("sip_msg.time BETWEEN"),
-            "time-range join is the slow shape this replaced: {sql}"
+            sql.contains("sip_msg.number_src = cdr.caller")
+                || sql.contains("sip_msg.number_src IN"),
+            "party match is required to avoid picking up unrelated calls in the window: {sql}"
+        );
+        assert!(
+            !sql.contains("sip_msg.time = cdr.calldate"),
+            "exact equality drops calls where the sniffer's clock drifts off cdr.calldate: {sql}"
         );
         assert!(
             !sql.contains("sip_msg.calldate"),
@@ -1022,8 +1031,12 @@ mod in_clause_tests {
         nf.dst_port = Some(5061);
         let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert!(
-            sql.contains("sip_msg.time = cdr.calldate"),
-            "join key must be time=calldate (single seek), got: {sql}"
+            sql.contains("INTERVAL 2 SECOND") && sql.contains("INTERVAL 5 SECOND"),
+            "join key must be a small time window (7s), got: {sql}"
+        );
+        assert!(
+            !sql.contains("sip_msg.time = cdr.calldate"),
+            "exact equality drops calls where the sniffer's clock drifts: {sql}"
         );
         assert!(
             !sql.contains("sip_msg.calldate"),
@@ -1058,8 +1071,8 @@ mod in_clause_tests {
             "expected one combined EXISTS, got {exists_count}: {sql}"
         );
         assert!(
-            sql.contains("sip_msg.time = cdr.calldate"),
-            "join key must be time=calldate, got: {sql}"
+            sql.contains("INTERVAL 2 SECOND") && sql.contains("INTERVAL 5 SECOND"),
+            "join key must be a small time window (7s), got: {sql}"
         );
         assert!(sql.contains("sip_msg.port_src = ? AND sip_msg.port_dst = ?"));
         assert_eq!(
@@ -1269,20 +1282,27 @@ impl NormalizedFilters {
         // into one EXISTS so a row with src=5060 AND dst=5061 is a
         // single indexed lookup per cdr.
         //
-        // Join key is `sip_msg.time = cdr.calldate` — voipmonitor
-        // stamps the very first SIP message of a call with the call
-        // start timestamp (= cdr.calldate), and stores that on
-        // `sip_msg.time` (sip_msg has no separate `calldate` column).
-        // Equality is one BTREE seek per surviving cdr against
-        // `sip_msg.time` (indexed on any reasonable install). The
-        // earlier `sip_msg.time BETWEEN calldate AND callend` shape
-        // forced a range scan per surviving cdr — for the 30-second
-        // default query timeout and a "today" filter, that routinely
-        // 504'd once any port filter was set (especially on long calls
-        // where the time window was wide). The earlier
-        // `sip_msg.calldate = cdr.calldate` shape used a column that
-        // doesn't exist on a stock voipmonitor install — it 500'd the
-        // request with "Unknown column 'sip_msg.calldate'".
+        // Join key is a small time window around cdr.calldate plus a
+        // party match — `sip_msg.time = cdr.calldate` works for most
+        // calls (the first INVITE carries cdr.calldate exactly) but
+        // silently drops calls where the sniffer's per-message clock
+        // diverged by a second or two from the cdr-stored calldate.
+        // That's why the user reported `dst_port=5060` returning calls
+        // whose displayed port was 5061/5062/5060 — the 5060 filter
+        // happened to match the first INVITE, but a hypothetical
+        // `dst_port=5061` could miss calls entirely if the 5061
+        // message's `time` was a second off. A 7-second window
+        // (`-2..+5`) covers the full INVITE → 200 OK → ACK exchange,
+        // and the party match (`number_src` OR `number_dst` equals
+        // cdr.caller) keeps the inner SELECT from picking up an
+        // unrelated call that happened to fire in the same window.
+        // The window is small enough that the BTREE seek against
+        // `sip_msg.time` is one indexed read per cdr — fast even
+        // with the 30-second default query timeout. The earlier
+        // `sip_msg.time BETWEEN cdr.calldate AND cdr.callend` shape
+        // did a full range scan per surviving cdr and 504'd on long
+        // calls; the earlier `sip_msg.calldate = cdr.calldate` used
+        // a column that doesn't exist on stock voipmonitor.
         let mut port_conds: Vec<&str> = Vec::new();
         if let Some(p) = self.src_port {
             port_conds.push("sip_msg.port_src = ?");
@@ -1295,7 +1315,11 @@ impl NormalizedFilters {
         if !port_conds.is_empty() {
             parts.push(format!(
                 "EXISTS (SELECT 1 FROM sip_msg \
-                 WHERE sip_msg.time = cdr.calldate \
+                 WHERE sip_msg.time BETWEEN \
+                       (cdr.calldate - INTERVAL 2 SECOND) \
+                       AND (cdr.calldate + INTERVAL 5 SECOND) \
+                   AND (sip_msg.number_src = cdr.caller \
+                        OR sip_msg.number_dst = cdr.caller) \
                    AND {})",
                 port_conds.join(" AND ")
             ));

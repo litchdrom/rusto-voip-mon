@@ -271,7 +271,20 @@ pub fn compute_rtp_stats(
 /// established pacing, and a single reorder event would skew
 /// a mean badly.
 fn estimate_clock_rate_hz(packets: &[RtpPacket]) -> f64 {
-    let sample_window = packets.len().min(30).max(2);
+    // Sample up to the first 30 packets. `min(30)` first so a
+    // single-packet stream (n=1) gives sample_window=1 — the
+    // earlier `.max(2)` would happily return 2 here and then
+    // `packets[..2]` panic with "range end index 2 out of range
+    // for slice of length 1" the moment a call has only one
+    // RTP packet recorded (e.g. a one-way audio failure path or
+    // a caller that hung up before media flowed).
+    let sample_window = packets.len().min(30);
+    if sample_window < 2 {
+        // Need a pair to compute a delta. Fall back to the safe
+        // narrowband default — the chart code path already treats
+        // this estimate as a hint, not a contract.
+        return 8_000.0;
+    }
     let mut rates: Vec<f64> = Vec::new();
     for w in packets[..sample_window].windows(2) {
         let d_arr_ms = (w[1].arrival_secs - w[0].arrival_secs) * 1000.0;
@@ -747,5 +760,35 @@ mod tests {
             "reorder should not corrupt jitter, got {}",
             stats.a_to_b[0].jitter_ms
         );
+    }
+
+    /// Regression: a one-packet stream must not panic the
+    /// clock-rate estimator. The earlier shape used
+    /// `sample_window = packets.len().min(30).max(2)` — for
+    /// n=1 that returned 2, and `packets[..2]` then panicked
+    /// with "range end index 2 out of range for slice of length
+    /// 1" when the call had only a single RTP packet recorded
+    /// (one-way audio failure / hung up before media flowed).
+    /// Estimator must now bail with the safe narrowband default.
+    #[test]
+    fn estimate_clock_rate_single_packet_does_not_panic() {
+        // The clock-rate estimator used to read `packets[..2]`
+        // with sample_window = min(30).max(2) which evaluates to
+        // 2 for a single-packet stream, and then panicked with
+        // "range end index 2 out of range for slice of length 1"
+        // when a call had only one RTP packet recorded (one-way
+        // audio failure / hung up before media flowed). The
+        // estimator now bails early with the safe narrowband
+        // default. If we reach the assertions below, the panic
+        // was avoided.
+        let packets = vec![mk_pkt(0.0, 0, 0x1, [10, 0, 0, 1])];
+        let pcap = build_rtp_pcap(&packets);
+        let parsed = parse_rtp_packets_from_pcap(&pcap);
+        let stats = compute_rtp_stats(parsed, |_| RtpDirection::AtoB, 1);
+        // Just one bucket, one packet; jitter is 0 because no
+        // delta exists to compute.
+        assert_eq!(stats.a_to_b.len(), 1);
+        assert_eq!(stats.a_to_b[0].packet_count, 1);
+        assert_eq!(stats.a_to_b[0].jitter_ms, 0.0);
     }
 }

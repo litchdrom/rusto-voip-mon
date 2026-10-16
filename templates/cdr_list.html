@@ -689,23 +689,15 @@ updateMasterCheckbox();
 updateBatchBtn();
 
 // SIP body close button — every open `.sip-body` overlay exposes a
-// `.sip-body-close` button in its top-right corner. Clicking it just
-// collapses the parent <details>, which both hides the overlay and
-// restores the inline <summary> toggle in the table cell. Delegated
-// so we don't need to re-wire on every page reload.
+// `.sip-body-close` button in its top-right corner with an inline
+// `onclick` that sets `details.open = false`. This delegated handler
+// is a belt-and-braces fallback for browsers that swallow the inline
+// event (none known, but cheap insurance).
 document.addEventListener('click', function(ev) {
   const btn = ev.target.closest('.sip-body-close');
   if (!btn) return;
   const details = btn.closest('details.sip-body');
   if (details) details.open = false;
-});
-// ESC also closes the topmost open overlay — keyboard parity with the
-// close button. `keydown` on document so it works regardless of which
-// element has focus.
-document.addEventListener('keydown', function(ev) {
-  if (ev.key !== 'Escape') return;
-  const open = document.querySelector('details.sip-body[open]');
-  if (open) open.open = false;
 });
 </script>
 {% endblock %}

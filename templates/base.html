@@ -7,12 +7,7 @@
   <link rel="stylesheet" href="/static/css/style.css">
   {% block head %}{% endblock %}
 </head>
-<body onkeydown="
-  if (event.key === 'Escape') {
-    document.querySelectorAll('details.sip-body[open]').forEach(function(d){ d.open = false; });
-    if (typeof staggerSipOverlays === 'function') staggerSipOverlays();
-  }
-">
+<body>
 {# Inline JS helpers — declared here (top of body) so they exist
    regardless of any JS error in the page's main script. The
    document-level addEventListener approach failed silently in
