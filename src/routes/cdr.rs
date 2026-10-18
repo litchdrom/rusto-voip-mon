@@ -315,8 +315,18 @@ impl FiltersView {
                 .max_duration
                 .map(|v| v.to_string())
                 .unwrap_or_default(),
-            src_port_str: f.src_port.map(|v| v.to_string()).unwrap_or_default(),
-            dst_port_str: f.dst_port.map(|v| v.to_string()).unwrap_or_default(),
+            src_port_str: f
+                .src_port
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            dst_port_str: f
+                .dst_port
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
             id_sensor_str: id_sensor,
             yesterday_from: format!("{}T00:00", yesterday),
             yesterday_to: format!("{}T23:59", yesterday),
@@ -405,8 +415,10 @@ pub async fn cdr_list(
         mos_max: params.first("mos_max"),
         duration_min: params.first("duration_min"),
         duration_max: params.first("duration_max"),
-        src_port: params.first("src_port"),
-        dst_port: params.first("dst_port"),
+        // src_port / dst_port are read directly via
+        // params.all("src_port") in build_filters — they
+        // support repeated keys + CSV, neither of which fits
+        // the scalar shape of this struct.
         page: params.first("page"),
         page_size: params.first("page_size"),
     };
@@ -2152,8 +2164,10 @@ pub async fn cdr_export_csv(
         mos_max: params.first("mos_max"),
         duration_min: params.first("duration_min"),
         duration_max: params.first("duration_max"),
-        src_port: params.first("src_port"),
-        dst_port: params.first("dst_port"),
+        // src_port / dst_port are read directly via
+        // params.all("src_port") in build_filters — they
+        // support repeated keys + CSV, neither of which fits
+        // the scalar shape of this struct.
         page: params.first("page"),
         page_size: params.first("page_size"),
     };
@@ -2394,8 +2408,22 @@ pub(crate) fn build_filters(q: &SingleParams, params: &QueryParams) -> CdrFilter
         // omitted. We DON'T fall back to 0 — 0 in sip_msg is a
         // "we didn't record a port" sentinel, not a real value, and
         // matching it would silently swallow noise rows.
-        src_port: parse_opt::<u16>(q.src_port.as_deref()),
-        dst_port: parse_opt::<u16>(q.dst_port.as_deref()),
+        // UDP source/dst port filters — typed numbers from the
+        // form, comma-separated for multi (e.g. `5060,5061` for
+        // either port). The form input may come as either
+        //   ?src_port=5060&src_port=5061   (chip checkboxes)
+        //   ?src_port=5060,5061            (text input with CSV)
+        // or any mix. `merge_csv` collapses repeated keys into
+        // a single CSV string, and `parse_csv_u16` then splits
+        // + dedupes. `0` is filtered out at the normalized() step
+        // because 0 in `sip_msg.port_*` is the "we didn't record
+        // a port" sentinel, not a real value.
+        src_port: parse_csv_u16(
+            merge_csv(params.all("src_port")).as_deref(),
+        ),
+        dst_port: parse_csv_u16(
+            merge_csv(params.all("dst_port")).as_deref(),
+        ),
         id_sensor: merge_csv(params.all("id_sensor")).filter(|s| !s.is_empty()),
         page: parse_opt(q.page.as_deref()),
         page_size: parse_opt(q.page_size.as_deref()),
@@ -2467,8 +2495,12 @@ pub(crate) struct SingleParams {
     pub mos_max: Option<String>,
     pub duration_min: Option<String>,
     pub duration_max: Option<String>,
-    pub src_port: Option<String>,
-    pub dst_port: Option<String>,
+    // src_port / dst_port are intentionally absent here — they
+    // arrive as repeated keys (`?src_port=A&src_port=B`) or a
+    // single CSV value (`?src_port=A,B`), and `build_filters`
+    // reads them via `params.all("src_port")` directly. They
+    // don't fit the "single scalar" shape this struct exists
+    // for.
     pub page: Option<String>,
     pub page_size: Option<String>,
 }
@@ -2529,6 +2561,32 @@ fn parse_opt<T: std::str::FromStr>(s: Option<&str>) -> Option<T> {
             None
         }
     }
+}
+
+/// Parse a comma-separated form field into a deduplicated `Vec<u16>`.
+/// Used for the multi-value port filters where the operator can
+/// type `5060,5061` to match either port. Empty / whitespace /
+/// unparseable entries are dropped silently (the warn from
+/// `parse_opt` would be misleading for partial lists). `0` is kept
+/// here — the "0 is the no-port sentinel" filter lives in
+/// `CdrFilters::normalized()`, where a Vec of ports becomes the
+/// final SQL bind list.
+fn parse_csv_u16(s: Option<&str>) -> Vec<u16> {
+    let Some(raw) = s else { return Vec::new() };
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<u16> = Vec::new();
+    for tok in raw.split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Ok(v) = t.parse::<u16>() {
+            if seen.insert(v) {
+                out.push(v);
+            }
+        }
+    }
+    out
 }
 
 fn csv_field(s: &Option<String>) -> String {
@@ -3246,6 +3304,8 @@ mod csv_tests {
             called: called.map(String::from),
             src_ip_str: "10.0.0.1".into(),
             dst_ip_str: "10.0.0.2".into(),
+            src_port_str: "5060".into(),
+            dst_port_str: "5061".into(),
             last_sip_response_num: Some(200),
             mos_str: "4.2".into(),
             a_lost: Some(0),

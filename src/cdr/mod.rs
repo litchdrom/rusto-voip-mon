@@ -177,6 +177,15 @@ pub struct CdrRow {
     /// Source IP of leg B (the callee's side). Same purpose as
     /// `a_saddr` but for the B leg.
     pub b_saddr: Option<IpAddr>,
+    /// UDP source port of the first INVITE message of the call.
+    /// Pulled from `sip_msg` via correlated subquery (see
+    /// `CDR_FULL_SELECT_COLUMNS`); `None` when the sip_msg lookup
+    /// found no matching row (one-way call, pcap-only sensor,
+    /// sip_msg retention flushed the row, etc.).
+    pub first_port_src: Option<u16>,
+    /// UDP destination port of the first INVITE message of the
+    /// call. Same source / fallback semantics as `first_port_src`.
+    pub first_port_dst: Option<u16>,
 }
 
 /// All `cdr` columns that `CdrRow` expects via `FromRow`. Every
@@ -188,6 +197,16 @@ pub struct CdrRow {
 /// Keeping the list in one place means `cdr::list`, `cdr_detail`,
 /// and `fetch_by_ids` all pull the same columns — no chance of one
 /// going stale when CdrRow gains a field.
+///
+/// `first_port_src` and `first_port_dst` are correlated subqueries
+/// against `sip_msg` — they pull the UDP ports of the first INVITE
+/// of the call (party-matched + tight 7-second time window so we
+/// don't pick up an unrelated call that fired in the same second).
+/// VoIPmonitor's CDR doesn't carry these columns by default; the
+/// subquery pulls them on the fly so the list page can show
+/// "src_ip :src_port → dst_ip :dst_port" per row. Empty string
+/// when the join finds no message (one-way call, pcap-only sensor
+/// without sip_msg, etc.).
 pub const CDR_FULL_SELECT_COLUMNS: &str = "ID AS `id`, calldate, callend, duration, connect_duration, \
         caller, callername, called, sipcallerip, sipcalledip, \
         lastSIPresponseNum AS `last_sip_response_num`, \
@@ -202,7 +221,21 @@ pub const CDR_FULL_SELECT_COLUMNS: &str = "ID AS `id`, calldate, callend, durati
         a_rtcp_maxjitter, b_rtcp_maxjitter, \
         a_payload, b_payload, \
         a_rtp_ptime, b_rtp_ptime, \
-        a_saddr, b_saddr";
+        a_saddr, b_saddr, \
+        (SELECT sip_msg.port_src FROM sip_msg \
+           WHERE sip_msg.time BETWEEN \
+                 (cdr.calldate - INTERVAL 2 SECOND) \
+                 AND (cdr.calldate + INTERVAL 5 SECOND) \
+             AND (sip_msg.number_src = cdr.caller \
+                  OR sip_msg.number_dst = cdr.caller) \
+           ORDER BY sip_msg.time ASC LIMIT 1) AS `first_port_src`, \
+        (SELECT sip_msg.port_dst FROM sip_msg \
+           WHERE sip_msg.time BETWEEN \
+                 (cdr.calldate - INTERVAL 2 SECOND) \
+                 AND (cdr.calldate + INTERVAL 5 SECOND) \
+             AND (sip_msg.number_src = cdr.caller \
+                  OR sip_msg.number_dst = cdr.caller) \
+           ORDER BY sip_msg.time ASC LIMIT 1) AS `first_port_dst`";
 
 /// View struct used by templates and the CSV exporter.
 #[derive(Debug, Clone, Serialize)]
@@ -223,6 +256,14 @@ pub struct CdrSummary {
     pub called: Option<String>,
     pub src_ip_str: String,
     pub dst_ip_str: String,
+    /// UDP source port of the first INVITE of the call (sip_msg
+    /// subquery). Empty string when the sip_msg lookup didn't
+    /// find a matching row — the template renders `""` as a
+    /// blank cell, not as `":0"` or similar.
+    pub src_port_str: String,
+    /// UDP destination port of the first INVITE. Same conventions
+    /// as `src_port_str`.
+    pub dst_port_str: String,
     pub last_sip_response_num: Option<u16>,
     pub mos_str: String,
     pub a_lost: Option<u32>,
@@ -444,6 +485,19 @@ impl CdrSummary {
             called: row.called,
             src_ip_str,
             dst_ip_str,
+            // First-INVITE ports from the correlated sip_msg
+            // subquery in CDR_FULL_SELECT_COLUMNS. Empty string
+            // when no message matched (one-way call, pcap-only
+            // sensor, retention-flushed sip_msg, etc.) so the
+            // template renders a blank cell rather than ":0".
+            src_port_str: row
+                .first_port_src
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
+            dst_port_str: row
+                .first_port_dst
+                .map(|p| p.to_string())
+                .unwrap_or_default(),
             last_sip_response_num: row.last_sip_response_num,
             mos_str,
             a_lost: row.a_lost,
@@ -493,10 +547,11 @@ pub struct CdrFilters {
     /// sentinel never silently matches every port-0 row.
     /// Use this to scope "calls that came in on the SBC vs the
     /// PSTN gateway" — different route = different port.
-    pub src_port: Option<u16>,
+    pub src_port: Vec<u16>,
     /// UDP destination port of the first / signalling leg
-    /// (matches `sip_msg.port_dst`). Same semantics as `src_port`.
-    pub dst_port: Option<u16>,
+    /// (matches `sip_msg.port_dst`). Multi-value (any-of), same
+    /// semantics as `src_port`. `0` rejected at the parse step.
+    pub dst_port: Vec<u16>,
     pub mos_min: Option<u8>,
     pub mos_max: Option<u8>,
     pub min_duration: Option<u32>,
@@ -548,12 +603,22 @@ impl CdrFilters {
             dst_ips: parse_ip_list(self.dst_ip.as_deref()),
             sip_codes: parse_u16_list(self.sip_code.as_deref()),
             sensor_ids: parse_u16_list(self.id_sensor.as_deref()),
-            // `0` is the empty-input sentinel here too — both
-            // `build_filters` (parse step) and the form-clear path
-            // pass `None` when the input is blank, so this branch
-            // only carries ports the operator explicitly typed.
-            src_port: self.src_port.filter(|&p| p > 0),
-            dst_port: self.dst_port.filter(|&p| p > 0),
+            // `0` is the empty-input sentinel in `sip_msg.port_*`
+            // ("we didn't record a port") and never a real value
+            // — drop it from the Vec at the parse boundary so the
+            // SQL never silently matches port-0 noise rows.
+            src_port: self
+                .src_port
+                .iter()
+                .copied()
+                .filter(|&p| p > 0)
+                .collect(),
+            dst_port: self
+                .dst_port
+                .iter()
+                .copied()
+                .filter(|&p| p > 0)
+                .collect(),
             mos_min_mult10: self.mos_min.map(|m| (m as u16) * 10),
             mos_max_mult10: self.mos_max.map(|m| (m as u16) * 10),
             min_duration: self.min_duration,
@@ -644,8 +709,8 @@ mod in_clause_tests {
             dst_ips: vec![],
             sip_codes: vec![],
             sensor_ids: vec![],
-            src_port: None,
-            dst_port: None,
+            src_port: vec![],
+            dst_port: vec![],
             mos_min_mult10: None,
             mos_max_mult10: None,
             min_duration: None,
@@ -990,7 +1055,7 @@ mod in_clause_tests {
     #[test]
     fn src_port_emits_single_exists_against_sip_msg() {
         let mut nf = f(vec![], vec![]);
-        nf.src_port = Some(5060);
+        nf.src_port = vec![5060];
         let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert!(
             sql.contains("EXISTS (SELECT 1 FROM sip_msg"),
@@ -1014,8 +1079,8 @@ mod in_clause_tests {
             "sip_msg has no calldate column on stock voipmonitor: {sql}"
         );
         assert!(
-            sql.contains("sip_msg.port_src = ?"),
-            "missing port_src placeholder: {sql}"
+            sql.contains("sip_msg.port_src IN (?)"),
+            "missing port_src IN-list: {sql}"
         );
         assert!(
             !sql.contains("port_dst"),
@@ -1028,7 +1093,7 @@ mod in_clause_tests {
     #[test]
     fn dst_port_emits_single_exists_against_sip_msg() {
         let mut nf = f(vec![], vec![]);
-        nf.dst_port = Some(5061);
+        nf.dst_port = vec![5061];
         let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         assert!(
             sql.contains("INTERVAL 2 SECOND") && sql.contains("INTERVAL 5 SECOND"),
@@ -1043,8 +1108,8 @@ mod in_clause_tests {
             "sip_msg has no calldate column on stock voipmonitor: {sql}"
         );
         assert!(
-            sql.contains("sip_msg.port_dst = ?"),
-            "missing port_dst placeholder: {sql}"
+            sql.contains("sip_msg.port_dst IN (?)"),
+            "missing port_dst IN-list: {sql}"
         );
         assert!(
             !sql.contains("port_src"),
@@ -1062,8 +1127,8 @@ mod in_clause_tests {
     #[test]
     fn src_and_dst_ports_combine_into_single_exists() {
         let mut nf = f(vec![], vec![]);
-        nf.src_port = Some(5060);
-        nf.dst_port = Some(5061);
+        nf.src_port = vec![5060];
+        nf.dst_port = vec![5061];
         let (sql, binds) = nf.to_where(IpColumnShape::LegacyInt, 0, 0);
         let exists_count = sql.matches("EXISTS (SELECT 1 FROM sip_msg").count();
         assert_eq!(
@@ -1074,7 +1139,10 @@ mod in_clause_tests {
             sql.contains("INTERVAL 2 SECOND") && sql.contains("INTERVAL 5 SECOND"),
             "join key must be a small time window (7s), got: {sql}"
         );
-        assert!(sql.contains("sip_msg.port_src = ? AND sip_msg.port_dst = ?"));
+        assert!(
+            sql.contains("sip_msg.port_src IN (?)")
+                && sql.contains("sip_msg.port_dst IN (?)")
+        );
         assert_eq!(
             binds,
             vec![FilterBind::U16(5060), FilterBind::U16(5061)],
@@ -1126,9 +1194,11 @@ pub struct NormalizedFilters {
     /// Windowed against the cdr row's own `calldate`/`callend` so
     /// each cdr gets an indexed per-row lookup against its call's
     /// SIP messages. None = "no port filter".
-    pub src_port: Option<u16>,
+    pub src_port: Vec<u16>,
     /// UDP destination port filter — same shape as `src_port`.
-    pub dst_port: Option<u16>,
+    /// Multi-value: emits `sip_msg.port_dst IN (?, ?, ?)` so the
+    /// operator can match any of several trunks at once.
+    pub dst_port: Vec<u16>,
     pub mos_min_mult10: Option<u16>,
     pub mos_max_mult10: Option<u16>,
     pub min_duration: Option<u32>,
@@ -1277,10 +1347,10 @@ impl NormalizedFilters {
                 binds.push(FilterBind::U16(*v));
             }
         }
-        // UDP port filters — `sip_msg.port_src` / `port_dst`. Single
-        // value per filter (not IN-list); both ports can be combined
-        // into one EXISTS so a row with src=5060 AND dst=5061 is a
-        // single indexed lookup per cdr.
+        // UDP port filters — `sip_msg.port_src` / `port_dst`. Multi-value
+        // (any-of), so they emit `IN (?, ?, ?)` and combine into one
+        // EXISTS so the party-match + window pair runs once per cdr
+        // regardless of how many ports the operator listed.
         //
         // Join key is a small time window around cdr.calldate plus a
         // party match — `sip_msg.time = cdr.calldate` works for most
@@ -1303,14 +1373,24 @@ impl NormalizedFilters {
         // did a full range scan per surviving cdr and 504'd on long
         // calls; the earlier `sip_msg.calldate = cdr.calldate` used
         // a column that doesn't exist on stock voipmonitor.
-        let mut port_conds: Vec<&str> = Vec::new();
-        if let Some(p) = self.src_port {
-            port_conds.push("sip_msg.port_src = ?");
-            binds.push(FilterBind::U16(p));
+        let mut port_conds: Vec<String> = Vec::new();
+        if !self.src_port.is_empty() {
+            port_conds.push(format!(
+                "sip_msg.port_src IN ({})",
+                placeholders(self.src_port.len())
+            ));
+            for p in &self.src_port {
+                binds.push(FilterBind::U16(*p));
+            }
         }
-        if let Some(p) = self.dst_port {
-            port_conds.push("sip_msg.port_dst = ?");
-            binds.push(FilterBind::U16(p));
+        if !self.dst_port.is_empty() {
+            port_conds.push(format!(
+                "sip_msg.port_dst IN ({})",
+                placeholders(self.dst_port.len())
+            ));
+            for p in &self.dst_port {
+                binds.push(FilterBind::U16(*p));
+            }
         }
         if !port_conds.is_empty() {
             parts.push(format!(
@@ -1638,8 +1718,10 @@ pub async fn ids_for_query_string(
         mos_max: params.first("mos_max"),
         duration_min: params.first("duration_min"),
         duration_max: params.first("duration_max"),
-        src_port: params.first("src_port"),
-        dst_port: params.first("dst_port"),
+        // src_port / dst_port are read directly via
+        // `params.all("src_port")` in `build_filters` — they
+        // support repeated keys + CSV, neither of which fits
+        // the scalar shape of this struct.
         page: params.first("page"),
         page_size: params.first("page_size"),
     };
@@ -2610,6 +2692,8 @@ mod rtp_leg_tests {
             b_rtp_ptime: None,
             a_saddr: Some(IpAddr::V4(0x0a00_0001)),
             b_saddr: Some(IpAddr::V4(0x0a00_0002)),
+            first_port_src: None,
+            first_port_dst: None,
         };
         let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0);
         // SIP-level IPs stay where they were.
@@ -2671,6 +2755,8 @@ mod rtp_leg_tests {
             b_rtp_ptime: None,
             a_saddr: None,
             b_saddr: None,
+            first_port_src: None,
+            first_port_dst: None,
         };
         let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0);
         assert_eq!(s.rtp_a.src_ip_str, "");
@@ -2736,6 +2822,8 @@ mod rtp_leg_tests {
                 b_rtp_ptime: None,
                 a_saddr: None,
                 b_saddr: None,
+                first_port_src: None,
+                first_port_dst: None,
             };
             CdrSummary::from_row(
                 row,
