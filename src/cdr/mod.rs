@@ -1576,10 +1576,19 @@ pub async fn list(
 }
 
 /// Batch-resolve the first-INVITE UDP ports for a set of CDR rows.
-/// One query per row, each a single indexed seek against `sip_msg`
-/// keyed on `(time, number_src|number_dst, port_src, port_dst)`.
-/// Empty / out-of-range / NULL rows just don't show up in the map
-/// — the caller renders an empty cell for those.
+/// One query total (a single INNER JOIN against sip_msg with
+/// `ROW_NUMBER` to pick the first matching message per call),
+/// returning up to N rows (one per surviving CDR). Empty /
+/// out-of-range / NULL rows just don't show up in the map — the
+/// caller renders an empty cell for those.
+///
+/// The earlier per-row implementation did N round-trips (one
+/// per visible CDR). With 50 visible CDRs and a typical 5–10 ms
+/// DB round-trip latency, that was 250–500 ms of pure wire
+/// wait on top of the indexed seek work. The batched version
+/// collapses to a single round-trip, which the operator
+/// reported as "queries are much slower now" after 8f9a508
+/// shipped the per-row loop.
 async fn fetch_first_invite_ports(
     pool: &MySqlPool,
     rows: &[CdrRow],
@@ -1591,36 +1600,54 @@ async fn fetch_first_invite_ports(
     use std::collections::HashMap;
     let mut out: HashMap<chrono::NaiveDateTime, (Option<u16>, Option<u16>)> =
         HashMap::with_capacity(rows.len());
-    for row in rows {
-        let Some(caller) = row.caller.as_deref().filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        // `(calldate, caller) → first matching sip_msg row` is the
-        // same party-match + 7-sec window used by the port filter
-        // EXISTS, just for a single call. The DB already has
-        // `sip_msg.time` indexed (the fetch_sip_messages path
-        // relies on it), so each lookup is one BTREE seek.
-        let port_row: Option<(Option<u16>, Option<u16>)> = sqlx::query_as(
-            "SELECT sip_msg.port_src, sip_msg.port_dst FROM sip_msg \
-              WHERE sip_msg.time BETWEEN \
-                    (? - INTERVAL 2 SECOND) AND (? + INTERVAL 5 SECOND) \
-                AND (sip_msg.number_src = ? OR sip_msg.number_dst = ?) \
-              ORDER BY sip_msg.time ASC LIMIT 1",
-        )
-        .bind(row.calldate)
-        .bind(row.calldate)
-        .bind(caller)
-        .bind(caller)
-        .fetch_optional(pool)
-        .await?;
-        if let Some((ps, pd)) = port_row {
-            // If both ports are 0, sip_msg is using the "no port
-            // recorded" sentinel — treat as missing rather than
-            // displaying ":0" in the table.
-            let ps = ps.filter(|&p| p > 0);
-            let pd = pd.filter(|&p| p > 0);
-            out.insert(row.calldate, (ps, pd));
-        }
+    if rows.is_empty() {
+        return Ok(out);
+    }
+    // Build the `IN (?, ?, ...)` placeholders + collect the bind
+    // values. CDR IDs are unique per call so we key the IN on
+    // `cdr.ID` rather than the calldate+party combo.
+    let ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+    let placeholders = std::iter::repeat("?")
+        .take(ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Single batched query: for each requested CDR, find the
+    // earliest sip_msg row in the 7-second party-matched window
+    // (the same shape the port filter EXISTS uses, but for a
+    // fixed set of IDs instead of the whole cdr table). The
+    // outer `WHERE rn = 1` keeps only the first-INVITE per CDR.
+    let sql = format!(
+        "SELECT ranked.calldate, ranked.port_src, ranked.port_dst \
+           FROM ( \
+             SELECT cdr.calldate AS calldate, \
+                    sip_msg.port_src AS port_src, \
+                    sip_msg.port_dst AS port_dst, \
+                    ROW_NUMBER() OVER ( \
+                      PARTITION BY cdr.ID ORDER BY sip_msg.time ASC \
+                    ) AS rn \
+               FROM cdr \
+               INNER JOIN sip_msg \
+                 ON sip_msg.time BETWEEN \
+                      (cdr.calldate - INTERVAL 2 SECOND) \
+                      AND (cdr.calldate + INTERVAL 5 SECOND) \
+                AND (sip_msg.number_src = cdr.caller \
+                     OR sip_msg.number_dst = cdr.caller) \
+              WHERE cdr.ID IN ({placeholders}) \
+                AND cdr.caller IS NOT NULL AND cdr.caller <> '' \
+           ) ranked \
+          WHERE ranked.rn = 1"
+    );
+    let mut q = sqlx::query_as::<_, (chrono::NaiveDateTime, Option<u16>, Option<u16>)>(&sql);
+    for id in &ids {
+        q = q.bind(*id);
+    }
+    let rows_with_ports = q.fetch_all(pool).await?;
+    for (calldate, ps, pd) in rows_with_ports {
+        // Filter the "0 = no port recorded" sentinel so the
+        // table renders a blank cell, not ":0".
+        let ps = ps.filter(|&p| p > 0);
+        let pd = pd.filter(|&p| p > 0);
+        out.insert(calldate, (ps, pd));
     }
     Ok(out)
 }
