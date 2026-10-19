@@ -1994,13 +1994,14 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
             // so it always fires regardless of any earlier JS error
             // in the page's main script — `this.closest('details')
             // .open = false` collapses the overlay back to the inline
-            // <summary> toggle in the row. The CSS-positioning fix
-            // (button is `position: absolute` inside the floating
-            // <pre>) prevents any ancestor with `transform`/`filter`
-            // /`contain` from hijacking the button.
+            // <summary> toggle in the row. The `ontoggle` handler
+            // calls `showOnlyThisSipOverlay` so opening a new body
+            // automatically closes any other open one — no
+            // overlapping windows, close button always at the
+            // same place.
             format!(
                 "<details class=\"sip-body\" \
-                         ontoggle=\"if(this.open) staggerSipOverlays()\">\
+                         ontoggle=\"if(this.open) showOnlyThisSipOverlay(this)\">\
                    <summary>raw SIP body ({content_type}, {bytes} bytes)</summary>\
                    <button type=\"button\" class=\"sip-body-close\" \
                            aria-label=\"Close raw SIP body\" \
