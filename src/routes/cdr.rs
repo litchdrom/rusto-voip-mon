@@ -759,6 +759,30 @@ pub async fn cdr_detail(
 <html><head><meta charset="utf-8"><title>CDR #{id}</title>
 <link rel="stylesheet" href="/static/css/style.css"></head>
 <body>
+<script>
+// SIP body overlay policy: only one open at a time. When a new
+// <details> opens, every other `.sip-body[open]` collapses first.
+// Inline (not in /static/js/app.js) so the function is defined
+// regardless of any earlier JS error, and so it works on this
+// page even though the detail HTML is built directly via format!
+// instead of askama-inheriting base.html. The close button
+// (inside the floating <pre>, top-right) is the same place no
+// matter which SIP message is currently open, so the muscle
+// memory doesn't depend on which row the operator clicked.
+function showOnlyThisSipOverlay(details) {{
+  var others = document.querySelectorAll('details.sip-body[open]');
+  for (var i = 0; i < others.length; i++) {{
+    if (others[i] !== details) others[i].open = false;
+  }}
+  var pre = details.querySelector('pre');
+  if (pre) {{
+    pre.style.top = '5vh';
+    pre.style.left = '5vw';
+    pre.style.right = '5vw';
+    pre.style.bottom = '5vh';
+  }}
+}}
+</script>
 <nav class="topbar">
   <div class="brand">
     <a href="/">
@@ -2748,6 +2772,49 @@ mod sip_render_tests {
         assert!(html.contains(r#"class="num sip-2xx""#));
         // Second row: failure — red 5xx class + red 5xx method class.
         assert!(html.contains(r#"class="num sip-5xx""#));
+    }
+
+    #[test]
+    fn sip_body_overlay_references_global_close_handler() {
+        // The per-row <details> emits an inline `ontoggle` that calls
+        // `showOnlyThisSipOverlay`. That function MUST be defined
+        // globally on whichever page renders these <details> blocks.
+        // The detail page is built via format!() (not askama-extending
+        // base.html), so it carries its own inline <script> with the
+        // function definition. If anyone removes the inline script
+        // from the detail page's format!() string, the auto-close
+        // policy silently breaks — the click fires
+        // `ReferenceError: showOnlyThisSipOverlay is not defined`.
+        // This test pins that contract: the rendered SIP timeline
+        // references the function name, and the operator must keep
+        // the inline <script> in lockstep.
+        let mk = |method: &str, code: u16| cdr::SipMessage {
+            id: 1,
+            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+            method: method.into(),
+            response_num: code,
+            response_text: format!("{code}"),
+            from_num: "+49123".into(),
+            to_num: "49199".into(),
+            src_ip_str: "10.0.0.1".into(),
+            dst_ip_str: "10.0.0.2".into(),
+            src_port: 5060,
+            dst_port: 5060,
+            direction: "out".into(),
+            content_type: "application/sdp".into(),
+            content: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n".into(),
+            cseq_num: None,
+            cseq_method: None,
+        };
+        let html = render_sip_timeline(&[mk("INVITE", 200)]);
+        assert!(
+            html.contains("ontoggle=\"if(this.open) showOnlyThisSipOverlay(this)\""),
+            "render_sip_timeline must emit the ontoggle referencing \
+             showOnlyThisSipOverlay; got:\n{html}"
+        );
     }
 
     #[test]
