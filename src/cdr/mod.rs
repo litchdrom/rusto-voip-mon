@@ -138,6 +138,17 @@ pub struct CdrRow {
     /// SIP-signalling callee IP. Same dual-shape handling as
     /// `sipcallerip`.
     pub sipcalledip: Option<IpAddr>,
+    /// UDP source port of the first INVITE / signalling leg
+    /// (voipmonitor's `sipcallerport` column, populated when
+    /// `cdr_sipport = yes` in voipmonitor.conf). `None` on
+    /// installs that don't enable the option, or when the
+    /// sniffer didn't capture the port. `Some(0)` means "captured
+    /// but no port recorded" — `from_row` filters that to a
+    /// blank cell so the table doesn't render ":0".
+    pub sipcallerport: Option<u16>,
+    /// UDP destination port of the first INVITE (voipmonitor's
+    /// `sipcalledport`). Same conventions as `sipcallerport`.
+    pub sipcalledport: Option<u16>,
     pub last_sip_response_num: Option<u16>,
     pub mos_min_mult10: Option<u8>,
     pub a_lost: Option<u32>,
@@ -189,17 +200,19 @@ pub struct CdrRow {
 /// and `fetch_by_ids` all pull the same columns — no chance of one
 /// going stale when CdrRow gains a field.
 ///
-/// `first_port_src` / `first_port_dst` are NOT included here on
-/// purpose — adding them as correlated subqueries made the basic
-/// start page time out at 30s, because they ran for every row in
-/// the time window (even when the operator never asked for a
-/// port filter) and each one's `sip_msg.time BETWEEN` is a range
-/// scan. Instead, `fetch_first_invite_ports` is called separately
-/// after the page is materialised, with just the 50 (or 500 for
-/// CSV) returned rows as the lookup set — see the call site in
-/// `list_stream`.
+/// `sipcallerport` / `sipcalledport` are populated by voipmonitor
+/// when `cdr_sipport = yes` is set in voipmonitor.conf — the
+/// column is the UDP port the first INVITE/response arrived on,
+/// which is exactly what the list-page ":port" cells want to
+/// show. The earlier 8f9a508 / 24373d6 path tried to derive this
+/// from `sip_msg` (correlated subquery, then batched lookup,
+/// then party-match, then window-only) — all unnecessary
+/// because the value is right here in the cdr row. The operator
+/// has `cdr_sipport = yes`; the columns come back as `None` on
+/// installs that don't.
 pub const CDR_FULL_SELECT_COLUMNS: &str = "ID AS `id`, calldate, callend, duration, connect_duration, \
         caller, callername, called, sipcallerip, sipcalledip, \
+        sipcallerport, sipcalledport, \
         lastSIPresponseNum AS `last_sip_response_num`, \
         mos_min_mult10, a_lost, b_lost, id_sensor, \
         a_mos_lqo_mult10, b_mos_lqo_mult10, \
@@ -385,17 +398,16 @@ impl CdrSummary {
     /// Takes `tz` by value (not by reference) so the spawned CSV-export
     /// task can move it into the closure without a clone per row.
     ///
-    /// `first_port_src` / `first_port_dst` are looked up out-of-band
-    /// (see `fetch_first_invite_ports`) — passing them as arguments
-    /// here keeps `CdrRow` free of an extra per-row subquery that
-    /// 504'd the basic start page in 8f9a508. Pass `None` for
-    /// install that don't have `sip_msg.port_*` populated.
+    /// Port fields come straight from the cdr row's
+    /// `sipcallerport` / `sipcalledport` columns (voipmonitor's
+    /// `cdr_sipport = yes`). The earlier 8f9a508 path took them as
+    /// arguments after a separate sip_msg lookup — that was
+    /// unnecessary because voipmonitor writes them right into
+    /// the cdr row.
     pub fn from_row(
         row: CdrRow,
         tz: FixedOffset,
         db_tz_secs: i32,
-        first_port_src: Option<u16>,
-        first_port_dst: Option<u16>,
     ) -> Self {
         let mos_str = row
             .mos_min_mult10
@@ -479,10 +491,14 @@ impl CdrSummary {
             // when no message matched (one-way call, pcap-only
             // sensor, retention-flushed sip_msg, etc.) so the
             // template renders a blank cell rather than ":0".
-            src_port_str: first_port_src
+            src_port_str: row
+                .sipcallerport
+                .filter(|&p| p > 0)
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
-            dst_port_str: first_port_dst
+            dst_port_str: row
+                .sipcalledport
+                .filter(|&p| p > 0)
                 .map(|p| p.to_string())
                 .unwrap_or_default(),
             last_sip_response_num: row.last_sip_response_num,
@@ -1551,105 +1567,11 @@ pub async fn list(
     // alternative — putting the port lookup as a subquery in
     // `CDR_FULL_SELECT_COLUMNS` — turned the basic start page into
     // a 30 s timeout because it ran the subquery for every candidate
-    // row in the time window, not just the 50 we actually return).
-    let port_pairs = fetch_first_invite_ports(
-        pool,
-        &rows,
-        db_tz_secs,
-    )
-    .await?;
-    let mut summaries: Vec<CdrSummary> = rows
+    let summaries: Vec<CdrSummary> = rows
         .into_iter()
-        .map(|row| {
-            let ports = port_pairs
-                .get(&row.calldate)
-                .copied()
-                .unwrap_or((None, None));
-            CdrSummary::from_row(row, tz, db_tz_secs, ports.0, ports.1)
-        })
+        .map(|row| CdrSummary::from_row(row, tz, db_tz_secs))
         .collect();
-    // Stable sort by calldate desc was already applied at the SQL
-    // level; the port lookup doesn't reorder, so summaries stay
-    // sorted.
-    let _ = &mut summaries; // silence unused-mut if compiler can prove we don't mutate
     Ok(CdrPage { rows: summaries, has_more })
-}
-
-/// Batch-resolve the first-INVITE UDP ports for a set of CDR rows.
-/// One query total (a single INNER JOIN against sip_msg with
-/// `ROW_NUMBER` to pick the first matching message per call),
-/// returning up to N rows (one per surviving CDR). Empty /
-/// out-of-range / NULL rows just don't show up in the map — the
-/// caller renders an empty cell for those.
-///
-/// The earlier per-row implementation did N round-trips (one
-/// per visible CDR). With 50 visible CDRs and a typical 5–10 ms
-/// DB round-trip latency, that was 250–500 ms of pure wire
-/// wait on top of the indexed seek work. The batched version
-/// collapses to a single round-trip, which the operator
-/// reported as "queries are much slower now" after 8f9a508
-/// shipped the per-row loop.
-async fn fetch_first_invite_ports(
-    pool: &MySqlPool,
-    rows: &[CdrRow],
-    _db_tz_secs: i32,
-) -> Result<
-    std::collections::HashMap<chrono::NaiveDateTime, (Option<u16>, Option<u16>)>,
-    sqlx::Error,
-> {
-    use std::collections::HashMap;
-    let mut out: HashMap<chrono::NaiveDateTime, (Option<u16>, Option<u16>)> =
-        HashMap::with_capacity(rows.len());
-    if rows.is_empty() {
-        return Ok(out);
-    }
-    // Build the `IN (?, ?, ...)` placeholders + collect the bind
-    // values. CDR IDs are unique per call so we key the IN on
-    // `cdr.ID` rather than the calldate+party combo.
-    let ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
-    let placeholders = std::iter::repeat("?")
-        .take(ids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    // Single batched query: for each requested CDR, find the
-    // earliest sip_msg row in the 7-second party-matched window
-    // (the same shape the port filter EXISTS uses, but for a
-    // fixed set of IDs instead of the whole cdr table). The
-    // outer `WHERE rn = 1` keeps only the first-INVITE per CDR.
-    let sql = format!(
-        "SELECT ranked.calldate, ranked.port_src, ranked.port_dst \
-           FROM ( \
-             SELECT cdr.calldate AS calldate, \
-                    sip_msg.port_src AS port_src, \
-                    sip_msg.port_dst AS port_dst, \
-                    ROW_NUMBER() OVER ( \
-                      PARTITION BY cdr.ID ORDER BY sip_msg.time ASC \
-                    ) AS rn \
-               FROM cdr \
-               INNER JOIN sip_msg \
-                 ON sip_msg.time BETWEEN \
-                      (cdr.calldate - INTERVAL 2 SECOND) \
-                      AND (cdr.calldate + INTERVAL 5 SECOND) \
-                AND (sip_msg.number_src = cdr.caller \
-                     OR sip_msg.number_dst = cdr.caller) \
-              WHERE cdr.ID IN ({placeholders}) \
-                AND cdr.caller IS NOT NULL AND cdr.caller <> '' \
-           ) ranked \
-          WHERE ranked.rn = 1"
-    );
-    let mut q = sqlx::query_as::<_, (chrono::NaiveDateTime, Option<u16>, Option<u16>)>(&sql);
-    for id in &ids {
-        q = q.bind(*id);
-    }
-    let rows_with_ports = q.fetch_all(pool).await?;
-    for (calldate, ps, pd) in rows_with_ports {
-        // Filter the "0 = no port recorded" sentinel so the
-        // table renders a blank cell, not ":0".
-        let ps = ps.filter(|&p| p > 0);
-        let pd = pd.filter(|&p| p > 0);
-        out.insert(calldate, (ps, pd));
-    }
-    Ok(out)
 }
 
 /// Stream all matching rows in order via a channel. The spawned task owns
@@ -1771,7 +1693,7 @@ pub async fn fetch_by_ids(
     let rows = q.fetch_all(pool).await?;
     let mut out = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
-        let s = CdrSummary::from_row(row, tz, db_tz_secs, None, None);
+        let s = CdrSummary::from_row(row, tz, db_tz_secs);
         out.insert(s.id, s);
     }
     Ok(out)
@@ -2778,8 +2700,10 @@ mod rtp_leg_tests {
             b_rtp_ptime: None,
             a_saddr: Some(IpAddr::V4(0x0a00_0001)),
             b_saddr: Some(IpAddr::V4(0x0a00_0002)),
+            sipcallerport: None,
+            sipcalledport: None,
         };
-        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0, None, None);
+        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0);
         // SIP-level IPs stay where they were.
         assert_eq!(s.src_ip_str, "10.0.0.1");
         assert_eq!(s.dst_ip_str, "10.0.0.2");
@@ -2839,8 +2763,10 @@ mod rtp_leg_tests {
             b_rtp_ptime: None,
             a_saddr: None,
             b_saddr: None,
+            sipcallerport: None,
+            sipcalledport: None,
         };
-        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0, None, None);
+        let s = CdrSummary::from_row(row, FixedOffset::east_opt(0).unwrap(), 0);
         assert_eq!(s.rtp_a.src_ip_str, "");
         assert_eq!(s.rtp_a.dst_ip_str, "");
         assert_eq!(s.rtp_b.src_ip_str, "");
@@ -2904,14 +2830,13 @@ mod rtp_leg_tests {
                 b_rtp_ptime: None,
                 a_saddr: None,
                 b_saddr: None,
+                sipcallerport: None,
+                sipcalledport: None,
             };
             CdrSummary::from_row(
                 row,
                 FixedOffset::east_opt(op_tz_h * 3600).unwrap(),
-                db_tz_h * 3600,
-                None,
-                None,
-            )
+                db_tz_h * 3600)
             .calldate
             .format("%Y-%m-%d %H:%M:%S")
             .to_string()

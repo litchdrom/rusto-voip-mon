@@ -623,7 +623,7 @@ pub async fn cdr_detail(
     // has no `?tz_offset_secs=` (it can't, the form lives on the
     // list page), so we rely on the session cookie + env default.
     let (tz, _) = state.resolve_tz(&user, None);
-    let cdr = CdrSummary::from_row(cdr, tz, state.config.db_tz_offset_secs, None, None);
+    let cdr = CdrSummary::from_row(cdr, tz, state.config.db_tz_offset_secs);
 
     // Pull the optional extension tables in parallel — all three are tiny.
     let (next, branches, sip_messages) = tokio::join!(
@@ -2257,10 +2257,7 @@ pub async fn cdr_export_csv(
                     let summary = CdrSummary::from_row(
                         r,
                         tz_for_stream,
-                        state.config.db_tz_offset_secs,
-                        None,
-                        None,
-                    );
+                        state.config.db_tz_offset_secs);
                     let line = format_csv_line(&summary);
                     if csv_tx.send(Ok(Bytes::from(line))).await.is_err() {
                         break; // client disconnected
