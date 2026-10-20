@@ -2023,14 +2023,26 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
             // automatically closes any other open one — no
             // overlapping windows, close button always at the
             // same place.
+            //
+            // The button sits INSIDE the floating <pre> (not as a
+            // sibling of it). `position: absolute` then scopes the
+            // button to the <pre>'s positioning context, which is
+            // itself `position: fixed` — so the button pins to the
+            // top-right corner of the overlay no matter where the
+            // row sits in the table. Earlier commits had the button
+            // as a sibling of <pre>, which made `position: absolute`
+            // resolve to the <details> (the table row), so the close
+            // button rendered at the row's top-right corner instead
+            // of the overlay's. Moving the button inside <pre>
+            // fixes that. The inline `onclick` still finds the
+            // enclosing <details> via `closest('details')`.
             format!(
                 "<details class=\"sip-body\" \
                          ontoggle=\"if(this.open) showOnlyThisSipOverlay(this)\">\
                    <summary>raw SIP body ({content_type}, {bytes} bytes)</summary>\
-                   <button type=\"button\" class=\"sip-body-close\" \
+                   <pre><button type=\"button\" class=\"sip-body-close\" \
                            aria-label=\"Close raw SIP body\" \
-                           onclick=\"this.closest('details').open=false\">✕</button>\
-                   <pre>{content}</pre>\
+                           onclick=\"this.closest('details').open=false\">✕</button>{content}</pre>\
                  </details>",
                 bytes = m.content.len(),
             )
@@ -2814,6 +2826,67 @@ mod sip_render_tests {
             html.contains("ontoggle=\"if(this.open) showOnlyThisSipOverlay(this)\""),
             "render_sip_timeline must emit the ontoggle referencing \
              showOnlyThisSipOverlay; got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn sip_body_close_button_lives_inside_the_floating_pre() {
+        // The close button MUST be a child of <pre>, NOT a sibling.
+        // It's `position: absolute` and the `<pre>` is `position:
+        // fixed` — so when the button is inside the `<pre>`, the
+        // absolute positioning resolves to the floating overlay's
+        // top-right corner. When the button is a sibling of <pre>
+        // (as in earlier commits), the absolute positioning falls
+        // back to the nearest positioned ancestor, which is the
+        // `<details>`'s `position: relative` — i.e. the table row
+        // — and the close button renders at the row's top-right
+        // corner instead of the overlay's. The CSS comment said the
+        // button was inside `<pre>` but the HTML didn't actually
+        // put it there. This test pins the structural contract so
+        // it can't silently regress again.
+        let mk = |method: &str, code: u16| cdr::SipMessage {
+            id: 1,
+            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
+                .unwrap()
+                .and_hms_opt(14, 30, 0)
+                .unwrap(),
+            method: method.into(),
+            response_num: code,
+            response_text: format!("{code}"),
+            from_num: "+49123".into(),
+            to_num: "49199".into(),
+            src_ip_str: "10.0.0.1".into(),
+            dst_ip_str: "10.0.0.2".into(),
+            src_port: 5060,
+            dst_port: 5060,
+            direction: "out".into(),
+            content_type: "application/sdp".into(),
+            content: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n".into(),
+            cseq_num: None,
+            cseq_method: None,
+        };
+        let html = render_sip_timeline(&[mk("INVITE", 200)]);
+        // The button MUST appear after `<pre>` opens, so its CSS
+        // positioning context is the floating <pre>, not the
+        // <details> row. We assert this by checking that
+        // `<pre>` precedes the button in the rendered HTML.
+        let pre_pos = html.find("<pre>")
+            .expect("render_sip_timeline must emit a <pre> for non-empty SIP bodies");
+        let btn_pos = html
+            .find("class=\"sip-body-close\"")
+            .expect("render_sip_timeline must emit the close button");
+        assert!(
+            btn_pos > pre_pos,
+            "close button must be inside <pre> so position:absolute \
+             scopes it to the floating overlay, not the <details> row. \
+             button at {btn_pos}, <pre> at {pre_pos}.\nHTML:\n{html}"
+        );
+        // And the button must still target the enclosing <details>
+        // via `closest('details')` so the inline onclick collapses
+        // the overlay on click.
+        assert!(
+            html.contains("this.closest('details').open=false"),
+            "close button must close the <details> on click; got:\n{html}"
         );
     }
 

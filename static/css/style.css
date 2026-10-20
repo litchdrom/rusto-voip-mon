@@ -556,21 +556,26 @@ table.sip-timeline .sip-row:hover {
   box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55);
   overflow: auto;
 }
-/* Close button — rides inside the <details> body (so it's hidden
-   when closed) but pins to the top-right corner of the floating
-   overlay when open. Positioned `absolute` (not `fixed`) so the
-   button is scoped to the floating <pre> overlay, not the viewport
-   — `position: fixed` inside an ancestor with `transform`, `filter`,
-   `contain`, or `will-change: transform` would silently re-parent
-   the fixed button to that ancestor instead of the viewport, which
-   made it unclickable when the button "fell inside" the table cell.
-   The button just sets `details.open = false`, which collapses the
-   overlay back to the inline <summary> in the table row — no
-   scroll-to-source gymnastics needed. */
+/* Close button — sits as the first child of the floating <pre>
+   (so it's hidden when <details> is closed), but pins to the
+   top-right corner of the overlay when open. Positioned
+   `absolute` (not `fixed`) so the button is scoped to the
+   floating <pre> overlay, not the viewport — `position: fixed`
+   inside an ancestor with `transform`, `filter`, `contain`,
+   or `will-change: transform` would silently re-parent the
+   fixed button to that ancestor instead of the viewport.
+   Earlier commits had the button as a sibling of <pre>, which
+   made `position: absolute` resolve to the <details>'s
+   `position: relative` (i.e. the table row), so the close
+   button rendered at the row's top-right corner instead of the
+   overlay's. Putting the button inside <pre> pins it to the
+   overlay no matter where the row sits. The inline `onclick`
+   still finds the enclosing <details> via
+   `this.closest('details').open = false`. */
 .sip-body .sip-body-close {
   display: none;
 }
-.sip-body[open] > .sip-body-close {
+.sip-body[open] pre > .sip-body-close {
   display: inline-flex;
   position: absolute;
   z-index: 1001;
@@ -590,7 +595,7 @@ table.sip-timeline .sip-row:hover {
   cursor: pointer;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
-.sip-body[open] > .sip-body-close:hover {
+.sip-body[open] pre > .sip-body-close:hover {
   background: var(--accent);
   color: var(--bg);
 }
