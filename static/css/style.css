@@ -526,105 +526,73 @@ table.sip-timeline .sip-row:hover {
 .sip-5xx,
 .sip-6xx { color: #f87171; font-weight: 600; }
 .sip-other { color: var(--fg-muted); }
-.sip-body {
-  margin-top: 4px;
-  position: relative;
-}
-.sip-body summary {
-  cursor: pointer;
-  color: var(--accent);
+/* Raw SIP body — full-width expandable row.
+   -----------------------------------------
+   The message row keeps only a compact toggle in its last cell. The
+   body itself is a sibling <tr> with colspan=7, so the raw SIP text
+   spans the entire table instead of being squeezed into the narrow
+   last column (where a long `Via:` / `Contact:` header was unreadable).
+
+   This replaces an earlier design that lifted the <pre> out of the row
+   as a `position: fixed` viewport overlay with a separate ✕ button. The
+   overlay needed JS to reposition it on every open, the ✕ sat at a
+   different place on every page scroll position, and the `position:
+   fixed` was fragile against any ancestor with `transform`/`filter`/
+   `contain`. An inline row has none of those failure modes and reads
+   like plain text, which is all a SIP dump is. */
+.sip-body-toggle {
+  font: inherit;
   font-size: 11px;
-  user-select: none;
-}
-/* When the operator opens the raw SIP body, lift it out of the narrow
-   sequence-diagram column and overlay it on the viewport. The summary
-   toggle stays anchored in the row (click it again to close), but the
-   <pre> itself floats so a long `To:` / `Via:` header is readable
-   instead of getting clipped to ~110px. */
-.sip-body[open] > pre {
-  position: fixed;
-  z-index: 1000;
-  top: 5vh;
-  left: 5vw;
-  right: 5vw;
-  width: auto;
-  max-height: 80vh;
-  background: var(--bg-elev);
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  padding: 14px 18px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.55);
-  overflow: auto;
-}
-/* Close button — sits as the first child of the floating <pre>
-   (so it's hidden when <details> is closed), but pins to the
-   top-right corner of the overlay when open. Positioned
-   `absolute` (not `fixed`) so the button is scoped to the
-   floating <pre> overlay, not the viewport — `position: fixed`
-   inside an ancestor with `transform`, `filter`, `contain`,
-   or `will-change: transform` would silently re-parent the
-   fixed button to that ancestor instead of the viewport.
-   Earlier commits had the button as a sibling of <pre>, which
-   made `position: absolute` resolve to the <details>'s
-   `position: relative` (i.e. the table row), so the close
-   button rendered at the row's top-right corner instead of the
-   overlay's. Putting the button inside <pre> pins it to the
-   overlay no matter where the row sits. The inline `onclick`
-   still finds the enclosing <details> via
-   `this.closest('details').open = false`. */
-.sip-body .sip-body-close {
-  display: none;
-}
-.sip-body[open] pre > .sip-body-close {
-  display: inline-flex;
-  position: absolute;
-  z-index: 1001;
-  top: 6px;
-  right: 6px;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  font-size: 14px;
-  line-height: 1;
-  color: var(--fg);
-  background: var(--bg-elev-2);
-  border: 1px solid var(--accent);
-  border-radius: 14px;
+  color: var(--accent);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 2px 6px;
   cursor: pointer;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  text-align: left;
+  white-space: nowrap;
 }
-.sip-body[open] pre > .sip-body-close:hover {
-  background: var(--accent);
-  color: var(--bg);
+.sip-body-toggle:hover {
+  border-color: var(--accent);
 }
-/* The close button sits inside the floating <pre>, so the <pre>
-   needs a tiny top padding so its scroll content doesn't tuck
-   underneath the 28px + 6px = 34px button. */
-.sip-body[open] > pre {
-  padding-top: 38px;
+/* Hover state is redundant with the row's own hover tint — keep it
+   visible but muted so it reads as a control, not a link. */
+.sip-body-toggle:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
 }
-.sip-body pre {
-  margin: 4px 0 0;
-  padding: 8px 10px;
+/* The body row must not inherit the `.sip-row:hover` background — it
+   spans the full width and a full-bleed tint makes it look like a
+   separate selectable record rather than part of the message above. */
+tr.sip-body-row:hover {
+  background: transparent;
+}
+tr.sip-body-row > td {
+  padding: 4px 8px 10px;
+}
+.sip-body-pre {
+  margin: 0;
+  padding: 10px 12px;
   background: var(--bg-elev-2);
   border: 1px solid var(--border);
+  border-left: 2px solid var(--accent);
   border-radius: 4px;
+  font-family: inherit;   /* already monospace via table.sip-timeline */
   font-size: 11px;
-  line-height: 1.4;
-  max-height: 360px;
-  overflow: auto;
+  line-height: 1.5;
   /* Long SIP headers (To: / From: with multi-char route-set tags,
      Authorization headers, etc.) need to wrap. `pre-wrap` preserves
-     the original CRLF line breaks; `overflow-wrap: anywhere`
-     breaks a single long line at any character boundary so it
-     stays inside the table column rather than horizontally
-     scrolling forever — but unlike `word-break: break-all` it
-     does NOT force mid-word breaks when a whitespace boundary
-     is available, so the result is still readable. */
+     the original CRLF line breaks; `overflow-wrap: anywhere` breaks a
+     single long line at any character boundary so a 300-char Via tag
+     stays readable instead of forcing horizontal scrolling across the
+     whole page. Unlike `word-break: break-all` it does NOT force
+     mid-word breaks when a whitespace boundary is available. */
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+  /* Cap the height so one enormous body can't bury the rest of the
+     message flow. Scrolls internally past the cap. */
+  max-height: 60vh;
+  overflow: auto;
 }
 
 /* Call flow diagram (above the SIP timeline).

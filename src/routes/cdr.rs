@@ -760,27 +760,35 @@ pub async fn cdr_detail(
 <link rel="stylesheet" href="/static/css/style.css"></head>
 <body>
 <script>
-// SIP body overlay policy: only one open at a time. When a new
-// <details> opens, every other `.sip-body[open]` collapses first.
-// Inline (not in /static/js/app.js) so the function is defined
-// regardless of any earlier JS error, and so it works on this
-// page even though the detail HTML is built directly via format!
-// instead of askama-inheriting base.html. The close button
-// (inside the floating <pre>, top-right) is the same place no
-// matter which SIP message is currently open, so the muscle
-// memory doesn't depend on which row the operator clicked.
-function showOnlyThisSipOverlay(details) {{
-  var others = document.querySelectorAll('details.sip-body[open]');
+// SIP raw-body expand. The toggle button lives in the message row's
+// last cell; the raw body itself is a sibling <tr> spanning every
+// column. `toggleSipBody` shows/hides that row and collapses any
+// other open one. No floating overlay, no separate close button --
+// clicking the toggle again closes the body.
+//
+// Defined inline (not in /static/js/app.js) so it is in scope no
+// matter what happens to the page's main script. This page's HTML
+// is built directly via format!(), so it cannot rely on a
+// scripts block inherited from base.html.
+function toggleSipBody(btn) {{
+  var row = btn.closest('tr');
+  var body = row && row.nextElementSibling;
+  if (!body || !body.classList.contains('sip-body-row')) return;
+  var will_open = body.hasAttribute('hidden');
+  // One open body at a time: collapse any other, and reset its toggle.
+  var others = document.querySelectorAll('tr.sip-body-row:not([hidden])');
   for (var i = 0; i < others.length; i++) {{
-    if (others[i] !== details) others[i].open = false;
+    if (others[i] !== body) {{
+      others[i].hidden = true;
+      var other_btn = others[i].parentNode.querySelector(
+        'button.sip-body-toggle[aria-expanded="true"]');
+      if (other_btn && other_btn !== btn) {{
+        other_btn.setAttribute('aria-expanded', 'false');
+      }}
+    }}
   }}
-  var pre = details.querySelector('pre');
-  if (pre) {{
-    pre.style.top = '5vh';
-    pre.style.left = '5vw';
-    pre.style.right = '5vw';
-    pre.style.bottom = '5vh';
-  }}
+  body.hidden = !will_open;
+  btn.setAttribute('aria-expanded', will_open ? 'true' : 'false');
 }}
 </script>
 <nav class="topbar">
@@ -2007,44 +2015,36 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
         let src = html_escape(&m.src_ip_str);
         let dst = html_escape(&m.dst_ip_str);
         let content_type = html_escape(&m.content_type);
-        // Build the expandable body. Only show the toggle when there's
-        // something useful to look at — bare CANCEL/ACK messages often
-        // have empty content and showing them is just noise.
+        // Raw body goes in its own <tr> with colspan=7 so it spans
+        // the full table width instead of being squeezed into the
+        // last column. The message row keeps only a compact toggle;
+        // `toggleSipBody` reveals the sibling row. Rows are emitted
+        // as a pair (message row, then body row) so `nextElementSibling`
+        // from the toggle's <tr> lands on the right body.
+        //
+        // No toggle at all when there's nothing to show -- bare
+        // CANCEL/ACK messages often have empty content and a dead
+        // toggle is just noise.
+        let toggle_html = if m.content.trim().is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<button type=\"button\" class=\"sip-body-toggle\" \
+                         aria-expanded=\"false\" \
+                         onclick=\"toggleSipBody(this)\">\
+                   raw SIP body ({content_type}, {bytes} bytes)\
+                 </button>",
+                bytes = m.content.len(),
+            )
+        };
         let body_html = if m.content.trim().is_empty() {
             String::new()
         } else {
             let content = html_escape(&m.content);
-            // Close button uses inline `onclick` (no event delegation)
-            // so it always fires regardless of any earlier JS error
-            // in the page's main script — `this.closest('details')
-            // .open = false` collapses the overlay back to the inline
-            // <summary> toggle in the row. The `ontoggle` handler
-            // calls `showOnlyThisSipOverlay` so opening a new body
-            // automatically closes any other open one — no
-            // overlapping windows, close button always at the
-            // same place.
-            //
-            // The button sits INSIDE the floating <pre> (not as a
-            // sibling of it). `position: absolute` then scopes the
-            // button to the <pre>'s positioning context, which is
-            // itself `position: fixed` — so the button pins to the
-            // top-right corner of the overlay no matter where the
-            // row sits in the table. Earlier commits had the button
-            // as a sibling of <pre>, which made `position: absolute`
-            // resolve to the <details> (the table row), so the close
-            // button rendered at the row's top-right corner instead
-            // of the overlay's. Moving the button inside <pre>
-            // fixes that. The inline `onclick` still finds the
-            // enclosing <details> via `closest('details')`.
             format!(
-                "<details class=\"sip-body\" \
-                         ontoggle=\"if(this.open) showOnlyThisSipOverlay(this)\">\
-                   <summary>raw SIP body ({content_type}, {bytes} bytes)</summary>\
-                   <pre><button type=\"button\" class=\"sip-body-close\" \
-                           aria-label=\"Close raw SIP body\" \
-                           onclick=\"this.closest('details').open=false\">✕</button>{content}</pre>\
-                 </details>",
-                bytes = m.content.len(),
+                "<tr class=\"sip-body-row\" hidden>\
+                   <td colspan=\"7\"><pre class=\"sip-body-pre\">{content}</pre></td>\
+                 </tr>"
             )
         };
         out.push_str(&format!(
@@ -2055,8 +2055,8 @@ fn render_sip_timeline(messages: &[cdr::SipMessage]) -> String {
                <td class=\"num {code_class}\" title=\"{resp_text}\">{resp_display}</td>\
                <td>{from}<br><span class=\"muted small\">{src}</span></td>\
                <td>{to}<br><span class=\"muted small\">{dst}</span></td>\
-               <td>{body_html}</td>\
-             </tr>",
+               <td>{toggle_html}</td>\
+             </tr>{body_html}",
             method = html_escape(&m.method),
         ));
     }
@@ -2787,106 +2787,77 @@ mod sip_render_tests {
     }
 
     #[test]
-    fn sip_body_overlay_references_global_close_handler() {
-        // The per-row <details> emits an inline `ontoggle` that calls
-        // `showOnlyThisSipOverlay`. That function MUST be defined
-        // globally on whichever page renders these <details> blocks.
-        // The detail page is built via format!() (not askama-extending
-        // base.html), so it carries its own inline <script> with the
-        // function definition. If anyone removes the inline script
-        // from the detail page's format!() string, the auto-close
-        // policy silently breaks — the click fires
-        // `ReferenceError: showOnlyThisSipOverlay is not defined`.
-        // This test pins that contract: the rendered SIP timeline
-        // references the function name, and the operator must keep
-        // the inline <script> in lockstep.
-        let mk = |method: &str, code: u16| cdr::SipMessage {
-            id: 1,
-            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
-                .unwrap()
-                .and_hms_opt(14, 30, 0)
-                .unwrap(),
-            method: method.into(),
-            response_num: code,
-            response_text: format!("{code}"),
-            from_num: "+49123".into(),
-            to_num: "49199".into(),
-            src_ip_str: "10.0.0.1".into(),
-            dst_ip_str: "10.0.0.2".into(),
-            src_port: 5060,
-            dst_port: 5060,
-            direction: "out".into(),
-            content_type: "application/sdp".into(),
-            content: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n".into(),
-            cseq_num: None,
-            cseq_method: None,
-        };
-        let html = render_sip_timeline(&[mk("INVITE", 200)]);
+    fn sip_body_toggle_targets_a_full_width_sibling_row() {
+        // The raw body must live in its own <tr> with colspan=7, not
+        // inside the message row's last column. `toggleSipBody`
+        // finds it via `toggle.closest('tr').nextElementSibling`, so
+        // the two rows must be emitted adjacently and the body row
+        // must carry the `sip-body-row` class it keys on.
+        //
+        // This also pins that no `showOnlyThisSipOverlay` call
+        // survives: that helper existed only to reposition a floating
+        // `position: fixed` overlay, and it is what threw
+        // `ReferenceError: showOnlyThisSipOverlay is not defined` on
+        // the detail page (built via format!, not askama).
+        let html = render_sip_timeline(&[mk_msg("INVITE", 200, 0.0)]);
         assert!(
-            html.contains("ontoggle=\"if(this.open) showOnlyThisSipOverlay(this)\""),
-            "render_sip_timeline must emit the ontoggle referencing \
-             showOnlyThisSipOverlay; got:\n{html}"
+            html.contains("class=\"sip-body-toggle\""),
+            "toggle button missing; got:\n{html}"
+        );
+        assert!(
+            html.contains("<tr class=\"sip-body-row\" hidden>"),
+            "body row must be a hidden sibling <tr>; got:\n{html}"
+        );
+        assert!(
+            html.contains("colspan=\"7\""),
+            "body row must span all 7 columns; got:\n{html}"
+        );
+        assert!(
+            html.contains("class=\"sip-body-pre\""),
+            "raw body must be a <pre class=\"sip-body-pre\">; got:\n{html}"
+        );
+        assert!(
+            html.contains("onclick=\"toggleSipBody(this)\""),
+            "toggle must call toggleSipBody; got:\n{html}"
+        );
+        assert!(
+            !html.contains("showOnlyThisSipOverlay"),
+            "obsolete overlay helper must not reappear; got:\n{html}"
+        );
+        assert!(
+            !html.contains("sip-body-close"),
+            "obsolete X close button must not reappear; got:\n{html}"
         );
     }
 
     #[test]
-    fn sip_body_close_button_lives_inside_the_floating_pre() {
-        // The close button MUST be a child of <pre>, NOT a sibling.
-        // It's `position: absolute` and the `<pre>` is `position:
-        // fixed` — so when the button is inside the `<pre>`, the
-        // absolute positioning resolves to the floating overlay's
-        // top-right corner. When the button is a sibling of <pre>
-        // (as in earlier commits), the absolute positioning falls
-        // back to the nearest positioned ancestor, which is the
-        // `<details>`'s `position: relative` — i.e. the table row
-        // — and the close button renders at the row's top-right
-        // corner instead of the overlay's. The CSS comment said the
-        // button was inside `<pre>` but the HTML didn't actually
-        // put it there. This test pins the structural contract so
-        // it can't silently regress again.
-        let mk = |method: &str, code: u16| cdr::SipMessage {
-            id: 1,
-            calldate: chrono::NaiveDate::from_ymd_opt(2026, 9, 25)
-                .unwrap()
-                .and_hms_opt(14, 30, 0)
-                .unwrap(),
-            method: method.into(),
-            response_num: code,
-            response_text: format!("{code}"),
-            from_num: "+49123".into(),
-            to_num: "49199".into(),
-            src_ip_str: "10.0.0.1".into(),
-            dst_ip_str: "10.0.0.2".into(),
-            src_port: 5060,
-            dst_port: 5060,
-            direction: "out".into(),
-            content_type: "application/sdp".into(),
-            content: "v=0\r\no=- 0 0 IN IP4 0.0.0.0\r\n".into(),
-            cseq_num: None,
-            cseq_method: None,
-        };
-        let html = render_sip_timeline(&[mk("INVITE", 200)]);
-        // The button MUST appear after `<pre>` opens, so its CSS
-        // positioning context is the floating <pre>, not the
-        // <details> row. We assert this by checking that
-        // `<pre>` precedes the button in the rendered HTML.
-        let pre_pos = html.find("<pre>")
-            .expect("render_sip_timeline must emit a <pre> for non-empty SIP bodies");
-        let btn_pos = html
-            .find("class=\"sip-body-close\"")
-            .expect("render_sip_timeline must emit the close button");
+    fn sip_body_row_follows_its_message_row() {
+        // The toggle lives in the message row's <td>; the body row is
+        // the immediately-following sibling. If anything is ever
+        // emitted between the two, `nextElementSibling` finds the
+        // wrong element and clicking the toggle silently does nothing.
+        let html = render_sip_timeline(&[mk_msg("INVITE", 200, 0.0)]);
+        let btn = html
+            .find("class=\"sip-body-toggle\"")
+            .expect("toggle button must be present");
+        let body = html
+            .find("class=\"sip-body-row\"")
+            .expect("body row must be present");
+        // The toggle sits inside the message row, which closes with
+        // </tr>; the body row opens right after. Assert the body row
+        // index is past the toggle and that exactly one `</tr>`
+        // separates them (no stray row in between).
         assert!(
-            btn_pos > pre_pos,
-            "close button must be inside <pre> so position:absolute \
-             scopes it to the floating overlay, not the <details> row. \
-             button at {btn_pos}, <pre> at {pre_pos}.\nHTML:\n{html}"
+            body > btn,
+            "body row must come after the toggle; btn={btn} body={body}\n{html}"
         );
-        // And the button must still target the enclosing <details>
-        // via `closest('details')` so the inline onclick collapses
-        // the overlay on click.
-        assert!(
-            html.contains("this.closest('details').open=false"),
-            "close button must close the <details> on click; got:\n{html}"
+        let between = &html[btn..body];
+        assert_eq!(
+            between.matches("</tr>").count(),
+            1,
+            "exactly the message row's own </tr> should sit between the \
+             toggle and the body row -- an extra row would break \
+             nextElementSibling:\n{html}"
         );
     }
 

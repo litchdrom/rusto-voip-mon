@@ -691,17 +691,5 @@ document.getElementById('batch-csv-btn')?.addEventListener('click', () => {
 document.getElementById('batch-csv-all-btn')?.addEventListener('click', downloadBatchCsvFromFilter);
 updateMasterCheckbox();
 updateBatchBtn();
-
-// SIP body close button — every open `.sip-body` overlay exposes a
-// `.sip-body-close` button in its top-right corner with an inline
-// `onclick` that sets `details.open = false`. This delegated handler
-// is a belt-and-braces fallback for browsers that swallow the inline
-// event (none known, but cheap insurance).
-document.addEventListener('click', function(ev) {
-  const btn = ev.target.closest('.sip-body-close');
-  if (!btn) return;
-  const details = btn.closest('details.sip-body');
-  if (details) details.open = false;
-});
 </script>
 {% endblock %}

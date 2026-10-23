@@ -8,49 +8,6 @@
   {% block head %}{% endblock %}
 </head>
 <body>
-{# Inline JS helpers — declared here (top of body) so they exist
-   regardless of any JS error in the page's main script. The
-   document-level addEventListener approach failed silently in
-   practice when something earlier in the script block threw —
-   these inline paths don't. #}
-<script>
-// SIP body overlay policy: only one open at a time. When a new
-// <details> opens, every other `.sip-body[open]` collapses
-// first — the operator's previous read goes away and the new
-// raw body takes the whole overlay slot. The close button
-// (inside the floating <pre>, top-right) is the same place no
-// matter which SIP message is currently open, so the muscle
-// memory doesn't depend on which row the operator clicked.
-//
-// The staggered fan-out (multiple overlapping windows at
-// different offsets) was a feature of the previous commit but
-// the operator called it out as confusing — windows overlapping
-// meant the back one's close button was hidden behind the front
-// one, and the only way to reach it was to close the front one
-// first, which is the same as the auto-close policy we're using
-// now. The window is centered for the single-overlay case.
-function showOnlyThisSipOverlay(details) {
-  // Collapse every other sip-body overlay. Cheap: a single
-  // query + a per-element `open = false`. We intentionally do
-  // NOT dispatch a synthetic `toggle` event here, so the
-  // per-row `ontoggle` attribute (which calls this function)
-  // doesn't re-fire and recurse.
-  var others = document.querySelectorAll('details.sip-body[open]');
-  for (var i = 0; i < others.length; i++) {
-    if (others[i] !== details) others[i].open = false;
-  }
-  // Centre the (now singular) overlay. Fixed at the same spot
-  // every time so the close button at top-right is always in
-  // the same place.
-  var pre = details.querySelector('pre');
-  if (pre) {
-    pre.style.top = '5vh';
-    pre.style.left = '5vw';
-    pre.style.right = '5vw';
-    pre.style.bottom = '5vh';
-  }
-}
-</script>
   {% if let Some(u) = user %}
   <nav class="topbar">
     <div class="brand">
