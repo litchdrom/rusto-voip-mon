@@ -58,6 +58,50 @@ cp .env.example .env
 
 Open http://localhost:8080 and log in with your VoIPmonitor credentials.
 
+### Cross-compile for Linux from Windows
+
+You don't need WSL or a Linux VM. [cargo-zigbuild](https://github.com/rust-cross/cargo-zigbuild)
+drives the Zig C toolchain to cross-compile, so a Windows dev box can produce the
+same static-ish Linux binary the Dockerfile builds.
+
+One-time setup (PowerShell):
+
+```powershell
+rustup target add x86_64-unknown-linux-gnu
+cargo install cargo-zigbuild
+winget install zig.zig            # or: scoop install zig
+```
+
+Restart your shell so `zig` lands on `PATH`, then:
+
+```powershell
+cargo zigbuild --release --target x86_64-unknown-linux-gnu
+# -> target\x86_64-unknown-linux-gnu\release\rusto-voip-mon
+```
+
+Deploy the artifact and restart the service:
+
+```powershell
+scp target\x86_64-unknown-linux-gnu\release\rusto-voip-mon user@server:/usr/local/bin/rusto-voip-mon
+ssh user@server sudo systemctl restart rusto-voip-mon
+```
+
+The binary embeds its own build stamp — `--version` prints the commit it was
+built from, so a stale upload is obvious:
+
+```
+$ ./rusto-voip-mon --version
+rusto-voip-mon 0.1.0 (commit <sha>, built <rfc3339>)
+```
+
+| Item | Notes |
+|---|---|
+| Target | `x86_64-unknown-linux-gnu` — the same target `Dockerfile` builds. For ARM servers use `aarch64-unknown-linux-gnu` instead. |
+| `zig` on `PATH` | `cargo-zigbuild` shells out to it. If `zig version` fails in a fresh shell, the install didn't pick up your profile. |
+| Runtime deps | The Linux host still needs `libssl3`, `ca-certificates`, and `zstd` (see the `runtime` stage in `Dockerfile`). The binary itself is self-contained. |
+| `templates/` | Baked into the binary by `askama` at compile time — no need to ship it. `askama`'s derive registers every `templates/*.html` as a build dependency, so editing one triggers a recompile on its own. No `cargo clean` needed. |
+| `static/` | **Read from disk at runtime** via `ServeDir::new("static")`, resolved relative to the process CWD. Keep a `static/` directory next to wherever you run the binary from. |
+
 ### Run with Docker
 
 ```bash
