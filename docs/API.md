@@ -216,6 +216,41 @@ placeholder for the SIP flow (deferred to v0.3).
 curl -fsS -b cookies.txt $HOST/cdr/3407244
 ```
 
+### `GET /cdr/:id/audio.wav`
+
+Per-leg call audio as a WAV file, reconstructed from the on-disk pcap
+archive. `?leg=a` (caller) or `?leg=b` (callee).
+
+```bash
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "$HOST/cdr/3407244/audio.wav?leg=a" -o call-a.wav
+```
+
+The audio is decoded from the RTP stream in the merged SIP+RTP pcap
+that `GET /pcap/:cdr_id` already serves — not from
+`sip_msg.rtp_payload_data`, which is only populated when the
+VoIPmonitor install is configured to store RTP payloads in the
+database. The pcap is always there.
+
+Only G.711 is playable without a codec library:
+
+| Payload type | Codec | Result |
+|---|---|---|
+| 0 | PCMU (µ-law) | `audio/wav`, 8 kHz mono 16-bit PCM |
+| 8 | PCMA (A-law) | `audio/wav`, 8 kHz mono 16-bit PCM |
+| anything else | G.729, Opus, GSM, … | `404` — not decodable without a codec library |
+
+A `404` also means: the CDR doesn't exist, the pcap archive is gone
+or unreadable, the leg carries no G.711 media, or the leg's RTP
+source address is unknown.
+
+Packets lost in transit are filled with silence (the RTP sequence
+number reveals the gap), so the recording plays back at the right
+speed instead of running fast and chipmunky.
+
+The CDR detail page renders one `<audio>` player per G.711 leg
+automatically; non-G.711 legs get no player at all.
+
 ### `GET /cdr/export.csv`
 
 Stream the matching CDRs as CSV. Same filter params as `/`. Output

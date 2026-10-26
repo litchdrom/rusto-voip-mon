@@ -33,6 +33,12 @@ An open-source web GUI for [VoIPmonitor](https://www.voipmonitor.org/), written 
   toggle). Tries the `sip_msg` table first; falls back to parsing
   the SIP messages out of the merged pcap archive (with
   `etherparse`) when the table is empty or schema-mismatched.
+- **Call audio** — `GET /cdr/:id/audio.wav?leg=a|b` reconstructs the
+  recording from the on-disk pcap and serves it as WAV. G.711 µ-law
+  and A-law are decoded in-process (8 kHz mono 16-bit PCM); packets
+  lost in transit are gap-filled with silence so the playback speed
+  is right. The detail page renders a player per G.711 leg — legs on
+  other codecs get no player rather than a dead button.
 - **PCAP download**
   - `GET /pcap/:cdr_id` — single merged SIP + RTP pcap, streamed
     byte-for-byte from the minute's `tar.zst` (no full-archive load),
@@ -235,7 +241,8 @@ docker-compose.yml  # example wiring against existing voipmonitor host
   - `<noscript>` fallbacks for every JS-only control (Apply button always
     visible, batch download, TZ apply, reset-to-today)
 - **Next**
-  - WAV playback (chunked streaming from `sip_msg.rtp_payload_data`)
+  - Audio playback for codecs beyond G.711 (G.729 / Opus need a real
+    decoder and a container the browser can play)
 - **Later**
   - Alerts, scheduled reports
 

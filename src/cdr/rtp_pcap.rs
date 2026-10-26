@@ -77,6 +77,15 @@ pub struct RtpPacket {
     /// Source IP — used to figure out which leg the packet
     /// belongs to (caller→callee vs callee→caller).
     pub src_ip: IpAddr,
+    /// RTP payload type (the low 7 bits of the second header byte).
+    /// 0 = PCMU (G.711 µ-law), 8 = PCMA (G.711 A-law). These two are
+    /// the only payload types we can turn back into playable audio
+    /// without a codec library — see `cdr::wav`.
+    pub payload_type: u8,
+    /// Media payload bytes, i.e. everything after the RTP header
+    /// (fixed header + CSRC list + extension). For G.711 this is
+    /// one byte per audio sample.
+    pub payload: Vec<u8>,
 }
 
 /// One second of aggregate statistics for one direction.
@@ -203,6 +212,23 @@ pub fn parse_rtp_packets_from_pcap(pcap_bytes: &[u8]) -> Vec<RtpPacket> {
         let seq = u16::from_be_bytes(payload[2..4].try_into().unwrap());
         let rtp_ts = u32::from_be_bytes(payload[4..8].try_into().unwrap());
         let ssrc = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+        // Payload type is the low 7 bits of byte 1; the top bit is
+        // the marker flag. Bit 7 of byte 0 (the padding bit) means
+        // the last payload byte is padding and must not be treated
+        // as audio.
+        let payload_type = payload[1] & 0x7f;
+        let mut media = &payload[header_len..];
+        // Strip RTP padding: the padding bit in byte 0 says the last
+        // byte of the payload counts the padding length, and that many
+        // trailing bytes are padding, not media.
+        if payload[0] & 0x20 != 0 {
+            if let Some(&pad_len) = media.last() {
+                let pad = pad_len as usize;
+                if pad > 0 && pad <= media.len() {
+                    media = &media[..media.len() - pad];
+                }
+            }
+        }
 
         out.push(RtpPacket {
             arrival_secs: ts_sec as f64 + ts_usec as f64 / 1_000_000.0,
@@ -210,6 +236,8 @@ pub fn parse_rtp_packets_from_pcap(pcap_bytes: &[u8]) -> Vec<RtpPacket> {
             seq,
             ssrc,
             src_ip,
+            payload_type,
+            payload: media.to_vec(),
         });
     }
     out
@@ -540,6 +568,10 @@ mod tests {
             seq: ((rtp_ts / 160) & 0xffff) as u16,
             ssrc,
             src_ip: IpAddr::V4(Ipv4Addr::from(src)),
+            // The stats path doesn't care about the media; the audio
+            // endpoint does and reads these off the parsed packets.
+            payload_type: 0,
+            payload: Vec::new(),
         }
     }
 
@@ -770,6 +802,149 @@ mod tests {
     /// 1" when the call had only a single RTP packet recorded
     /// (one-way audio failure / hung up before media flowed).
     /// Estimator must now bail with the safe narrowband default.
+    /// Build a pcap containing raw RTP payloads verbatim. The shared
+    /// `build_rtp_pcap` helper stamps a fixed header (PT=0, no
+    /// padding), so tests that need to exercise the payload type or
+    /// the padding bit need to place the bytes themselves.
+    fn build_raw_rtp_pcap(rtp_payloads: &[Vec<u8>]) -> Vec<u8> {
+        let mut pcap = Vec::new();
+        // pcap global header
+        pcap.extend_from_slice(&0xa1b2c3d4_u32.to_le_bytes());
+        pcap.extend_from_slice(&2u16.to_le_bytes());
+        pcap.extend_from_slice(&4u16.to_le_bytes());
+        pcap.extend_from_slice(&0i32.to_le_bytes());
+        pcap.extend_from_slice(&0u32.to_le_bytes());
+        pcap.extend_from_slice(&65535u32.to_le_bytes());
+        pcap.extend_from_slice(&1u32.to_le_bytes());
+
+        for (i, rtp) in rtp_payloads.iter().enumerate() {
+            let udp_len = (8 + rtp.len()) as u16;
+            let ip_total_len = (20 + udp_len) as u16;
+            let incl_len = (14 + ip_total_len as usize) as u32;
+
+            let mut pkt = Vec::with_capacity(incl_len as usize);
+            pkt.extend_from_slice(&[0u8; 6]); // dst mac
+            pkt.extend_from_slice(&[0u8; 6]); // src mac
+            pkt.extend_from_slice(&0x0800u16.to_be_bytes()); // ethertype
+            pkt.push(0x45); // ipv4, 5 words of header
+            pkt.push(0x00); // dscp/ecn
+            pkt.extend_from_slice(&ip_total_len.to_be_bytes());
+            pkt.extend_from_slice(&0u16.to_be_bytes()); // id
+            pkt.extend_from_slice(&0u16.to_le_bytes()); // flags/frag
+            pkt.push(64); // ttl
+            pkt.push(17); // proto = UDP
+            pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum
+            pkt.extend_from_slice(&[10, 0, 0, 1]); // src
+            pkt.extend_from_slice(&[10, 0, 0, 2]); // dst
+            pkt.extend_from_slice(&16384u16.to_be_bytes()); // src port
+            pkt.extend_from_slice(&16384u16.to_be_bytes()); // dst port
+            pkt.extend_from_slice(&udp_len.to_be_bytes());
+            pkt.extend_from_slice(&0u16.to_be_bytes()); // udp checksum
+            pkt.extend_from_slice(rtp);
+
+            // pcap record header
+            pcap.extend_from_slice(&(1_700_000_000u32 + i as u32).to_le_bytes());
+            pcap.extend_from_slice(&0u32.to_le_bytes());
+            pcap.extend_from_slice(&incl_len.to_le_bytes());
+            pcap.extend_from_slice(&incl_len.to_le_bytes());
+            pcap.extend_from_slice(&pkt);
+        }
+        pcap
+    }
+
+    /// A well-formed RTP header with the given first byte (version /
+    /// padding / extension bits) and payload type.
+    fn rtp_header(first_byte: u8, payload_type: u8, seq: u16) -> Vec<u8> {
+        let mut rtp = Vec::with_capacity(12);
+        rtp.push(first_byte);
+        rtp.push(payload_type & 0x7f);
+        rtp.extend_from_slice(&seq.to_be_bytes());
+        rtp.extend_from_slice(&160u32.to_be_bytes()); // ts
+        rtp.extend_from_slice(&0x1122_3344u32.to_be_bytes()); // ssrc
+        rtp
+    }
+
+    #[test]
+    fn parse_captures_payload_type_and_media_bytes() {
+        // The audio endpoint needs the payload type (to pick the G.711
+        // decoder) and the media bytes themselves (to decode into PCM).
+        // The parser must expose both, and must strip the RTP header
+        // so the payload is pure media.
+        let mut rtp = rtp_header(0x80, 0, 1);
+        // 4 media bytes: 0xFF is µ-law silence.
+        rtp.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        let pcap = build_raw_rtp_pcap(&[rtp]);
+
+        let packets = parse_rtp_packets_from_pcap(&pcap);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload_type, 0, "PT must be PCMU");
+        assert_eq!(packets[0].payload, vec![0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn parse_reads_the_a_law_payload_type() {
+        let mut rtp = rtp_header(0x80, 8, 1);
+        rtp.extend_from_slice(&[0xD5, 0xD5]);
+        let pcap = build_raw_rtp_pcap(&[rtp]);
+
+        let packets = parse_rtp_packets_from_pcap(&pcap);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].payload_type, 8, "PT must be PCMA");
+    }
+
+    #[test]
+    fn parse_masks_the_marker_bit_out_of_the_payload_type() {
+        // Byte 1's high bit is the marker (talkstart) flag, not part
+        // of the payload type. PT 0 with the marker set is still 0.
+        let mut rtp = rtp_header(0x80, 0x80, 1);
+        rtp.extend_from_slice(&[0xFF]);
+        let pcap = build_raw_rtp_pcap(&[rtp]);
+
+        let packets = parse_rtp_packets_from_pcap(&pcap);
+        assert_eq!(packets[0].payload_type, 0);
+    }
+
+    #[test]
+    fn parse_strips_rtp_padding() {
+        // The padding bit (0x20 in byte 0) says the last payload byte
+        // counts how many trailing bytes are padding. Those bytes are
+        // NOT audio and must not be decoded as samples.
+        let mut rtp = rtp_header(0xA0, 0, 1);
+        // 3 media bytes + a padding count of 2 (the count byte plus
+        // one more).
+        rtp.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0x02]);
+        let pcap = build_raw_rtp_pcap(&[rtp]);
+
+        let packets = parse_rtp_packets_from_pcap(&pcap);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            packets[0].payload.len(),
+            2,
+            "the 2 padding bytes must be stripped, leaving 2 media bytes"
+        );
+        assert_eq!(packets[0].payload, vec![0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn parse_strips_the_rtp_extension_header() {
+        // X=1 (extension bit) with a 1-word extension. The extension
+        // header is 4 bytes (profile + length) + 1 word of data.
+        let mut rtp = rtp_header(0x90, 0, 1);
+        rtp.extend_from_slice(&0xBEDEu16.to_be_bytes()); // profile
+        rtp.extend_from_slice(&1u16.to_be_bytes()); // length in words
+        rtp.extend_from_slice(&[0u8; 4]); // extension data
+        rtp.extend_from_slice(&[0xFF, 0xFF]); // media
+        let pcap = build_raw_rtp_pcap(&[rtp]);
+
+        let packets = parse_rtp_packets_from_pcap(&pcap);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(
+            packets[0].payload,
+            vec![0xFF, 0xFF],
+            "the extension header must not be treated as media"
+        );
+    }
+
     #[test]
     fn estimate_clock_rate_single_packet_does_not_panic() {
         // The clock-rate estimator used to read `packets[..2]`

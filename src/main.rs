@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(routes::cdr::cdr_list))
         .route("/cdr/:id", get(routes::cdr::cdr_detail))
         .route("/cdr/:id/rtp-chart.json", get(routes::cdr::rtp_chart_json))
+        .route("/cdr/:id/audio.wav", get(routes::cdr::cdr_audio_wav))
         .route("/cdr/export.csv", get(routes::cdr::cdr_export_csv).post(routes::cdr::cdr_export_csv_batch))
         .route("/cdr/select", post(routes::login::select_cdrs))
         .route("/pcap/:cdr_id", get(routes::pcap::download_single))

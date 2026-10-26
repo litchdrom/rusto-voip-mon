@@ -21,6 +21,7 @@ use crate::db::IpColumnShape;
 pub mod ip;
 pub mod rtp_pcap;
 pub mod sip_pcap;
+pub mod wav;
 
 pub use ip::IpAddr;
 

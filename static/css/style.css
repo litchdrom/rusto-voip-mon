@@ -595,6 +595,27 @@ tr.sip-body-row > td {
   overflow: auto;
 }
 
+/* Call audio player (CDR detail, under the RTP statistics table).
+   The <audio> element is inline; the caption underneath names the
+   codec and reminds the operator the recording was reconstructed
+   from the pcap rather than stored as a file. */
+table.rtp-audio {
+  margin-top: 8px;
+}
+table.rtp-audio th {
+  width: 120px;
+}
+.audio-cell audio {
+  width: 100%;
+  max-width: 420px;
+  height: 32px;
+  vertical-align: middle;
+}
+.audio-cell small {
+  display: block;
+  margin-top: 2px;
+}
+
 /* Call flow diagram (above the SIP timeline).
    Horizontal flex row of phase boxes — each box's `flex: N 0 0`
    makes its width proportional to the phase's duration, so an

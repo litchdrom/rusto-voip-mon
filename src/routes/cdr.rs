@@ -893,7 +893,7 @@ function toggleSipBody(btn) {{
             &cdr.rtp_b.dst_ip_str,
         ),
         sip_html = render_sip_timeline(&sip_messages),
-        rtp_html = render_rtp_stats(&cdr.rtp_a, &cdr.rtp_b),
+        rtp_html = render_rtp_stats(id, &cdr.rtp_a, &cdr.rtp_b),
         rtp_chart_html = render_rtp_chart_panel(id),
     );
     // Same no-store policy as cdr_list — see the comment there for the
@@ -1024,6 +1024,176 @@ pub async fn rtp_chart_json(
         json.to_string(),
     )
         .into_response())
+}
+
+/// Per-leg call audio as a WAV file, extracted from the on-disk pcap.
+///
+/// `GET /cdr/:id/audio.wav?leg=a` (or `?leg=b`)
+///
+/// Why the pcap and not `sip_msg.rtp_payload_data`: the DB column is
+/// only populated when the VoIPmonitor install stores RTP payloads
+/// (`store_rtp_payload=yes`), which is off by default — a player built
+/// on it would be a dead button for most operators. The pcap archive
+/// always has the media, and the detail page already extracts that
+/// same merged SIP+RTP pcap for the SIP timeline and the RTP chart.
+///
+/// Only G.711 µ-law (PT 0) and A-law (PT 8) are decodable without a
+/// codec library; anything else returns 404 and the UI shows no
+/// player for that leg. See `cdr::wav`.
+///
+/// 404 when: the CDR doesn't exist, the pcap can't be read, the leg
+/// has no G.711 media, or the leg's RTP source address is unknown.
+pub async fn cdr_audio_wav(
+    State(state): State<crate::state::AppState>,
+    _user: SessionUser,
+    axum::extract::Path(id): axum::extract::Path<u64>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> AppResult<Response> {
+    let leg = params.get("leg").map(|s| s.as_str()).unwrap_or("a");
+    if leg != "a" && leg != "b" {
+        return Err(AppError::BadRequest("leg must be 'a' or 'b'".to_string()));
+    }
+
+    let row = sqlx::query_as::<_, cdr::CdrRow>(
+        &format!(
+            "SELECT {} FROM cdr WHERE ID = ? LIMIT 1",
+            cdr::CDR_FULL_SELECT_COLUMNS
+        ),
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(crate::error::AppError::from)?;
+
+    let Some(row) = row else {
+        return Err(AppError::NotFound);
+    };
+
+    // The leg's RTP source address (who sent the media in this
+    // direction) and its payload type.
+    let (leg_src, leg_pt) = if leg == "a" {
+        (row.a_saddr, row.a_payload)
+    } else {
+        (row.b_saddr, row.b_payload)
+    };
+
+    // VoIPmonitor records the payload type it saw. When it is missing
+    // we still try: the RTP header carries the payload type too, so
+    // the decoder can sniff PT 0 / PT 8 from the packets themselves.
+    let wanted_pt = leg_pt.map(|p| p as u8);
+
+    let pcap_bytes = match crate::routes::pcap::build_pcap_bytes(&state, id).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(cdr_id = id, error = ?e, "audio pcap extract failed");
+            return Err(AppError::NotFound);
+        }
+    };
+
+    let packets = cdr::rtp_pcap::parse_rtp_packets_from_pcap(&pcap_bytes);
+
+    // Direction filter: packets whose source is this leg's RTP
+    // sender. When the leg's address is unknown we cannot split the
+    // streams, so we take every G.711 packet instead of nothing —
+    // a mixed-down recording is more useful than a silent player.
+    // `cdr::ip::IpAddr` (what the CDR row carries) and
+    // `std::net::IpAddr` (what the pcap parser produces) are distinct
+    // types with no cross-`PartialEq`. Compare their canonical
+    // textual forms instead — the same trick the RTP chart's
+    // direction split uses, so both endpoints split the legs the
+    // same way.
+    let leg_src_str = leg_src.map(|ip| ip.to_dotted_decimal());
+    let leg_packets: Vec<cdr::rtp_pcap::RtpPacket> = match &leg_src_str {
+        Some(src) => packets
+            .into_iter()
+            .filter(|p| p.src_ip.to_string() == *src)
+            .collect(),
+        None => packets,
+    };
+
+    // If VoIPmonitor told us the payload type, use it. Otherwise
+    // sniff: whichever of PT 0 / PT 8 actually carries the most
+    // media wins.
+    let payload_type = match wanted_pt {
+        Some(pt) if cdr::wav::is_wav_capable(pt) => pt,
+        Some(_) => {
+            // VoIPmonitor recorded a codec we can't decode.
+            return Err(AppError::NotFound);
+        }
+        None => {
+            let mut pcmu = 0usize;
+            let mut pcma = 0usize;
+            for p in &leg_packets {
+                match p.payload_type {
+                    cdr::wav::PT_PCMU => pcmu += p.payload.len(),
+                    cdr::wav::PT_PCMA => pcma += p.payload.len(),
+                    _ => {}
+                }
+            }
+            if pcmu == 0 && pcma == 0 {
+                return Err(AppError::NotFound);
+            }
+            if pcmu >= pcma {
+                cdr::wav::PT_PCMU
+            } else {
+                cdr::wav::PT_PCMA
+            }
+        }
+    };
+
+    let Some(wav) = cdr::wav::encode_wav_from_rtp(&leg_packets, payload_type) else {
+        return Err(AppError::NotFound);
+    };
+
+    let filename = format!("cdr-{id}-leg-{leg}.wav");
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, "audio/wav")
+        .header(
+            axum::http::header::CONTENT_DISPOSITION,
+            // "inline" so the browser plays it in the <audio> element
+            // instead of downloading it.
+            format!("inline; filename=\"{filename}\""),
+        )
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .body(Body::from(wav))
+        .map_err(|e| AppError::Internal(format!("response build: {e}")))?)
+}
+
+/// Render the per-leg audio player row for the RTP statistics panel.
+///
+/// Only legs whose codec VoIPmonitor recorded as G.711 (PT 0 / PT 8)
+/// get a player — everything else would be a button that always
+/// fails. The `<audio>` element hides itself via `onerror` if the
+/// endpoint turns out to have no decodable media.
+fn render_audio_players(cdr_id: u64, rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
+    fn player(cdr_id: u64, leg: &str, pt: Option<i32>) -> String {
+        let Some(pt) = pt else { return String::new() };
+        let pt = pt as u8;
+        if !cdr::wav::is_wav_capable(pt) {
+            return String::new();
+        }
+        format!(
+            "<div class=\"audio-cell\">\
+               <audio controls preload=\"none\" \
+                      src=\"/cdr/{cdr_id}/audio.wav?leg={leg}\" \
+                      onerror=\"this.closest('td').innerHTML=''\"></audio>\
+               <small class=\"muted\">{codec} &middot; extracted from pcap</small>\
+             </div>",
+            codec = cdr::wav::codec_label(pt),
+        )
+    }
+    let a = player(cdr_id, "a", rtp_a.payload);
+    let b = player(cdr_id, "b", rtp_b.payload);
+    if a.is_empty() && b.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<table class=\"cdrs rtp-audio\"><thead><tr><th>call audio</th>\
+         <th>A leg (caller)</th><th>B leg (callee)</th></tr></thead><tbody>\
+         <tr><td>recording</td><td>{a}</td><td>{b}</td></tr>\
+         </tbody></table>"
+    )
 }
 
 /// Render the per-leg RTP statistics panel — a two-column "A leg /
@@ -1647,7 +1817,7 @@ fn rtp_row_html(
 /// B leg" table with the most useful VoIPmonitor-derived quality
 /// metrics. Returns "" when neither leg has any data (failed calls,
 /// early hangups) so the section is omitted entirely.
-fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
+fn render_rtp_stats(cdr_id: u64, rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
     fn dim_or_dash(v: &str) -> &str {
         if v.is_empty() { "<span class=\"muted\">—</span>" } else { v }
     }
@@ -1763,6 +1933,15 @@ fn render_rtp_stats(rtp_a: &cdr::RtpLeg, rtp_b: &cdr::RtpLeg) -> String {
         &rtp_b.rtcp_max_jitter_ms(),
     ));
     out.push_str("</tbody></table>");
+    // Call audio player, one per leg.
+    //
+    // The audio comes from the on-disk pcap (same extraction the SIP
+    // timeline and the RTP chart use), decoded from G.711 to WAV.
+    // Only G.711 legs can be played, so the row is omitted entirely
+    // for other codecs — no dead button. If the pcap turns out to
+    // hold no decodable media anyway, the endpoint 404s and the
+    // `onerror` handler hides the player.
+    out.push_str(&render_audio_players(cdr_id, rtp_a, rtp_b));
     // Footnote: explain where these come from. Analysts often want
     // to know "is this real-time or stored?" before trusting the
     // numbers — they ARE real-time (VoIPmonitor stores them when the
@@ -2784,6 +2963,75 @@ mod sip_render_tests {
         assert!(html.contains(r#"class="num sip-2xx""#));
         // Second row: failure — red 5xx class + red 5xx method class.
         assert!(html.contains(r#"class="num sip-5xx""#));
+    }
+
+    #[test]
+    fn audio_player_only_renders_for_g711_legs() {
+        // A leg whose codec is not G.711 must get NO player -- a
+        // button that can never work is worse than no button. The
+        // endpoint returns 404 for those, so rendering one would
+        // leave a dead control in the UI.
+        let g711 = cdr::RtpLeg {
+            payload: Some(0), // PCMU
+            ..leg_stub()
+        };
+        let opus = cdr::RtpLeg {
+            payload: Some(111), // Opus
+            ..leg_stub()
+        };
+
+        // Both legs G.711 -> a player for each.
+        let html = render_audio_players(42, &g711, &g711);
+        assert!(html.contains("/cdr/42/audio.wav?leg=a"), "got: {html}");
+        assert!(html.contains("/cdr/42/audio.wav?leg=b"), "got: {html}");
+
+        // One leg G.711, one not -> only the G.711 leg gets a player.
+        let html = render_audio_players(42, &g711, &opus);
+        assert!(html.contains("/cdr/42/audio.wav?leg=a"), "got: {html}");
+        assert!(!html.contains("/cdr/42/audio.wav?leg=b"), "got: {html}");
+
+        // Neither leg G.711 -> no player row at all.
+        let html = render_audio_players(42, &opus, &opus);
+        assert_eq!(html, "", "no player row expected, got: {html}");
+    }
+
+    #[test]
+    fn audio_player_hides_itself_when_the_endpoint_404s() {
+        // The pcap may hold no decodable media even when VoIPmonitor
+        // recorded a G.711 payload type. The <audio> element then
+        // fires `error`, and the handler empties the cell so the UI
+        // doesn't show a broken player.
+        let g711 = cdr::RtpLeg {
+            payload: Some(8), // PCMA
+            ..leg_stub()
+        };
+        let html = render_audio_players(7, &g711, &g711);
+        assert!(
+            html.contains("onerror="),
+            "the player must hide itself on a failed load; got: {html}"
+        );
+        assert!(html.contains("preload=\"none\""), "got: {html}");
+    }
+
+    /// A minimal `RtpLeg` for the audio-player tests: everything
+    /// empty except the fields they set.
+    fn leg_stub() -> cdr::RtpLeg {
+        cdr::RtpLeg {
+            mos_lqo_mult10: None,
+            lost: None,
+            received: None,
+            avg_jitter_mult10: None,
+            max_jitter: None,
+            loss_perc_mult1000: None,
+            delay_avg_mult100: None,
+            rtcp_loss: None,
+            rtcp_maxjitter: None,
+            payload: None,
+            ptime: None,
+            codec_name: String::new(),
+            src_ip_str: String::new(),
+            dst_ip_str: String::new(),
+        }
     }
 
     #[test]
