@@ -209,7 +209,7 @@ docker-compose.yml  # example wiring against existing voipmonitor host
 ## Roadmap
 
 - **Shipped**
-  - Auth (MD5 + bcrypt), CDR list + filters + pagination, CDR detail (basic), CSV export
+  - Auth (MD5 + bcrypt), CDR list + filters + pagination, CDR detail, CSV export
   - Single + batch PCAP download (position-based extraction from `cdr_tar_part`,
     VoIPmonitor LZO format decoded inline, merged SIP+RTP pcap output)
   - Cross-page batch selection + filter-mode batch download
@@ -217,13 +217,26 @@ docker-compose.yml  # example wiring against existing voipmonitor host
   - Multi-value caller / called search (`caller_in`, `called_in` SQL IN-list)
   - Brand-glow logo baked into the SVG for dark-theme legibility
   - Admin override (`is_admin` implies all per-feature permissions)
+  - Per-operator timezone selector (seconds precision, half/quarter-hour zones),
+    with a server-side default and an optional DB-storage offset
+  - UDP source/destination port filters on the first INVITE
+    (`cdr.sipcallerport` / `cdr.sipcalledport`, multi-value), plus the same
+    ports shown as columns in the CDR list
+  - MOS timeline + RTP stats chart on CDR detail (`GET /cdr/:id/rtp-chart.json`,
+    per-leg jitter / MOS / loss / jitter / one-way delay from the on-disk RTP pcap)
+  - sngrep-style call-flow diagram on CDR detail (phase boxes, proportional
+    widths, worst-response-code colouring)
+  - SIP message timeline sourced from the merged pcap archive when available,
+    falling back to `sip_msg`; raw SIP body expands into a full-width row
+  - Per-user RBAC UI (`/admin/users` — create, edit, reset password, delete,
+    with self-lockout protection)
+  - Sensor / collector admin UI (`/admin/sensors` — CRUD over
+    `sensors` / `sensor_stats`)
+  - `<noscript>` fallbacks for every JS-only control (Apply button always
+    visible, batch download, TZ apply, reset-to-today)
 - **Next**
-  - MOS timeline + RTP stats chart on CDR detail
-  - Optional `<noscript>` apply-button polish
-- **Later**
   - WAV playback (chunked streaming from `sip_msg.rtp_payload_data`)
-  - Per-user RBAC UI (currently DB-only)
-  - Sensor / collector status admin
+- **Later**
   - Alerts, scheduled reports
 
 ## License
